@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS clients (
 CREATE INDEX IF NOT EXISTS idx_clients_team ON clients (team_id);
 CREATE INDEX IF NOT EXISTS idx_clients_team_email ON clients (team_id, email);
 
--- Cached appointments (shape TBD once Swagger spec is read; stub for now)
+-- Cached appointments (shape TBD once Swagger spec is read - stub for now)
 CREATE TABLE IF NOT EXISTS appointments (
   id TEXT PRIMARY KEY,
   team_id TEXT NOT NULL,

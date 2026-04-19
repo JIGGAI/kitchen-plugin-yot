@@ -46,7 +46,12 @@ function runMigrations(sqlite: any) {
 
   for (const file of files) {
     if (applied.has(file)) continue;
-    const sql = readFileSync(join(migrationsDir, file), 'utf8');
+    const raw = readFileSync(join(migrationsDir, file), 'utf8');
+    // Strip SQL comments before splitting so a `;` inside `-- comment` text
+    // doesn't create bogus statements.
+    const sql = raw
+      .replace(/--[^\n]*/g, '')      // line comments
+      .replace(/\/\*[\s\S]*?\*\//g, ''); // block comments
     const statements = sql.split(';').map((s) => s.trim()).filter(Boolean);
     for (const stmt of statements) {
       try { sqlite.exec(stmt + ';'); }
