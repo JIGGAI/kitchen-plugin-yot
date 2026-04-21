@@ -3,9 +3,23 @@ import { join, dirname } from 'path';
 import { homedir } from 'os';
 import * as schema from './schema';
 
-// Resolve plugin package root (where db/migrations/ lives at runtime).
-// dist/db/index.js → ../.. → plugin root
-const PLUGIN_ROOT = dirname(dirname(__dirname));
+/**
+ * Find `db/migrations/` relative to the bundled output. After esbuild bundling,
+ * __dirname can be `dist/`, `dist/api/`, or (unbundled) `dist/db/` depending on
+ * which entry point is executing. Walk up to 6 levels looking for the
+ * migrations directory so this works regardless of build layout.
+ */
+function resolveMigrationsDir(startDir: string): string | null {
+  let cur = startDir;
+  for (let i = 0; i < 6; i++) {
+    const candidate = join(cur, 'db', 'migrations');
+    if (existsSync(candidate)) return candidate;
+    const parent = dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+  return null;
+}
 
 function createDatabase(teamId: string) {
   const dbDir = join(homedir(), '.openclaw', 'kitchen', 'plugins', 'yot');
@@ -28,8 +42,8 @@ function createDatabase(teamId: string) {
  * from dist/ without shipping drizzle metadata.
  */
 function runMigrations(sqlite: any) {
-  const migrationsDir = join(PLUGIN_ROOT, 'db', 'migrations');
-  if (!existsSync(migrationsDir)) return;
+  const migrationsDir = resolveMigrationsDir(__dirname);
+  if (!migrationsDir) return;
 
   sqlite.exec(`CREATE TABLE IF NOT EXISTS __yot_migrations (
     name TEXT PRIMARY KEY,

@@ -5,7 +5,7 @@
 import { and, eq, sql } from 'drizzle-orm';
 import { initializeDatabase } from '../db';
 import * as schema from '../db/schema';
-import { fetchClients, ping } from '../drivers/yot-client';
+import { fetchBusiness, fetchClients, fetchLocations, ping } from '../drivers/yot-client';
 import type { KitchenPluginContext } from './types-kitchen';
 import type { ApiError, YotConfig } from '../types';
 
@@ -108,6 +108,30 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     }
   }
 
+  // ---- /business (live passthrough, metadata is small + slow-changing) ----
+  if (req.path === '/business' && req.method === 'GET') {
+    const config = readYotConfig(teamId);
+    if (!config) return apiError(400, 'NOT_CONFIGURED', 'YOT apiKey not set for this team. POST /config first.');
+    try {
+      const data = await fetchBusiness(config);
+      return { status: 200, data };
+    } catch (error: any) {
+      return apiError(502, 'YOT_ERROR', error?.message || String(error));
+    }
+  }
+
+  // ---- /locations (live passthrough, metadata is small + slow-changing) ----
+  if (req.path === '/locations' && req.method === 'GET') {
+    const config = readYotConfig(teamId);
+    if (!config) return apiError(400, 'NOT_CONFIGURED', 'YOT apiKey not set for this team. POST /config first.');
+    try {
+      const data = await fetchLocations(config);
+      return { status: 200, data: { data, total: data.length } };
+    } catch (error: any) {
+      return apiError(502, 'YOT_ERROR', error?.message || String(error));
+    }
+  }
+
   // ---- /clients (cached list) ----
   if (req.path === '/clients' && req.method === 'GET') {
     try {
@@ -151,25 +175,46 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
 
     const startedAt = new Date().toISOString();
     try {
-      const raw = await fetchClients(config);
+      // Page through until YOT returns an empty page. The list endpoint is
+      // 1-indexed; in practice we cap at a high page number as a safety net.
+      const MAX_PAGES = 200;
+      const raw: any[] = [];
+      for (let page = 1; page <= MAX_PAGES; page++) {
+        const chunk = await fetchClients(config, { page });
+        if (!chunk.length) break;
+        raw.push(...chunk);
+      }
       const { db } = initializeDatabase(teamId);
       const now = new Date().toISOString();
       let upserts = 0;
       for (const item of raw) {
-        if (!item?.id && !item?.clientId) continue;
-        const id = String(item.id ?? item.clientId);
+        // YOT list endpoint returns: id (numeric), privateId (uuid),
+        // givenName, otherName, surname, initial, homePhone, mobilePhone,
+        // businessPhone, emailAddress, birthday, gender, active, street,
+        // suburb, state, postcode, country. Aggregated visit/spend data is
+        // NOT in the list endpoint — must come from /client/{id} or exports.
+        if (!item?.id && !item?.privateId) continue;
+        const id = String(item.id ?? item.privateId);
+        const addressParts = [item.street, item.suburb, item.state, item.postcode, item.country]
+          .filter((p) => p != null && String(p).trim().length > 0);
         const values = {
           id,
           teamId,
-          firstName: item.firstName ?? item.first_name ?? null,
-          lastName: item.lastName ?? item.last_name ?? null,
-          email: item.email ?? null,
-          phone: item.phone ?? item.mobile ?? null,
-          address: item.address ? JSON.stringify(item.address) : null,
-          tags: item.tags ? JSON.stringify(item.tags) : null,
-          lastVisitAt: item.lastVisitAt ?? item.last_visit_at ?? null,
-          totalVisits: typeof item.totalVisits === 'number' ? item.totalVisits : null,
-          totalSpend: typeof item.totalSpend === 'number' ? item.totalSpend : null,
+          firstName: item.givenName ?? item.firstName ?? null,
+          lastName: item.surname ?? item.lastName ?? null,
+          email: item.emailAddress ?? item.email ?? null,
+          phone: item.mobilePhone ?? item.homePhone ?? item.businessPhone ?? item.phone ?? null,
+          address: addressParts.length ? JSON.stringify({
+            street: item.street ?? null,
+            suburb: item.suburb ?? null,
+            state: item.state ?? null,
+            postcode: item.postcode ?? null,
+            country: item.country ?? null,
+          }) : null,
+          tags: null,
+          lastVisitAt: null,
+          totalVisits: null,
+          totalSpend: null,
           raw: JSON.stringify(item),
           syncedAt: now,
         };
