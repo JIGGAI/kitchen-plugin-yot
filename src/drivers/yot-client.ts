@@ -1,7 +1,5 @@
 // Thin wrapper around the You're On Time REST API.
-// The real endpoint catalog still needs to be confirmed against the Swagger spec
-// (https://api2.youreontime.com/index.html); for now we expose ping + a stubbed
-// clients fetch so the rest of the plugin can wire through.
+// Auth + endpoints confirmed 2026-04-21 against a real Hair Mechanix key.
 
 import type { YotConfig } from '../types';
 
@@ -13,43 +11,62 @@ function resolveBaseUrl(config: YotConfig): string {
 }
 
 async function yotFetch(config: YotConfig, path: string, init: RequestInit = {}): Promise<Response> {
-  // Endpoints in the OpenAPI spec are rooted at /1/api — always apply that
-  // prefix unless the caller already includes it.
   const rel = path.startsWith('/') ? path : '/' + path;
   const prefixed = rel.startsWith(API_PREFIX) ? rel : `${API_PREFIX}${rel}`;
   const url = `${resolveBaseUrl(config)}${prefixed}`;
-  // Auth header shape is not declared in the OpenAPI spec (no securityDefinitions).
-  // Bitbucket example auth flow: POST /1/api/auth/quicklogin → /1/api/auth/quickloginauth
-  // to obtain a token. Using x-api-key as a placeholder until we confirm the
-  // header name against a real key; swap here once verified.
+  // Auth header is literally "APIKey" (case-sensitive). The Swagger spec has no
+  // securityDefinitions — empirically, x-api-key and Bearer both return
+  // HTTP 500 "Invalid API Key".
   return fetch(url, {
     ...init,
     headers: {
       'accept': 'application/json',
-      'x-api-key': config.apiKey,
+      'APIKey': config.apiKey,
       ...(init.headers || {}),
     },
   });
 }
 
-export async function ping(config: YotConfig): Promise<{ ok: boolean; status?: number; error?: string }> {
+/**
+ * Validate the stored API key by hitting an authenticated endpoint.
+ *
+ * /1/api/ping is a public no-auth endpoint that returns 200 regardless, so
+ * we probe /1/api/business instead — it requires a valid APIKey and returns
+ * the account's basic metadata on success.
+ */
+export async function ping(config: YotConfig): Promise<{ ok: boolean; status?: number; error?: string; business?: string }> {
   try {
-    const res = await yotFetch(config, '/ping');
-    return { ok: res.ok, status: res.status };
+    const res = await yotFetch(config, '/business');
+    if (!res.ok) return { ok: false, status: res.status, error: `HTTP ${res.status}` };
+    const data = await res.json().catch(() => null) as { name?: string } | null;
+    return { ok: true, status: res.status, business: data?.name };
   } catch (error: any) {
     return { ok: false, error: error?.message || String(error) };
   }
 }
 
+export async function fetchBusiness(config: YotConfig): Promise<unknown> {
+  const res = await yotFetch(config, '/business');
+  if (!res.ok) throw new Error(`YOT /business failed: ${res.status}`);
+  return res.json();
+}
+
+export async function fetchLocations(config: YotConfig): Promise<unknown[]> {
+  const res = await yotFetch(config, '/locations');
+  if (!res.ok) throw new Error(`YOT /locations failed: ${res.status}`);
+  const data = await res.json().catch(() => []);
+  return Array.isArray(data) ? data : [];
+}
+
 /**
- * Placeholder — real shape TBD. Returns a raw array from YOT.
- * Swap the implementation once the Swagger client list endpoint is verified.
+ * Fetch a single page of clients. Returns the raw array from YOT.
+ * Field shape per live probe: { id, privateId, givenName, surname, emailAddress,
+ * mobilePhone, homePhone, businessPhone, active, country, ... } with nulls common.
  */
 export async function fetchClients(
   config: YotConfig,
   opts: { locationId?: number; page?: number; search?: string } = {},
 ): Promise<any[]> {
-  // OpenAPI: GET /1/api/clients?locationId&page&search
   const params = new URLSearchParams();
   if (opts.locationId !== undefined) params.set('locationId', String(opts.locationId));
   if (opts.page !== undefined) params.set('page', String(opts.page));
