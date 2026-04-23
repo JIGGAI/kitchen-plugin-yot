@@ -16,7 +16,32 @@
     "id": "yot",
     "name": "You're On Time CRM",
     "teamTypes": ["marketing-team", "ops-team"],
-    "tabs": [],
+    "tabs": [
+      {
+        "id": "overview",
+        "label": "Overview",
+        "icon": "chart",
+        "bundle": "./dist/tabs/overview.js"
+      },
+      {
+        "id": "locations",
+        "label": "Locations",
+        "icon": "map-pin",
+        "bundle": "./dist/tabs/locations.js"
+      },
+      {
+        "id": "clients",
+        "label": "Clients",
+        "icon": "users",
+        "bundle": "./dist/tabs/clients.js"
+      },
+      {
+        "id": "sync-runs",
+        "label": "Sync Runs",
+        "icon": "clock",
+        "bundle": "./dist/tabs/sync-runs.js"
+      }
+    ],
     "apiRoutes": "./dist/api/handler.js",
     "migrations": "./db/migrations"
   },

@@ -11,6 +11,7 @@ console.log('Building kitchen-plugin-yot...\n');
 if (fs.existsSync(distDir)) fs.rmSync(distDir, { recursive: true });
 fs.mkdirSync(distDir, { recursive: true });
 fs.mkdirSync(path.join(distDir, 'api'), { recursive: true });
+fs.mkdirSync(path.join(distDir, 'tabs'), { recursive: true });
 
 const externals = [
   '--external:better-sqlite3',
@@ -36,6 +37,19 @@ try {
     { cwd: root, stdio: 'inherit' }
   );
   console.log('✓ Built dist/api/handler.js');
+
+  const tabsDir = path.join(root, 'src/tabs');
+  if (fs.existsSync(tabsDir)) {
+    const tabFiles = fs.readdirSync(tabsDir).filter((file) => file.endsWith('.tsx'));
+    for (const tabFile of tabFiles) {
+      const name = tabFile.replace('.tsx', '');
+      execSync(
+        `esbuild src/tabs/${tabFile} --bundle --platform=browser --target=es2020 --format=iife --outfile=dist/tabs/${name}.js --jsx=automatic`,
+        { cwd: root, stdio: 'inherit' }
+      );
+      console.log(`✓ Built dist/tabs/${name}.js`);
+    }
+  }
 
   // Copy migrations
   const migSrc = path.join(root, 'db/migrations');
