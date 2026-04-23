@@ -6,6 +6,10 @@
     "type": "git",
     "url": "https://github.com/JIGGAI/kitchen-plugin-yot"
   },
+  "homepage": "https://github.com/JIGGAI/kitchen-plugin-yot",
+  "bugs": {
+    "url": "https://github.com/JIGGAI/kitchen-plugin-yot/issues"
+  },
   "main": "dist/index.js",
   "files": [
     "dist/",
@@ -47,7 +51,9 @@
   },
   "scripts": {
     "build": "node scripts/build.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
     "better-sqlite3": "^11.0.0",
@@ -57,6 +63,7 @@
     "@types/better-sqlite3": "^7.6.0",
     "@types/node": "^20.0.0",
     "esbuild": "^0.24.0",
-    "typescript": "^5.0.0"
+    "typescript": "^5.0.0",
+    "vitest": "^2.0.0"
   }
 }
