@@ -23,6 +23,41 @@ export const clients = sqliteTable('clients', {
   totalSpend: real('total_spend'),
   raw: text('raw'),
   syncedAt: text('synced_at').notNull(),
+  privateId: text('private_id'),
+  otherName: text('other_name'),
+  fullName: text('full_name'),
+  homePhone: text('home_phone'),
+  mobilePhone: text('mobile_phone'),
+  businessPhone: text('business_phone'),
+  emailAddress: text('email_address'),
+  birthday: text('birthday'),
+  gender: text('gender'),
+  active: integer('active', { mode: 'boolean' }),
+  street: text('street'),
+  suburb: text('suburb'),
+  state: text('state'),
+  postcode: text('postcode'),
+  country: text('country'),
+  sourceLocationId: text('source_location_id'),
+  createdAtRemote: text('created_at_remote'),
+});
+
+export const locations = sqliteTable('locations', {
+  id: text('id').primaryKey(),
+  teamId: text('team_id').notNull(),
+  name: text('name'),
+  emailAddress: text('email_address'),
+  businessPhone: text('business_phone'),
+  mobilePhone: text('mobile_phone'),
+  canBookOnline: integer('can_book_online', { mode: 'boolean' }),
+  active: integer('active', { mode: 'boolean' }),
+  street: text('street'),
+  suburb: text('suburb'),
+  state: text('state'),
+  postcode: text('postcode'),
+  country: text('country'),
+  raw: text('raw'),
+  syncedAt: text('synced_at').notNull(),
 });
 
 export const appointments = sqliteTable('appointments', {
@@ -51,7 +86,25 @@ export const syncState = sqliteTable('sync_state', {
   pk: primaryKey({ columns: [t.teamId, t.resource] }),
 }));
 
+export const syncRuns = sqliteTable('sync_runs', {
+  id: text('id').primaryKey(),
+  teamId: text('team_id').notNull(),
+  resource: text('resource').notNull(),
+  status: text('status').notNull(),
+  startedAt: text('started_at').notNull(),
+  completedAt: text('completed_at'),
+  rowsSeen: integer('rows_seen'),
+  rowsWritten: integer('rows_written'),
+  pageCount: integer('page_count'),
+  notes: text('notes'),
+  error: text('error'),
+});
+
 export type Client = typeof clients.$inferSelect;
 export type NewClient = typeof clients.$inferInsert;
+export type Location = typeof locations.$inferSelect;
+export type NewLocation = typeof locations.$inferInsert;
 export type Appointment = typeof appointments.$inferSelect;
 export type NewAppointment = typeof appointments.$inferInsert;
+export type SyncRun = typeof syncRuns.$inferSelect;
+export type NewSyncRun = typeof syncRuns.$inferInsert;

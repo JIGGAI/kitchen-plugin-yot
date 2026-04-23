@@ -8,14 +8,45 @@ export interface YotConfig {
 
 export interface ClientRecord {
   id: string;
+  privateId: string | null;
   firstName: string | null;
+  otherName: string | null;
   lastName: string | null;
+  fullName: string | null;
   email: string | null;
   phone: string | null;
+  homePhone: string | null;
+  mobilePhone: string | null;
+  businessPhone: string | null;
+  birthday: string | null;
+  gender: string | null;
+  active: boolean | null;
+  street: string | null;
+  suburb: string | null;
+  state: string | null;
+  postcode: string | null;
+  country: string | null;
+  sourceLocationId: string | null;
   tags: string[];
   lastVisitAt: string | null;
   totalVisits: number | null;
   totalSpend: number | null;
+  syncedAt: string;
+}
+
+export interface LocationRecord {
+  id: string;
+  name: string | null;
+  emailAddress: string | null;
+  businessPhone: string | null;
+  mobilePhone: string | null;
+  canBookOnline: boolean | null;
+  active: boolean | null;
+  street: string | null;
+  suburb: string | null;
+  state: string | null;
+  postcode: string | null;
+  country: string | null;
   syncedAt: string;
 }
 
@@ -38,6 +69,19 @@ export interface SyncStateRecord {
   lastSuccessAt: string | null;
   lastError: string | null;
   rowCount: number | null;
+}
+
+export interface SyncRunRecord {
+  id: string;
+  resource: string;
+  status: string;
+  startedAt: string;
+  completedAt: string | null;
+  rowsSeen: number | null;
+  rowsWritten: number | null;
+  pageCount: number | null;
+  notes: string | null;
+  error: string | null;
 }
 
 export interface ApiError {
