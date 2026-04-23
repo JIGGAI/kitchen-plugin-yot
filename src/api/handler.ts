@@ -2,13 +2,15 @@
 // Kitchen invokes handleRequest({ path, method, query, headers, body }, ctx)
 // and expects { status, data } back.
 
+import { mkdirSync, writeFileSync } from 'fs';
+import path from 'path';
 import { randomUUID } from 'crypto';
-import { and, asc, desc, eq, like, or, sql } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import { initializeDatabase } from '../db';
 import * as schema from '../db/schema';
-import { fetchBusiness, fetchClients, fetchLocations, ping } from '../drivers/yot-client';
+import { characterizeClientPaging, fetchBusiness, fetchClients, fetchLocations, ping } from '../drivers/yot-client';
 import type { KitchenPluginContext } from './types-kitchen';
-import type { ApiError, ClientRecord, LocationRecord, SyncRunRecord, YotConfig } from '../types';
+import type { ApiError, ClientRecord, ExportManifestRecord, LocationRecord, SyncRunRecord, YotConfig } from '../types';
 
 export type PluginRequest = {
   method: string;
@@ -72,6 +74,16 @@ function normalizeFullName(item: Record<string, any>): string | null {
   return composed || null;
 }
 
+function safeJsonParseArray(value: string | null): string[] {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
 function mapClientRecord(row: schema.Client): ClientRecord {
   return {
     id: row.id,
@@ -94,7 +106,7 @@ function mapClientRecord(row: schema.Client): ClientRecord {
     postcode: row.postcode ?? null,
     country: row.country ?? null,
     sourceLocationId: row.sourceLocationId ?? null,
-    tags: row.tags ? JSON.parse(row.tags) : [],
+    tags: safeJsonParseArray(row.tags),
     lastVisitAt: row.lastVisitAt ?? null,
     totalVisits: row.totalVisits ?? null,
     totalSpend: row.totalSpend ?? null,
@@ -150,6 +162,41 @@ function parseSort(query: Record<string, string | undefined>): { field: string; 
   return { field, direction };
 }
 
+function upsertSyncState(db: ReturnType<typeof initializeDatabase>['db'], teamId: string, resource: string, values: { lastSyncedAt?: string | null; lastSuccessAt?: string | null; lastError?: string | null; rowCount?: number | null }) {
+  db.run(sql`INSERT INTO sync_state (team_id, resource, last_synced_at, last_success_at, last_error, row_count)
+             VALUES (${teamId}, ${resource}, ${values.lastSyncedAt ?? null}, ${values.lastSuccessAt ?? null}, ${values.lastError ?? null}, ${values.rowCount ?? null})
+             ON CONFLICT(team_id, resource) DO UPDATE SET
+               last_synced_at = ${values.lastSyncedAt ?? null},
+               last_success_at = COALESCE(${values.lastSuccessAt ?? null}, last_success_at),
+               last_error = ${values.lastError ?? null},
+               row_count = COALESCE(${values.rowCount ?? null}, row_count)`);
+}
+
+function writeExportFiles(teamId: string, db: ReturnType<typeof initializeDatabase>['db']): ExportManifestRecord {
+  const exportedAt = new Date().toISOString();
+  const stamp = exportedAt.replace(/[:.]/g, '-');
+  const dir = path.join(process.env.HOME || '', '.openclaw', 'kitchen', 'plugins', 'yot', 'exports', teamId, stamp);
+  mkdirSync(dir, { recursive: true });
+
+  const files: Array<{ name: string; rows: number }> = [];
+  const datasets: Array<{ name: string; rows: unknown[] }> = [
+    { name: 'clients.json', rows: db.select().from(schema.clients).where(eq(schema.clients.teamId, teamId)).all() },
+    { name: 'locations.json', rows: db.select().from(schema.locations).where(eq(schema.locations.teamId, teamId)).all() },
+    { name: 'appointments.json', rows: db.select().from(schema.appointments).where(eq(schema.appointments.teamId, teamId)).all() },
+    { name: 'sync-state.json', rows: db.select().from(schema.syncState).where(eq(schema.syncState.teamId, teamId)).all() },
+    { name: 'sync-runs.json', rows: db.select().from(schema.syncRuns).where(eq(schema.syncRuns.teamId, teamId)).all() },
+  ];
+
+  for (const dataset of datasets) {
+    writeFileSync(path.join(dir, dataset.name), `${JSON.stringify(dataset.rows, null, 2)}\n`, 'utf8');
+    files.push({ name: dataset.name, rows: dataset.rows.length });
+  }
+
+  const manifest: ExportManifestRecord = { teamId, exportedAt, directory: dir, files };
+  writeFileSync(path.join(dir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+  return manifest;
+}
+
 export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginContext): Promise<PluginResponse> {
   const teamId = getTeamId(req);
 
@@ -167,12 +214,15 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     const counts = {
       clients: Number(db.select({ c: sql<number>`count(*)` }).from(schema.clients).where(eq(schema.clients.teamId, teamId)).all()?.[0]?.c || 0),
       locations: Number(db.select({ c: sql<number>`count(*)` }).from(schema.locations).where(eq(schema.locations.teamId, teamId)).all()?.[0]?.c || 0),
+      appointments: Number(db.select({ c: sql<number>`count(*)` }).from(schema.appointments).where(eq(schema.appointments.teamId, teamId)).all()?.[0]?.c || 0),
     };
     return {
       status: 200,
       data: {
         ok: true,
+        teamId,
         yotConfigured: Boolean(config),
+        dbMode: `yot-${teamId}.db`,
         counts,
         syncState: syncRows,
       },
@@ -200,18 +250,13 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       const now = new Date().toISOString();
       for (const [key, value] of Object.entries(body)) {
         const valueStr = typeof value === 'string' ? value : JSON.stringify(value);
-        try {
-          db.run(sql`INSERT INTO plugin_config (team_id, key, value, updated_at) VALUES (${teamId}, ${key}, ${valueStr}, ${now})
-                     ON CONFLICT(team_id, key) DO UPDATE SET value = ${valueStr}, updated_at = ${now}`);
-        } catch {
-          const existing = db.select().from(schema.pluginConfig)
-            .where(and(eq(schema.pluginConfig.teamId, teamId), eq(schema.pluginConfig.key, key))).all();
-          if (existing.length) {
-            db.update(schema.pluginConfig).set({ value: valueStr, updatedAt: now })
-              .where(and(eq(schema.pluginConfig.teamId, teamId), eq(schema.pluginConfig.key, key))).run();
-          } else {
-            db.insert(schema.pluginConfig).values({ teamId, key, value: valueStr, updatedAt: now }).run();
-          }
+        const existing = db.select().from(schema.pluginConfig)
+          .where(and(eq(schema.pluginConfig.teamId, teamId), eq(schema.pluginConfig.key, key))).all();
+        if (existing.length) {
+          db.update(schema.pluginConfig).set({ value: valueStr, updatedAt: now })
+            .where(and(eq(schema.pluginConfig.teamId, teamId), eq(schema.pluginConfig.key, key))).run();
+        } else {
+          db.insert(schema.pluginConfig).values({ teamId, key, value: valueStr, updatedAt: now }).run();
         }
       }
       return { status: 200, data: { ok: true, keys: Object.keys(body) } };
@@ -260,19 +305,12 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     const startedAt = new Date().toISOString();
     const runId = randomUUID();
     try {
-      const raw = await fetchLocations(config);
       const { db } = initializeDatabase(teamId);
+      db.insert(schema.syncRuns).values({ id: runId, teamId, resource: 'locations', status: 'running', startedAt }).run();
+      const raw = await fetchLocations(config);
       const now = new Date().toISOString();
-      db.insert(schema.syncRuns).values({
-        id: runId,
-        teamId,
-        resource: 'locations',
-        status: 'running',
-        startedAt,
-      }).run();
-
       let upserts = 0;
-      for (const item of raw as Record<string, any>[]) {
+      for (const item of raw) {
         if (!item?.id) continue;
         const values: schema.NewLocation = {
           id: String(item.id),
@@ -291,29 +329,16 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
           raw: JSON.stringify(item),
           syncedAt: now,
         };
-        try {
-          db.insert(schema.locations).values(values).onConflictDoUpdate({
-            target: schema.locations.id,
-            set: { ...values, id: undefined as unknown as string },
-          }).run();
-        } catch {
+        const existing = db.select().from(schema.locations).where(eq(schema.locations.id, values.id)).all();
+        if (existing.length) {
+          db.update(schema.locations).set({ ...values }).where(eq(schema.locations.id, values.id)).run();
+        } else {
           db.insert(schema.locations).values(values).run();
         }
         upserts++;
       }
-
-      db.run(sql`INSERT INTO sync_state (team_id, resource, last_synced_at, last_success_at, last_error, row_count)
-                 VALUES (${teamId}, ${'locations'}, ${now}, ${now}, ${null}, ${upserts})
-                 ON CONFLICT(team_id, resource) DO UPDATE SET
-                   last_synced_at = ${now}, last_success_at = ${now}, last_error = ${null}, row_count = ${upserts}`);
-      db.update(schema.syncRuns).set({
-        status: 'success',
-        completedAt: now,
-        rowsSeen: raw.length,
-        rowsWritten: upserts,
-        pageCount: 1,
-      }).where(eq(schema.syncRuns.id, runId)).run();
-
+      upsertSyncState(db, teamId, 'locations', { lastSyncedAt: now, lastSuccessAt: now, lastError: null, rowCount: upserts });
+      db.update(schema.syncRuns).set({ status: 'success', completedAt: now, rowsSeen: raw.length, rowsWritten: upserts, pageCount: 1 }).where(eq(schema.syncRuns.id, runId)).run();
       return { status: 200, data: { ok: true, synced: upserts, startedAt, completedAt: now } };
     } catch (error: any) {
       const errMsg = error?.message || String(error);
@@ -321,11 +346,8 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       try {
         const { db } = initializeDatabase(teamId);
         db.update(schema.syncRuns).set({ status: 'error', completedAt: now, error: errMsg }).where(eq(schema.syncRuns.id, runId)).run();
-        db.run(sql`INSERT INTO sync_state (team_id, resource, last_synced_at, last_error)
-                   VALUES (${teamId}, ${'locations'}, ${now}, ${errMsg})
-                   ON CONFLICT(team_id, resource) DO UPDATE SET
-                     last_synced_at = ${now}, last_error = ${errMsg}`);
-      } catch { /* ignore */ }
+        upsertSyncState(db, teamId, 'locations', { lastSyncedAt: now, lastError: errMsg });
+      } catch {}
       return apiError(502, 'YOT_ERROR', errMsg);
     }
   }
@@ -360,15 +382,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       });
 
       const total = rows.length;
-      return {
-        status: 200,
-        data: {
-          data: rows.slice(offset, offset + limit).map(mapClientRecord),
-          total,
-          limit,
-          offset,
-        },
-      };
+      return { status: 200, data: { data: rows.slice(offset, offset + limit).map(mapClientRecord), total, limit, offset } };
     } catch (error: any) {
       return apiError(500, 'DATABASE_ERROR', error?.message || 'Failed to read clients');
     }
@@ -378,8 +392,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
   if (clientMatch && req.method === 'GET') {
     try {
       const { db } = initializeDatabase(teamId);
-      const rows = db.select().from(schema.clients)
-        .where(and(eq(schema.clients.teamId, teamId), eq(schema.clients.id, clientMatch[1]!))).all();
+      const rows = db.select().from(schema.clients).where(and(eq(schema.clients.teamId, teamId), eq(schema.clients.id, clientMatch[1]!))).all();
       if (!rows.length) return apiError(404, 'NOT_FOUND', 'Client not found');
       return { status: 200, data: mapClientRecord(rows[0]) };
     } catch (error: any) {
@@ -398,21 +411,18 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       const locationIdRaw = cleanString(req.query.locationId);
       const locationId = locationIdRaw ? Number(locationIdRaw) : undefined;
       const { db } = initializeDatabase(teamId);
-      db.insert(schema.syncRuns).values({
-        id: runId,
-        teamId,
-        resource: 'clients',
-        status: 'running',
-        startedAt,
-        notes: locationIdRaw ? `locationId=${locationIdRaw}` : null,
-      }).run();
+      db.insert(schema.syncRuns).values({ id: runId, teamId, resource: 'clients', status: 'running', startedAt, notes: locationIdRaw ? `locationId=${locationIdRaw}` : null }).run();
 
-      const raw: any[] = [];
+      const raw: Record<string, any>[] = [];
       let pageCount = 0;
+      let stoppedBecause = 'maxPages';
       for (let page = 1; page <= MAX_PAGES; page++) {
         const chunk = await fetchClients(config, { page, locationId });
         pageCount = page;
-        if (!chunk.length) break;
+        if (!chunk.length) {
+          stoppedBecause = 'empty-page';
+          break;
+        }
         raw.push(...chunk);
       }
 
@@ -420,7 +430,6 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       let upserts = 0;
       for (const item of raw) {
         if (!item?.id && !item?.privateId) continue;
-        const fullName = normalizeFullName(item);
         const values: schema.NewClient = {
           id: String(item.id ?? item.privateId),
           teamId,
@@ -437,7 +446,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
           syncedAt: now,
           privateId: cleanString(item.privateId),
           otherName: cleanString(item.otherName),
-          fullName,
+          fullName: normalizeFullName(item),
           homePhone: cleanString(item.homePhone),
           mobilePhone: cleanString(item.mobilePhone),
           businessPhone: cleanString(item.businessPhone),
@@ -453,42 +462,52 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
           sourceLocationId: locationIdRaw,
           createdAtRemote: cleanString(item.createdDate ?? item.createdAt),
         };
-        try {
-          db.insert(schema.clients).values(values).onConflictDoUpdate({
-            target: schema.clients.id,
-            set: { ...values, id: undefined as unknown as string },
-          }).run();
-        } catch {
+        const existing = db.select().from(schema.clients).where(eq(schema.clients.id, values.id)).all();
+        if (existing.length) {
+          db.update(schema.clients).set({ ...values }).where(eq(schema.clients.id, values.id)).run();
+        } else {
           db.insert(schema.clients).values(values).run();
         }
         upserts++;
       }
 
-      db.run(sql`INSERT INTO sync_state (team_id, resource, last_synced_at, last_success_at, last_error, row_count)
-                 VALUES (${teamId}, ${'clients'}, ${now}, ${now}, ${null}, ${upserts})
-                 ON CONFLICT(team_id, resource) DO UPDATE SET
-                   last_synced_at = ${now}, last_success_at = ${now}, last_error = ${null}, row_count = ${upserts}`);
-      db.update(schema.syncRuns).set({
-        status: 'success',
-        completedAt: now,
-        rowsSeen: raw.length,
-        rowsWritten: upserts,
-        pageCount,
-      }).where(eq(schema.syncRuns.id, runId)).run();
-
-      return { status: 200, data: { ok: true, synced: upserts, rowsSeen: raw.length, pageCount, startedAt, completedAt: now } };
+      upsertSyncState(db, teamId, 'clients', { lastSyncedAt: now, lastSuccessAt: now, lastError: null, rowCount: upserts });
+      db.update(schema.syncRuns).set({ status: 'success', completedAt: now, rowsSeen: raw.length, rowsWritten: upserts, pageCount, notes: `${locationIdRaw ? `locationId=${locationIdRaw}; ` : ''}stop=${stoppedBecause}` }).where(eq(schema.syncRuns.id, runId)).run();
+      return { status: 200, data: { ok: true, synced: upserts, rowsSeen: raw.length, pageCount, stoppedBecause, startedAt, completedAt: now } };
     } catch (error: any) {
       const errMsg = error?.message || String(error);
       const now = new Date().toISOString();
       try {
         const { db } = initializeDatabase(teamId);
         db.update(schema.syncRuns).set({ status: 'error', completedAt: now, error: errMsg }).where(eq(schema.syncRuns.id, runId)).run();
-        db.run(sql`INSERT INTO sync_state (team_id, resource, last_synced_at, last_error)
-                   VALUES (${teamId}, ${'clients'}, ${now}, ${errMsg})
-                   ON CONFLICT(team_id, resource) DO UPDATE SET
-                     last_synced_at = ${now}, last_error = ${errMsg}`);
-      } catch { /* ignore */ }
+        upsertSyncState(db, teamId, 'clients', { lastSyncedAt: now, lastError: errMsg });
+      } catch {}
       return apiError(502, 'YOT_ERROR', errMsg);
+    }
+  }
+
+  if (req.path === '/clients/paging-characterization' && req.method === 'GET') {
+    const config = readYotConfig(teamId);
+    if (!config) return apiError(400, 'NOT_CONFIGURED', 'YOT apiKey not set for this team. POST /config first.');
+    try {
+      const locationIdRaw = cleanString(req.query.locationId);
+      const result = await characterizeClientPaging(config, {
+        locationId: locationIdRaw ? Number(locationIdRaw) : undefined,
+        maxPages: parseInt(String(req.query.maxPages || '25'), 10) || 25,
+      });
+      return { status: 200, data: result };
+    } catch (error: any) {
+      return apiError(502, 'YOT_ERROR', error?.message || String(error));
+    }
+  }
+
+  if (req.path === '/export' && req.method === 'POST') {
+    try {
+      const { db } = initializeDatabase(teamId);
+      const manifest = writeExportFiles(teamId, db);
+      return { status: 200, data: { ok: true, manifest } };
+    } catch (error: any) {
+      return apiError(500, 'EXPORT_ERROR', error?.message || 'Failed to export local cache');
     }
   }
 

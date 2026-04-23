@@ -13,6 +13,7 @@ export type {
   AppointmentRecord,
   SyncStateRecord,
   SyncRunRecord,
+  ExportManifestRecord,
   ApiError,
   PaginatedResponse,
 } from './types';
