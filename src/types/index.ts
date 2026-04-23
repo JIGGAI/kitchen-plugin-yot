@@ -84,6 +84,16 @@ export interface SyncRunRecord {
   error: string | null;
 }
 
+export interface ExportManifestRecord {
+  teamId: string;
+  exportedAt: string;
+  directory: string;
+  files: Array<{
+    name: string;
+    rows: number;
+  }>;
+}
+
 export interface ApiError {
   error: string;
   message: string;
