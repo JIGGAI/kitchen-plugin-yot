@@ -10,13 +10,17 @@ import { api, boolLabel, fmtNumber, formatDateTime, t } from './common';
   type Row = {
     id: string;
     fullName: string | null;
+    firstName: string | null;
+    otherName: string | null;
+    lastName: string | null;
     email: string | null;
     phone: string | null;
+    homePhone: string | null;
+    mobilePhone: string | null;
+    businessPhone: string | null;
     sourceLocationId: string | null;
+    country: string | null;
     active: boolean | null;
-    totalVisits: number | null;
-    totalSpend: number | null;
-    lastVisitAt: string | null;
     syncedAt: string;
   };
 
@@ -30,6 +34,21 @@ import { api, boolLabel, fmtNumber, formatDateTime, t } from './common';
     const [limit] = useState(25);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null as string | null);
+
+    const displayName = (row: Row) => {
+      const fallback = [row.firstName, row.otherName, row.lastName].filter(Boolean).join(' ').trim();
+      return row.fullName || fallback || 'Unnamed';
+    };
+
+    const phoneLines = (row: Row) => {
+      const entries = [
+        row.phone,
+        row.mobilePhone && row.mobilePhone !== row.phone ? `Mobile: ${row.mobilePhone}` : null,
+        row.homePhone && row.homePhone !== row.phone ? `Home: ${row.homePhone}` : null,
+        row.businessPhone && row.businessPhone !== row.phone ? `Business: ${row.businessPhone}` : null,
+      ].filter(Boolean) as string[];
+      return entries.length ? entries : ['—'];
+    };
 
     const load = async (nextOffset = offset, nextSearch = search) => {
       setLoading(true);
@@ -69,6 +88,12 @@ import { api, boolLabel, fmtNumber, formatDateTime, t } from './common';
           h('input', {
             value: searchInput,
             onChange: (e: any) => setSearchInput(e.target.value),
+            onKeyDown: (e: any) => {
+              if (e.key === 'Enter') {
+                setSearch(searchInput);
+                void load(0, searchInput);
+              }
+            },
             placeholder: 'Search name, email, or phone',
             style: t.input,
           }),
@@ -89,33 +114,28 @@ import { api, boolLabel, fmtNumber, formatDateTime, t } from './common';
             h('thead', null, h('tr', null,
               h('th', { style: t.th }, 'Client'),
               h('th', { style: t.th }, 'Contact'),
-              h('th', { style: t.th }, 'Location'),
-              h('th', { style: t.th }, 'Visits'),
-              h('th', { style: t.th }, 'Spend'),
-              h('th', { style: t.th }, 'Last visit'),
+              h('th', { style: t.th }, 'Country'),
+              h('th', { style: t.th }, 'Source location'),
+              h('th', { style: t.th }, 'Synced'),
               h('th', { style: t.th }, 'Active')
             )),
             h('tbody', null,
               rows.length
                 ? rows.map((row: Row) => h('tr', { key: row.id },
                   h('td', { style: t.td },
-                    h('div', { className: 'text-sm font-medium', style: t.text }, row.fullName || 'Unnamed'),
+                    h('div', { className: 'text-sm font-medium', style: t.text }, displayName(row)),
                     h('div', { className: 'text-xs', style: t.faint }, row.id)
                   ),
                   h('td', { style: t.td },
                     h('div', null, row.email || '—'),
-                    h('div', { className: 'text-xs', style: t.faint }, row.phone || '—')
+                    ...phoneLines(row).map((line, idx) => h('div', { key: `${row.id}-phone-${idx}`, className: 'text-xs', style: t.faint }, line))
                   ),
+                  h('td', { style: t.td }, row.country || '—'),
                   h('td', { style: t.td }, row.sourceLocationId || '—'),
-                  h('td', { style: t.td }, fmtNumber(row.totalVisits)),
-                  h('td', { style: t.td }, row.totalSpend == null ? '—' : `$${Number(row.totalSpend).toFixed(2)}`),
-                  h('td', { style: t.td },
-                    h('div', null, formatDateTime(row.lastVisitAt)),
-                    h('div', { className: 'text-xs', style: t.faint }, `Synced ${formatDateTime(row.syncedAt)}`)
-                  ),
+                  h('td', { style: t.td }, formatDateTime(row.syncedAt)),
                   h('td', { style: t.td }, boolLabel(row.active, 'Active', 'Inactive'))
                 ))
-                : h('tr', null, h('td', { style: t.td, colSpan: 7 }, loading ? 'Loading clients…' : 'No cached clients found.'))
+                : h('tr', null, h('td', { style: t.td, colSpan: 6 }, loading ? 'Loading clients…' : 'No cached clients found.'))
             )
           )
         ),

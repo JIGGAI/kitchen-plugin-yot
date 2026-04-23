@@ -55,6 +55,9 @@ import { api, boolLabel, formatDateTime, t } from './common';
           h('input', {
             value: search,
             onChange: (e: any) => setSearch(e.target.value),
+            onKeyDown: (e: any) => {
+              if (e.key === 'Enter') void load();
+            },
             placeholder: 'Search by name, suburb, phone, or email',
             style: t.input,
           }),
