@@ -11,13 +11,9 @@
     "url": "https://github.com/JIGGAI/kitchen-plugin-yot/issues"
   },
   "main": "dist/index.js",
-  "bin": {
-    "kitchen-plugin-yot": "scripts/kitchen-cli.js"
-  },
   "files": [
     "dist/",
     "db/migrations/",
-    "scripts/kitchen-cli.js",
     "README.md"
   ],
   "kitchenPlugin": {
@@ -55,7 +51,6 @@
   },
   "scripts": {
     "build": "node scripts/build.js",
-    "dev": "node scripts/dev.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --passWithNoTests",
     "prepublishOnly": "npm run build"
