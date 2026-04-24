@@ -155,8 +155,16 @@ function parseBooleanFilter(value: string | undefined): boolean | null {
   return null;
 }
 
+const NUMERIC_SORT_FIELDS = new Set(['totalVisits', 'totalSpend']);
+const DATE_SORT_FIELDS = new Set(['lastVisitAt', 'syncedAt', 'createdAtRemote']);
+const STRING_SORT_FIELDS = new Set(['fullName', 'firstName', 'lastName']);
+
 function parseSort(query: Record<string, string | undefined>): { field: string; direction: 'asc' | 'desc' } {
-  const allowed = new Set(['fullName', 'firstName', 'lastName', 'lastVisitAt', 'syncedAt', 'createdAtRemote']);
+  const allowed = new Set<string>([
+    ...STRING_SORT_FIELDS,
+    ...DATE_SORT_FIELDS,
+    ...NUMERIC_SORT_FIELDS,
+  ]);
   const field = allowed.has(String(query.sort || '')) ? String(query.sort) : 'syncedAt';
   const direction = String(query.direction || 'desc').toLowerCase() === 'asc' ? 'asc' : 'desc';
   return { field, direction };
@@ -364,20 +372,42 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       let rows = db.select().from(schema.clients).where(eq(schema.clients.teamId, teamId)).all() as schema.Client[];
       if (activeFilter !== null) rows = rows.filter((row) => row.active === activeFilter);
       if (locationFilter) rows = rows.filter((row) => row.sourceLocationId === locationFilter);
-      if (cleanString(req.query.lastVisitBefore)) rows = rows.filter((row) => !row.lastVisitAt || row.lastVisitAt <= String(req.query.lastVisitBefore));
-      if (cleanString(req.query.lastVisitAfter)) rows = rows.filter((row) => !!row.lastVisitAt && row.lastVisitAt >= String(req.query.lastVisitAfter));
+
+      // Recency window filter: `lastVisitNever=1` keeps only clients with no recorded visit.
+      // `lastVisitBefore` / `lastVisitAfter` keep clients with a non-null last visit on the
+      // matching side of the cutoff (unlike the previous behavior which conflated null with
+      // "before"). This lets the UI wire "never" and "within N days" as independent options.
+      const lastVisitNever = String(req.query.lastVisitNever || '').toLowerCase();
+      if (lastVisitNever === '1' || lastVisitNever === 'true' || lastVisitNever === 'yes') {
+        rows = rows.filter((row) => !row.lastVisitAt);
+      } else {
+        const before = cleanString(req.query.lastVisitBefore);
+        const after = cleanString(req.query.lastVisitAfter);
+        if (before) rows = rows.filter((row) => !!row.lastVisitAt && row.lastVisitAt <= before);
+        if (after) rows = rows.filter((row) => !!row.lastVisitAt && row.lastVisitAt >= after);
+      }
+
       if (search) {
         const term = search.toLowerCase();
         rows = rows.filter((row) =>
-          [row.fullName, row.firstName, row.lastName, row.emailAddress, row.mobilePhone, row.homePhone, row.businessPhone, row.phone]
+          [row.fullName, row.firstName, row.lastName, row.email, row.emailAddress, row.mobilePhone, row.homePhone, row.businessPhone, row.phone]
             .some((value) => String(value || '').toLowerCase().includes(term))
         );
       }
 
       rows.sort((a, b) => {
         const dir = direction === 'asc' ? 1 : -1;
-        const aValue = String((a as any)[field] || '');
-        const bValue = String((b as any)[field] || '');
+        const aRaw = (a as any)[field];
+        const bRaw = (b as any)[field];
+        if (NUMERIC_SORT_FIELDS.has(field)) {
+          const aNum = typeof aRaw === 'number' ? aRaw : Number.NEGATIVE_INFINITY;
+          const bNum = typeof bRaw === 'number' ? bRaw : Number.NEGATIVE_INFINITY;
+          if (aNum === bNum) return 0;
+          return (aNum < bNum ? -1 : 1) * dir;
+        }
+        // String/date compare: treat null/empty as empty string so they sort together at one end.
+        const aValue = aRaw == null ? '' : String(aRaw);
+        const bValue = bRaw == null ? '' : String(bRaw);
         return aValue.localeCompare(bValue) * dir;
       });
 
