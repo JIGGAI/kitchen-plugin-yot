@@ -16,7 +16,7 @@ import { api, boolLabel, fmtNumber, formatDateTime, t } from './common';
   };
 
   function Overview(props: any) {
-    const teamId = String(props?.teamId || 'default');
+    const teamId = typeof props?.teamId === 'string' && props.teamId.trim() ? props.teamId.trim() : null;
     const [health, setHealth] = useState(null as Health | null);
     const [busy, setBusy] = useState(null as string | null);
     const [loading, setLoading] = useState(true);
@@ -24,6 +24,7 @@ import { api, boolLabel, fmtNumber, formatDateTime, t } from './common';
     const [error, setError] = useState(null as string | null);
 
     const load = async () => {
+      if (!teamId) return;
       setLoading(true);
       setError(null);
       try {
@@ -35,9 +36,10 @@ import { api, boolLabel, fmtNumber, formatDateTime, t } from './common';
       }
     };
 
-    useEffect(() => { void load(); }, [teamId]);
+    useEffect(() => { if (teamId) void load(); else setLoading(false); }, [teamId]);
 
     const runAction = async (key: string, label: string, path: string) => {
+      if (!teamId) return;
       setBusy(key);
       setMessage(null);
       setError(null);
@@ -59,13 +61,21 @@ import { api, boolLabel, fmtNumber, formatDateTime, t } from './common';
     };
 
     const stats = [
-      ['Team', health?.teamId || teamId],
+      ['Team', health?.teamId || teamId || '—'],
       ['Database', health?.dbMode || '—'],
       ['YOT configured', boolLabel(health?.yotConfigured, 'Configured', 'Missing')],
       ['Clients cached', fmtNumber(health?.counts?.clients)],
       ['Locations cached', fmtNumber(health?.counts?.locations)],
       ['Appointments cached', fmtNumber(health?.counts?.appointments)],
     ];
+
+    if (!teamId) {
+      return h('div', { style: t.card },
+        h('div', { className: 'text-sm font-medium', style: t.text }, 'YOT Overview & Health'),
+        h('div', { className: 'mt-2 text-sm', style: t.danger }, 'No team context was provided to the YOT plugin.'),
+        h('div', { className: 'mt-2 text-xs', style: t.faint }, 'Open this plugin from a specific team so it can query the correct yot-<team>.db cache instead of silently falling back to an empty default database.')
+      );
+    }
 
     return h('div', { className: 'space-y-3' },
       h('div', { style: t.card },

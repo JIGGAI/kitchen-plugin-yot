@@ -21,12 +21,13 @@ import { api, fmtNumber, formatDateTime, t } from './common';
   };
 
   function SyncRuns(props: any) {
-    const teamId = String(props?.teamId || 'default');
+    const teamId = typeof props?.teamId === 'string' && props.teamId.trim() ? props.teamId.trim() : null;
     const [rows, setRows] = useState([] as Row[]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null as string | null);
 
     const load = async () => {
+      if (!teamId) return;
       setLoading(true);
       setError(null);
       try {
@@ -39,7 +40,15 @@ import { api, fmtNumber, formatDateTime, t } from './common';
       }
     };
 
-    useEffect(() => { void load(); }, [teamId]);
+    useEffect(() => { if (teamId) void load(); else setLoading(false); }, [teamId]);
+
+    if (!teamId) {
+      return h('div', { style: t.card },
+        h('div', { className: 'text-sm font-medium', style: t.text }, 'Sync Runs'),
+        h('div', { className: 'mt-2 text-sm', style: t.danger }, 'No team context was provided to the YOT Sync Runs tab.'),
+        h('div', { className: 'mt-2 text-xs', style: t.faint }, 'Open this plugin from a specific team so it can query the correct yot-<team>.db cache instead of silently falling back to an empty default database.')
+      );
+    }
 
     return h('div', { className: 'space-y-3' },
       h('div', { style: t.card },
