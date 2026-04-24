@@ -60,20 +60,103 @@ export const locations = sqliteTable('locations', {
   syncedAt: text('synced_at').notNull(),
 });
 
+export const stylists = sqliteTable('stylists', {
+  id: text('id').primaryKey(),
+  teamId: text('team_id').notNull(),
+  locationId: text('location_id'),
+  privateId: text('private_id'),
+  givenName: text('given_name'),
+  surname: text('surname'),
+  fullName: text('full_name'),
+  emailAddress: text('email_address'),
+  mobilePhone: text('mobile_phone'),
+  active: integer('active', { mode: 'boolean' }),
+  sourceLocationId: text('source_location_id'),
+  raw: text('raw'),
+  syncedAt: text('synced_at').notNull(),
+});
+
+// NOTE: `appointments` carries both the legacy 0001 columns (staff_id,
+// starts_at, ends_at, total) and the slice-B columns (stylist_id, start_at,
+// end_at, gross/discount/net, created_at_remote, updated_at_remote).
+// Legacy columns remain writable for back-compat; the slice-D/F ingestion
+// (ticket 0119) will populate the newer shape.
 export const appointments = sqliteTable('appointments', {
   id: text('id').primaryKey(),
   teamId: text('team_id').notNull(),
   clientId: text('client_id'),
-  staffId: text('staff_id'),
+  staffId: text('staff_id'),           // legacy
+  stylistId: text('stylist_id'),
   serviceId: text('service_id'),
   locationId: text('location_id'),
-  startsAt: text('starts_at'),
-  endsAt: text('ends_at'),
+  startsAt: text('starts_at'),         // legacy
+  endsAt: text('ends_at'),             // legacy
+  startAt: text('start_at'),
+  endAt: text('end_at'),
   status: text('status'),
-  total: real('total'),
+  total: real('total'),                // legacy
+  grossAmount: real('gross_amount'),
+  discountAmount: real('discount_amount'),
+  netAmount: real('net_amount'),
+  createdAtRemote: text('created_at_remote'),
+  updatedAtRemote: text('updated_at_remote'),
   raw: text('raw'),
   syncedAt: text('synced_at').notNull(),
 });
+
+export const services = sqliteTable('services', {
+  id: text('id').primaryKey(),
+  teamId: text('team_id').notNull(),
+  locationId: text('location_id'),
+  name: text('name'),
+  durationMinutes: integer('duration_minutes'),
+  price: real('price'),
+  active: integer('active', { mode: 'boolean' }),
+  raw: text('raw'),
+  syncedAt: text('synced_at').notNull(),
+});
+
+export const promotions = sqliteTable('promotions', {
+  id: text('id').primaryKey(),
+  teamId: text('team_id').notNull(),
+  code: text('code'),
+  name: text('name'),
+  startAt: text('start_at'),
+  endAt: text('end_at'),
+  discountType: text('discount_type'),
+  discountValue: real('discount_value'),
+  locationId: text('location_id'),
+  active: integer('active', { mode: 'boolean' }),
+  raw: text('raw'),
+  syncedAt: text('synced_at').notNull(),
+});
+
+export const promotionUsage = sqliteTable('promotion_usage', {
+  id: text('id').primaryKey(),
+  teamId: text('team_id').notNull(),
+  promotionId: text('promotion_id').notNull(),
+  locationId: text('location_id'),
+  appointmentId: text('appointment_id'),
+  clientId: text('client_id'),
+  usedAt: text('used_at'),
+  discountAmount: real('discount_amount'),
+  raw: text('raw'),
+  syncedAt: text('synced_at').notNull(),
+});
+
+export const revenueFacts = sqliteTable('revenue_facts', {
+  teamId: text('team_id').notNull(),
+  locationId: text('location_id').notNull(),
+  date: text('date').notNull(),
+  grossAmount: real('gross_amount'),
+  discountAmount: real('discount_amount'),
+  netAmount: real('net_amount'),
+  appointmentCount: integer('appointment_count'),
+  uniqueClientCount: integer('unique_client_count'),
+  lastUpdatedAt: text('last_updated_at').notNull(),
+}, (t) => ({
+  pk: primaryKey({ columns: [t.teamId, t.locationId, t.date] }),
+}));
 
 export const syncState = sqliteTable('sync_state', {
   teamId: text('team_id').notNull(),
@@ -104,7 +187,33 @@ export type Client = typeof clients.$inferSelect;
 export type NewClient = typeof clients.$inferInsert;
 export type Location = typeof locations.$inferSelect;
 export type NewLocation = typeof locations.$inferInsert;
+export type Stylist = typeof stylists.$inferSelect;
+export type NewStylist = typeof stylists.$inferInsert;
 export type Appointment = typeof appointments.$inferSelect;
 export type NewAppointment = typeof appointments.$inferInsert;
+export type Service = typeof services.$inferSelect;
+export type NewService = typeof services.$inferInsert;
+export type Promotion = typeof promotions.$inferSelect;
+export type NewPromotion = typeof promotions.$inferInsert;
+export type PromotionUsage = typeof promotionUsage.$inferSelect;
+export type NewPromotionUsage = typeof promotionUsage.$inferInsert;
+export type RevenueFact = typeof revenueFacts.$inferSelect;
+export type NewRevenueFact = typeof revenueFacts.$inferInsert;
 export type SyncRun = typeof syncRuns.$inferSelect;
 export type NewSyncRun = typeof syncRuns.$inferInsert;
+
+/**
+ * Resource names for the `sync_state` table. Kept here as a constant so new
+ * resources get a single place to register.
+ */
+export const SYNC_RESOURCES = [
+  'clients',
+  'locations',
+  'stylists',
+  'appointments',
+  'services',
+  'promotions',
+  'promotion_usage',
+  'revenue_facts',
+] as const;
+export type SyncResource = typeof SYNC_RESOURCES[number];

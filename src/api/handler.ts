@@ -217,13 +217,53 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
 
   if (req.path === '/health' && req.method === 'GET') {
     const config = readYotConfig(teamId);
-    const { db } = initializeDatabase(teamId);
-    const syncRows = db.select().from(schema.syncState).where(eq(schema.syncState.teamId, teamId)).all();
-    const counts = {
-      clients: Number(db.select({ c: sql<number>`count(*)` }).from(schema.clients).where(eq(schema.clients.teamId, teamId)).all()?.[0]?.c || 0),
-      locations: Number(db.select({ c: sql<number>`count(*)` }).from(schema.locations).where(eq(schema.locations.teamId, teamId)).all()?.[0]?.c || 0),
-      appointments: Number(db.select({ c: sql<number>`count(*)` }).from(schema.appointments).where(eq(schema.appointments.teamId, teamId)).all()?.[0]?.c || 0),
+    const { db, sqlite } = initializeDatabase(teamId);
+    // Graceful count helper: if a table doesn't exist yet (e.g. a new
+    // resource whose migration hasn't run in this DB), return 0 instead of
+    // crashing /health.
+    const safeCount = (table: string): number => {
+      try {
+        const row: any = sqlite.prepare(`SELECT COUNT(*) AS c FROM "${table}" WHERE team_id = ?`).get(teamId);
+        return Number(row?.c || 0);
+      } catch {
+        return 0;
+      }
     };
+    const syncRows = (() => {
+      try { return db.select().from(schema.syncState).where(eq(schema.syncState.teamId, teamId)).all(); }
+      catch { return []; }
+    })();
+    const counts = {
+      clients: safeCount('clients'),
+      locations: safeCount('locations'),
+      stylists: safeCount('stylists'),
+      appointments: safeCount('appointments'),
+      services: safeCount('services'),
+      promotions: safeCount('promotions'),
+      promotion_usage: safeCount('promotion_usage'),
+      revenue_facts: (() => {
+        // revenue_facts is keyed on team_id as well but doesn't scope by ID;
+        // reuse the helper for consistency.
+        return safeCount('revenue_facts');
+      })(),
+    };
+    // Migration status: read __yot_migrations and report the highest applied
+    // filename (which is also our schema version marker since filenames are
+    // numerically prefixed: 0001_, 0002_, 0003_...).
+    let migrations: { version: string | null; applied: string[] } = { version: null, applied: [] };
+    try {
+      const rows: any[] = sqlite.prepare('SELECT name FROM __yot_migrations ORDER BY name ASC').all();
+      const applied = rows.map((r) => r.name as string);
+      migrations = { version: applied[applied.length - 1] || null, applied };
+    } catch {
+      migrations = { version: null, applied: [] };
+    }
+    // Per-resource last_success_at for dashboard freshness checks.
+    const lastSuccessByResource: Record<string, string | null> = {};
+    for (const resource of schema.SYNC_RESOURCES) {
+      const row = syncRows.find((r: schema.SyncRun | any) => r.resource === resource);
+      lastSuccessByResource[resource] = row?.lastSuccessAt ?? null;
+    }
     return {
       status: 200,
       data: {
@@ -231,7 +271,9 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         teamId,
         yotConfigured: Boolean(config),
         dbMode: `yot-${teamId}.db`,
+        migrations,
         counts,
+        lastSuccessByResource,
         syncState: syncRows,
       },
     };
