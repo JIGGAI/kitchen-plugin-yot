@@ -103,5 +103,9 @@ export async function api<T = any>(pluginId: string, teamId: string, path: strin
     throw new Error(text || `HTTP ${res.status}`);
   }
   if (!res.ok) throw new Error(json?.message || json?.error || `HTTP ${res.status}`);
-  return json?.data ?? json;
+  // Return the raw response envelope so tabs can access metadata (data, total, offset,
+  // manifest, state, etc.). Previously we unwrapped `.data` here, which caused a
+  // double-unwrap bug in list tabs (locations/clients/sync-runs) where `data?.data`
+  // was always undefined and tables rendered empty.
+  return json;
 }
