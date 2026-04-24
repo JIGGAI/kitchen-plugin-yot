@@ -25,7 +25,7 @@ import { api, boolLabel, fmtNumber, formatDateTime, t } from './common';
   };
 
   function Clients(props: any) {
-    const teamId = String(props?.teamId || 'default');
+    const teamId = typeof props?.teamId === 'string' && props.teamId.trim() ? props.teamId.trim() : null;
     const [rows, setRows] = useState([] as Row[]);
     const [searchInput, setSearchInput] = useState('');
     const [search, setSearch] = useState('');
@@ -51,6 +51,7 @@ import { api, boolLabel, fmtNumber, formatDateTime, t } from './common';
     };
 
     const load = async (nextOffset = offset, nextSearch = search) => {
+      if (!teamId) return;
       setLoading(true);
       setError(null);
       try {
@@ -69,10 +70,18 @@ import { api, boolLabel, fmtNumber, formatDateTime, t } from './common';
       }
     };
 
-    useEffect(() => { void load(0, search); }, [teamId]);
+    useEffect(() => { if (teamId) void load(0, search); else setLoading(false); }, [teamId]);
 
     const page = Math.floor(offset / limit) + 1;
     const totalPages = Math.max(1, Math.ceil(total / limit));
+
+    if (!teamId) {
+      return h('div', { style: t.card },
+        h('div', { className: 'text-sm font-medium', style: t.text }, 'Clients Cache'),
+        h('div', { className: 'mt-2 text-sm', style: t.danger }, 'No team context was provided to the YOT Clients tab.'),
+        h('div', { className: 'mt-2 text-xs', style: t.faint }, 'Open this plugin from a specific team so it can query the correct yot-<team>.db cache instead of silently falling back to an empty default database.')
+      );
+    }
 
     return h('div', { className: 'space-y-3' },
       h('div', { style: t.card },
