@@ -82,6 +82,37 @@ export async function fetchLocationStaff(config: YotConfig, locationId: number, 
   return Array.isArray(data) ? (data as Record<string, any>[]) : [];
 }
 
+export async function fetchStaffProfile(config: YotConfig, staffId: number): Promise<Record<string, any> | null> {
+  const res = await yotFetch(config, `/staff/profile/${staffId}`);
+  if (!res.ok) throw new Error(`YOT /staff/profile/${staffId} failed: ${res.status}`);
+  return await res.json().catch(() => null);
+}
+
+export async function fetchAppointmentsRange(
+  config: YotConfig,
+  opts: { locationId: number; staffId: number; date: number; enddate: number },
+): Promise<Record<string, any>> {
+  const params = new URLSearchParams();
+  params.set('locationId', String(opts.locationId));
+  params.set('staffId', String(opts.staffId));
+  params.set('date', String(opts.date));
+  params.set('enddate', String(opts.enddate));
+  const res = await yotFetch(config, `/appointmentsrange?${params.toString()}`);
+  if (!res.ok) throw new Error(`YOT /appointmentsrange failed: ${res.status}`);
+  const data = await res.json().catch(() => ({}));
+  return data && typeof data === 'object' ? (data as Record<string, any>) : {};
+}
+
+export function extractAppointmentsRangeRows(payload: Record<string, any> | null | undefined): Record<string, any>[] {
+  if (!payload || typeof payload !== 'object') return [];
+  const nested = payload.data;
+  if (nested && typeof nested === 'object' && Array.isArray((nested as any).appointments)) {
+    return (nested as any).appointments as Record<string, any>[];
+  }
+  if (Array.isArray((payload as any).appointments)) return (payload as any).appointments as Record<string, any>[];
+  return [];
+}
+
 export async function characterizeClientPaging(
   config: YotConfig,
   opts: { locationId?: number; maxPages?: number } = {},

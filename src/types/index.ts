@@ -68,26 +68,40 @@ export interface StylistRecord {
   givenName: string | null;
   surname: string | null;
   fullName: string | null;
+  initial: string | null;
+  jobTitle: string | null;
+  jobDescription: string | null;
   emailAddress: string | null;
   mobilePhone: string | null;
   active: boolean | null;
   sourceLocationId: string | null;
+  serviceCategoryNames: string[];
+  serviceIds: string[];
+  serviceNames: string[];
   syncedAt: string;
 }
 
 export interface StylistDetailRecord extends StylistRecord {
+  profileRaw: unknown | null;
   raw: unknown | null;
 }
 
 export interface AppointmentRecord {
   id: string;
+  appointmentId: string | null;
   clientId: string | null;
+  clientName: string | null;
   staffId: string | null;
+  stylistId: string | null;
   serviceId: string | null;
+  serviceNameRaw: string | null;
   locationId: string | null;
   startsAt: string | null;
   endsAt: string | null;
+  durationMinutes: number | null;
   status: string | null;
+  statusCode: string | null;
+  statusDescription: string | null;
   total: number | null;
   syncedAt: string;
 }
@@ -97,14 +111,21 @@ export interface ServiceRecord {
   serviceId: string | null;
   locationId: string | null;
   name: string | null;
+  categoryId: string | null;
+  categoryName: string | null;
   durationMinutes: number | null;
+  lengthDisplay: string | null;
   price: number | null;
+  priceDisplay: string | null;
   active: boolean | null;
+  staffPriceCount: number | null;
   syncedAt: string;
 }
 
 export interface ServiceDetailRecord extends ServiceRecord {
   localId: string | null;
+  description: string | null;
+  staffPriceOverrides: unknown | null;
   raw: unknown | null;
 }
 

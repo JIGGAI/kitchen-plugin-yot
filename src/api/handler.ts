@@ -8,10 +8,11 @@ import { randomUUID } from 'crypto';
 import { and, eq, sql } from 'drizzle-orm';
 import { initializeDatabase } from '../db';
 import * as schema from '../db/schema';
-import { characterizeClientPaging, fetchBusiness, fetchClients, fetchLocationServices, fetchLocationStaff, fetchLocations, ping } from '../drivers/yot-client';
+import { characterizeClientPaging, extractAppointmentsRangeRows, fetchAppointmentsRange, fetchBusiness, fetchClients, fetchLocationServices, fetchLocationStaff, fetchLocations, fetchStaffProfile, ping } from '../drivers/yot-client';
 import type { KitchenPluginContext } from './types-kitchen';
 import type {
   ApiError,
+  AppointmentRecord,
   ClientDetailRecord,
   ClientRecord,
   ExportManifestRecord,
@@ -179,10 +180,16 @@ function mapStylistRecord(row: schema.Stylist): StylistRecord {
     givenName: row.givenName ?? null,
     surname: row.surname ?? null,
     fullName: row.fullName ?? null,
+    initial: row.initial ?? null,
+    jobTitle: row.jobTitle ?? null,
+    jobDescription: row.jobDescription ?? null,
     emailAddress: row.emailAddress ?? null,
     mobilePhone: row.mobilePhone ?? null,
     active: row.active ?? null,
     sourceLocationId: row.sourceLocationId ?? null,
+    serviceCategoryNames: safeJsonParseArray(row.serviceCategoryNames ?? null),
+    serviceIds: safeJsonParseArray(row.serviceIds ?? null),
+    serviceNames: safeJsonParseArray(row.serviceNames ?? null),
     syncedAt: row.syncedAt,
   };
 }
@@ -190,7 +197,30 @@ function mapStylistRecord(row: schema.Stylist): StylistRecord {
 function mapStylistDetailRecord(row: schema.Stylist): StylistDetailRecord {
   return {
     ...mapStylistRecord(row),
+    profileRaw: safeJsonParse(row.profileRaw ?? null),
     raw: safeJsonParse(row.raw ?? null),
+  };
+}
+
+function mapAppointmentRecord(row: schema.Appointment): AppointmentRecord {
+  return {
+    id: row.id,
+    appointmentId: row.appointmentId ?? null,
+    clientId: row.clientId ?? null,
+    clientName: row.clientName ?? null,
+    staffId: row.staffId ?? null,
+    stylistId: row.stylistId ?? null,
+    serviceId: row.serviceId ?? null,
+    serviceNameRaw: row.serviceNameRaw ?? null,
+    locationId: row.locationId ?? null,
+    startsAt: row.startAt ?? row.startsAt ?? null,
+    endsAt: row.endAt ?? row.endsAt ?? null,
+    durationMinutes: row.durationMinutes ?? null,
+    status: row.status ?? null,
+    statusCode: row.statusCode ?? null,
+    statusDescription: row.statusDescription ?? null,
+    total: row.total ?? null,
+    syncedAt: row.syncedAt,
   };
 }
 
@@ -212,12 +242,17 @@ function mapSyncRun(row: schema.SyncRun): SyncRunRecord {
 function mapServiceRecord(row: schema.Service): ServiceRecord {
   return {
     id: row.id,
-    serviceId: row.id.includes(':') ? row.id.split(':').slice(1).join(':') : row.id,
+    serviceId: row.privateId ?? (row.id.includes(':') ? row.id.split(':').slice(1).join(':') : row.id),
     locationId: row.locationId ?? null,
     name: row.name ?? null,
+    categoryId: row.categoryId ?? null,
+    categoryName: row.categoryName ?? null,
     durationMinutes: row.durationMinutes ?? null,
+    lengthDisplay: row.lengthDisplay ?? null,
     price: row.price ?? null,
+    priceDisplay: row.priceDisplay ?? null,
     active: row.active ?? null,
+    staffPriceCount: row.staffPriceCount ?? null,
     syncedAt: row.syncedAt,
   };
 }
@@ -226,6 +261,8 @@ function mapServiceDetailRecord(row: schema.Service): ServiceDetailRecord {
   return {
     ...mapServiceRecord(row),
     localId: row.id,
+    description: row.description ?? null,
+    staffPriceOverrides: safeJsonParse(row.staffPriceOverrides ?? null),
     raw: safeJsonParse(row.raw ?? null),
   };
 }
@@ -239,6 +276,60 @@ function parseDurationMinutes(value: unknown): number | null {
   if (hourMatch) total += Number(hourMatch[1]) * 60;
   if (minuteMatch) total += Number(minuteMatch[1]);
   return total > 0 ? total : null;
+}
+
+function normalizeNameForLookup(value: unknown): string | null {
+  const text = cleanString(value);
+  return text ? text.replace(/\s+/g, ' ').trim().toLowerCase() : null;
+}
+
+function stripHtml(value: unknown): string | null {
+  const text = cleanString(value);
+  if (!text) return null;
+  const plain = text.replace(/<[^>]+>/g, ' ').replace(/&nbsp;/gi, ' ').replace(/\s+/g, ' ').trim();
+  return plain || null;
+}
+
+function localIsoFromParts(item: Record<string, any>, hourKey: 'startHour' | 'endHour', minuteKey: 'startMinute' | 'endMinute'): string | null {
+  const year = Number(item?.year);
+  const month = Number(item?.month);
+  const day = Number(item?.day);
+  const hour = Number(item?.[hourKey]);
+  const minute = Number(item?.[minuteKey]);
+  if (![year, month, day, hour, minute].every((n) => Number.isFinite(n))) return null;
+  return `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}T${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}:00`;
+}
+
+function computeDurationMinutes(item: Record<string, any>): number | null {
+  const startHour = Number(item?.startHour);
+  const startMinute = Number(item?.startMinute);
+  const endHour = Number(item?.endHour);
+  const endMinute = Number(item?.endMinute);
+  if (![startHour, startMinute, endHour, endMinute].every((n) => Number.isFinite(n))) return null;
+  return (endHour * 60 + endMinute) - (startHour * 60 + startMinute);
+}
+
+function collectStylistProfileDetails(profile: Record<string, any> | null): { categoryNames: string[]; serviceIds: string[]; serviceNames: string[] } {
+  const categoryNames = new Set<string>();
+  const serviceIds = new Set<string>();
+  const serviceNames = new Set<string>();
+  const categories = Array.isArray(profile?.serviceCategories) ? profile.serviceCategories : [];
+  for (const category of categories) {
+    const categoryName = cleanString(category?.categoryName ?? category?.category);
+    if (categoryName) categoryNames.add(categoryName);
+    const services = Array.isArray(category?.services) ? category.services : [];
+    for (const service of services) {
+      const serviceId = cleanString(service?.serviceId);
+      const serviceName = cleanString(service?.serviceName ?? service?.name);
+      if (serviceId) serviceIds.add(serviceId);
+      if (serviceName) serviceNames.add(serviceName);
+    }
+  }
+  return {
+    categoryNames: Array.from(categoryNames),
+    serviceIds: Array.from(serviceIds),
+    serviceNames: Array.from(serviceNames),
+  };
 }
 
 function parseBooleanFilter(value: string | undefined): boolean | null {
@@ -744,18 +835,30 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         for (const item of raw) {
           if (item?.id == null) continue;
           const stylistId = String(item.id);
+          let profile: Record<string, any> | null = null;
+          try {
+            profile = await fetchStaffProfile(config, Number(item.id));
+          } catch {}
+          const profileDetails = collectStylistProfileDetails(profile);
           const values: schema.NewStylist = {
             id: `${locationId}:${stylistId}`,
             teamId,
             locationId,
             privateId: stylistId,
-            givenName: null,
-            surname: null,
-            fullName: normalizeFullName(item),
-            emailAddress: cleanString(item.emailAddress),
-            mobilePhone: cleanString(item.mobilePhone),
+            givenName: cleanString(profile?.givenName ?? profile?.firstName ?? item.givenName ?? item.firstName),
+            surname: cleanString(profile?.surname ?? profile?.lastName ?? item.surname ?? item.lastName),
+            fullName: normalizeFullName(profile ?? item),
+            initial: cleanString(item.initial ?? profile?.initial),
+            jobTitle: cleanString(profile?.jobTitle ?? item.jobTitle),
+            jobDescription: cleanString(profile?.jobDescription ?? item.jobDescription),
+            emailAddress: cleanString(profile?.emailAddress ?? item.emailAddress),
+            mobilePhone: cleanString(profile?.mobilePhone ?? item.mobilePhone),
             active: typeof item.active === 'boolean' ? item.active : null,
             sourceLocationId: locationId,
+            serviceCategoryNames: JSON.stringify(profileDetails.categoryNames),
+            serviceIds: JSON.stringify(profileDetails.serviceIds),
+            serviceNames: JSON.stringify(profileDetails.serviceNames),
+            profileRaw: profile ? JSON.stringify(profile) : null,
             raw: JSON.stringify(item),
             syncedAt: now,
           };
@@ -778,6 +881,149 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         const { db } = initializeDatabase(teamId);
         db.update(schema.syncRuns).set({ status: 'error', completedAt: now, error: errMsg }).where(eq(schema.syncRuns.id, runId)).run();
         upsertSyncState(db, teamId, 'stylists', { lastSyncedAt: now, lastError: errMsg });
+      } catch {}
+      return apiError(502, 'YOT_ERROR', errMsg);
+    }
+  }
+
+  if (req.path === '/appointments' && req.method === 'GET') {
+    try {
+      const { db } = initializeDatabase(teamId);
+      const { limit, offset } = parsePagination(req.query);
+      const locationFilter = cleanString(req.query.locationId || req.query.location);
+      const stylistFilter = cleanString(req.query.stylistId || req.query.staffId);
+      const statusFilter = cleanString(req.query.statusCode || req.query.status);
+      const search = cleanString(req.query.search || req.query.q);
+      let rows = db.select().from(schema.appointments).where(eq(schema.appointments.teamId, teamId)).all() as schema.Appointment[];
+      if (locationFilter) rows = rows.filter((row) => row.locationId === locationFilter);
+      if (stylistFilter) rows = rows.filter((row) => row.stylistId === stylistFilter || row.staffId === stylistFilter);
+      if (statusFilter) rows = rows.filter((row) => row.statusCode === statusFilter || row.status === statusFilter);
+      if (search) {
+        const term = search.toLowerCase();
+        rows = rows.filter((row) => [row.clientName, row.serviceNameRaw, row.statusDescription, row.appointmentId, row.clientId].some((value) => String(value || '').toLowerCase().includes(term)));
+      }
+      rows.sort((a, b) => String(b.startAt || b.startsAt || '').localeCompare(String(a.startAt || a.startsAt || '')));
+      const total = rows.length;
+      return { status: 200, data: { data: rows.slice(offset, offset + limit).map(mapAppointmentRecord), total, limit, offset } };
+    } catch (error: any) {
+      return apiError(500, 'DATABASE_ERROR', error?.message || 'Failed to read appointments');
+    }
+  }
+
+  if (req.path === '/appointments/sync' && req.method === 'POST') {
+    const config = readYotConfig(teamId);
+    if (!config) return apiError(400, 'NOT_CONFIGURED', 'YOT apiKey not set for this team. POST /config first.');
+
+    const startedAt = new Date().toISOString();
+    const runId = randomUUID();
+    const lookbackDays = Math.max(1, Math.min(parseInt(req.query.lookbackDays || '30', 10) || 30, 365));
+    try {
+      const { db } = initializeDatabase(teamId);
+      db.insert(schema.syncRuns).values({ id: runId, teamId, resource: 'appointments', status: 'running', startedAt, notes: `lookbackDays=${lookbackDays}` }).run();
+      const locations = await fetchLocations(config);
+      const activeLocations = locations.filter((item) => item?.id != null && item?.active !== false);
+      const now = new Date().toISOString();
+      const enddate = Date.now();
+      const date = enddate - lookbackDays * 24 * 60 * 60 * 1000;
+      let rowsSeen = 0;
+      let rowsWritten = 0;
+      let locationsSynced = 0;
+      for (const location of activeLocations) {
+        const locationId = String(location.id);
+        const staff = await fetchLocationStaff(config, Number(location.id), { services: true });
+        const actor = staff.find((item) => item?.id != null);
+        if (!actor?.id) continue;
+        const serviceRows = db.select().from(schema.services).where(and(eq(schema.services.teamId, teamId), eq(schema.services.locationId, locationId))).all() as schema.Service[];
+        const serviceNameToId = new Map<string, string>();
+        for (const row of serviceRows) {
+          const norm = normalizeNameForLookup(row.name);
+          if (norm && row.privateId) serviceNameToId.set(norm, row.privateId);
+        }
+        const payload = await fetchAppointmentsRange(config, { locationId: Number(location.id), staffId: Number(actor.id), date, enddate });
+        const appointments = extractAppointmentsRangeRows(payload);
+        const statuses = Array.isArray(payload?.statuses) ? payload.statuses : [];
+        const categories = Array.isArray(payload?.categories) ? payload.categories : [];
+        const statusById = new Map<string, Record<string, any>>();
+        const categoryById = new Map<string, Record<string, any>>();
+        for (const item of statuses) if (item?.id != null) statusById.set(String(item.id), item);
+        for (const item of categories) if (item?.id != null) categoryById.set(String(item.id), item);
+        rowsSeen += appointments.length;
+        for (const item of appointments) {
+          if (item?.appointmentId == null) continue;
+          const appointmentId = String(item.appointmentId);
+          const serviceNameRaw = cleanString(item.service);
+          const serviceNameNorm = normalizeNameForLookup(item.service);
+          const statusId = cleanString(item.status);
+          const categoryId = cleanString(item.category);
+          const statusMeta = statusId ? statusById.get(statusId) : null;
+          const categoryMeta = categoryId ? categoryById.get(categoryId) : null;
+          const values: schema.NewAppointment = {
+            id: `${locationId}:${appointmentId}`,
+            teamId,
+            appointmentId,
+            internalId: cleanString(item.id),
+            clientId: cleanString(item.clientId),
+            clientName: cleanString(item.clientName),
+            clientPhone: cleanString(item.clientPhone),
+            clientNotes: cleanString(item.clientNotes),
+            staffId: cleanString(item.resourceId),
+            stylistId: cleanString(item.resourceId),
+            serviceId: serviceNameNorm ? serviceNameToId.get(serviceNameNorm) ?? null : null,
+            serviceNameRaw,
+            serviceNameNorm,
+            locationId,
+            startsAt: localIsoFromParts(item, 'startHour', 'startMinute'),
+            endsAt: localIsoFromParts(item, 'endHour', 'endMinute'),
+            startAt: localIsoFromParts(item, 'startHour', 'startMinute'),
+            endAt: localIsoFromParts(item, 'endHour', 'endMinute'),
+            status: cleanString(statusMeta?.description ?? item.status),
+            statusCode: cleanString(statusMeta?.code ?? item.status),
+            statusDescription: cleanString(statusMeta?.description),
+            categoryId,
+            categoryName: cleanString(categoryMeta?.description),
+            durationMinutes: computeDurationMinutes(item),
+            descriptionHtml: cleanString(item.description),
+            descriptionText: stripHtml(item.description),
+            referrer: cleanString(item.referrer),
+            promotionCode: cleanString(item.promotionCode),
+            arrivalNote: cleanString(item.arrivalNote),
+            reminderSent: typeof item.reminderSent === 'boolean' ? item.reminderSent : null,
+            cancelledFlag: typeof item.cancelled === 'boolean' ? item.cancelled : null,
+            onlineBooking: typeof item.onlineBooking === 'boolean' ? item.onlineBooking : null,
+            newClient: typeof item.newClient === 'boolean' ? item.newClient : null,
+            isClass: typeof item.isClass === 'boolean' ? item.isClass : null,
+            processingLength: typeof item.processingLength === 'number' ? item.processingLength : null,
+            total: null,
+            grossAmount: null,
+            discountAmount: null,
+            netAmount: null,
+            createdAtRemote: cleanString(item.createdAt),
+            createdBy: cleanString(item.createdBy),
+            updatedAtRemote: cleanString(item.updatedAt),
+            updatedBy: cleanString(item.updatedBy),
+            raw: JSON.stringify(item),
+            syncedAt: now,
+          };
+          const existing = db.select().from(schema.appointments).where(eq(schema.appointments.id, values.id)).all();
+          if (existing.length) {
+            db.update(schema.appointments).set({ ...values }).where(eq(schema.appointments.id, values.id)).run();
+          } else {
+            db.insert(schema.appointments).values(values).run();
+          }
+          rowsWritten++;
+        }
+        locationsSynced++;
+      }
+      upsertSyncState(db, teamId, 'appointments', { lastSyncedAt: now, lastSuccessAt: now, lastError: null, rowCount: rowsWritten });
+      db.update(schema.syncRuns).set({ status: 'success', completedAt: now, rowsSeen, rowsWritten, pageCount: locationsSynced, notes: `lookbackDays=${lookbackDays}; locations=${locationsSynced}` }).where(eq(schema.syncRuns.id, runId)).run();
+      return { status: 200, data: { ok: true, synced: rowsWritten, rowsSeen, locationCount: locationsSynced, lookbackDays, startedAt, completedAt: now } };
+    } catch (error: any) {
+      const errMsg = error?.message || String(error);
+      const now = new Date().toISOString();
+      try {
+        const { db } = initializeDatabase(teamId);
+        db.update(schema.syncRuns).set({ status: 'error', completedAt: now, error: errMsg }).where(eq(schema.syncRuns.id, runId)).run();
+        upsertSyncState(db, teamId, 'appointments', { lastSyncedAt: now, lastError: errMsg });
       } catch {}
       return apiError(502, 'YOT_ERROR', errMsg);
     }
@@ -840,17 +1086,25 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
           for (const item of services) {
             if (item?.serviceId == null) continue;
             const serviceId = String(item.serviceId);
-            const rawItem = { ...item };
-            delete (rawItem as any).staffPrices;
+            const staffPrices = Array.isArray(item?.staffPrices) ? item.staffPrices : [];
+            const nonEmptyStaffPrices = staffPrices.filter((row: any) => cleanString(row?.price) != null);
             const values: schema.NewService = {
               id: `${locationId}:${serviceId}`,
               teamId,
               locationId,
+              privateId: serviceId,
               name: cleanString(item.serviceName ?? item.name),
+              categoryId: cleanString(item.categoryId ?? category?.categoryId),
+              categoryName: cleanString(item.categoryName ?? category?.category),
               durationMinutes: parseDurationMinutes(item.length),
+              lengthDisplay: cleanString(item.length),
               price: typeof item.priceValue === 'number' ? item.priceValue : null,
+              priceDisplay: cleanString(item.price),
+              description: cleanString(item.description),
               active: typeof item.active === 'boolean' ? item.active : null,
-              raw: JSON.stringify({ ...rawItem, locationId, category: cleanString(category?.category) }),
+              staffPriceCount: staffPrices.length || 0,
+              staffPriceOverrides: JSON.stringify(nonEmptyStaffPrices),
+              raw: JSON.stringify({ ...item, locationId, category: cleanString(category?.category) }),
               syncedAt: now,
             };
             const existing = db.select().from(schema.services).where(eq(schema.services.id, values.id)).all();
