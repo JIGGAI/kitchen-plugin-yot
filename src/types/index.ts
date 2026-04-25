@@ -63,6 +63,28 @@ export interface AppointmentRecord {
   syncedAt: string;
 }
 
+export interface StylistRecord {
+  id: string;
+  stylistId: string | null;
+  locationId: string | null;
+  fullName: string | null;
+  givenName: string | null;
+  surname: string | null;
+  active: boolean | null;
+  syncedAt: string;
+}
+
+export interface ServiceRecord {
+  id: string;
+  serviceId: string | null;
+  locationId: string | null;
+  name: string | null;
+  durationMinutes: number | null;
+  price: number | null;
+  active: boolean | null;
+  syncedAt: string;
+}
+
 export interface SyncStateRecord {
   resource: string;
   lastSyncedAt: string | null;

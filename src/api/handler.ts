@@ -8,9 +8,9 @@ import { randomUUID } from 'crypto';
 import { and, eq, sql } from 'drizzle-orm';
 import { initializeDatabase } from '../db';
 import * as schema from '../db/schema';
-import { characterizeClientPaging, fetchBusiness, fetchClients, fetchLocations, ping } from '../drivers/yot-client';
+import { characterizeClientPaging, fetchBusiness, fetchClients, fetchLocationServices, fetchLocationStaff, fetchLocations, ping } from '../drivers/yot-client';
 import type { KitchenPluginContext } from './types-kitchen';
-import type { ApiError, ClientRecord, ExportManifestRecord, LocationRecord, SyncRunRecord, YotConfig } from '../types';
+import type { ApiError, ClientRecord, ExportManifestRecord, LocationRecord, ServiceRecord, StylistRecord, SyncRunRecord, YotConfig } from '../types';
 
 export type PluginRequest = {
   method: string;
@@ -147,6 +147,32 @@ function mapSyncRun(row: schema.SyncRun): SyncRunRecord {
   };
 }
 
+function mapStylistRecord(row: schema.Stylist): StylistRecord {
+  return {
+    id: row.id,
+    stylistId: row.privateId ?? null,
+    locationId: row.locationId ?? null,
+    fullName: row.fullName ?? null,
+    givenName: row.givenName ?? null,
+    surname: row.surname ?? null,
+    active: row.active ?? null,
+    syncedAt: row.syncedAt,
+  };
+}
+
+function mapServiceRecord(row: schema.Service): ServiceRecord {
+  return {
+    id: row.id,
+    serviceId: row.id.includes(':') ? row.id.split(':').slice(1).join(':') : row.id,
+    locationId: row.locationId ?? null,
+    name: row.name ?? null,
+    durationMinutes: row.durationMinutes ?? null,
+    price: row.price ?? null,
+    active: row.active ?? null,
+    syncedAt: row.syncedAt,
+  };
+}
+
 function parseBooleanFilter(value: string | undefined): boolean | null {
   if (value == null || value === '') return null;
   const normalized = String(value).toLowerCase();
@@ -190,7 +216,9 @@ function writeExportFiles(teamId: string, db: ReturnType<typeof initializeDataba
   const datasets: Array<{ name: string; rows: unknown[] }> = [
     { name: 'clients.json', rows: db.select().from(schema.clients).where(eq(schema.clients.teamId, teamId)).all() },
     { name: 'locations.json', rows: db.select().from(schema.locations).where(eq(schema.locations.teamId, teamId)).all() },
+    { name: 'stylists.json', rows: db.select().from(schema.stylists).where(eq(schema.stylists.teamId, teamId)).all() },
     { name: 'appointments.json', rows: db.select().from(schema.appointments).where(eq(schema.appointments.teamId, teamId)).all() },
+    { name: 'services.json', rows: db.select().from(schema.services).where(eq(schema.services.teamId, teamId)).all() },
     { name: 'sync-state.json', rows: db.select().from(schema.syncState).where(eq(schema.syncState.teamId, teamId)).all() },
     { name: 'sync-runs.json', rows: db.select().from(schema.syncRuns).where(eq(schema.syncRuns.teamId, teamId)).all() },
   ];
@@ -568,6 +596,186 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         const { db } = initializeDatabase(teamId);
         db.update(schema.syncRuns).set({ status: 'error', completedAt: now, error: errMsg }).where(eq(schema.syncRuns.id, runId)).run();
         upsertSyncState(db, teamId, 'clients', { lastSyncedAt: now, lastError: errMsg });
+      } catch {}
+      return apiError(502, 'YOT_ERROR', errMsg);
+    }
+  }
+
+
+  if (req.path === '/stylists' && req.method === 'GET') {
+    try {
+      const { db } = initializeDatabase(teamId);
+      const { limit, offset } = parsePagination(req.query);
+      const locationFilter = cleanString(req.query.locationId || req.query.location);
+      const activeFilter = parseBooleanFilter(req.query.active);
+      const search = cleanString(req.query.search || req.query.q);
+      let rows = db.select().from(schema.stylists).where(eq(schema.stylists.teamId, teamId)).all() as schema.Stylist[];
+      if (locationFilter) rows = rows.filter((row) => row.locationId === locationFilter);
+      if (activeFilter !== null) rows = rows.filter((row) => row.active === activeFilter);
+      if (search) {
+        const term = search.toLowerCase();
+        rows = rows.filter((row) =>
+          [row.fullName, row.givenName, row.surname, row.privateId]
+            .some((value) => String(value || '').toLowerCase().includes(term))
+        );
+      }
+      rows.sort((a, b) => String(a.fullName || a.givenName || '').localeCompare(String(b.fullName || b.givenName || '')));
+      const total = rows.length;
+      return { status: 200, data: { data: rows.slice(offset, offset + limit).map(mapStylistRecord), total, limit, offset } };
+    } catch (error: any) {
+      return apiError(500, 'DATABASE_ERROR', error?.message || 'Failed to read stylists');
+    }
+  }
+
+  if (req.path === '/stylists/sync' && req.method === 'POST') {
+    const config = readYotConfig(teamId);
+    if (!config) return apiError(400, 'NOT_CONFIGURED', 'YOT apiKey not set for this team. POST /config first.');
+
+    const startedAt = new Date().toISOString();
+    const runId = randomUUID();
+    try {
+      const { db } = initializeDatabase(teamId);
+      db.insert(schema.syncRuns).values({ id: runId, teamId, resource: 'stylists', status: 'running', startedAt }).run();
+      const locations = await fetchLocations(config);
+      const activeLocations = locations.filter((item) => item?.id != null && item?.active !== false);
+      const now = new Date().toISOString();
+      let rowsSeen = 0;
+      let rowsWritten = 0;
+      for (const location of activeLocations) {
+        const locationId = String(location.id);
+        const raw = await fetchLocationStaff(config, Number(location.id), { services: true });
+        rowsSeen += raw.length;
+        for (const item of raw) {
+          if (item?.id == null) continue;
+          const stylistId = String(item.id);
+          const values: schema.NewStylist = {
+            id: `${locationId}:${stylistId}`,
+            teamId,
+            locationId,
+            privateId: stylistId,
+            givenName: null,
+            surname: null,
+            fullName: normalizeFullName(item),
+            emailAddress: cleanString(item.emailAddress),
+            mobilePhone: cleanString(item.mobilePhone),
+            active: typeof item.active === 'boolean' ? item.active : null,
+            sourceLocationId: locationId,
+            raw: JSON.stringify(item),
+            syncedAt: now,
+          };
+          const existing = db.select().from(schema.stylists).where(eq(schema.stylists.id, values.id)).all();
+          if (existing.length) {
+            db.update(schema.stylists).set({ ...values }).where(eq(schema.stylists.id, values.id)).run();
+          } else {
+            db.insert(schema.stylists).values(values).run();
+          }
+          rowsWritten++;
+        }
+      }
+      upsertSyncState(db, teamId, 'stylists', { lastSyncedAt: now, lastSuccessAt: now, lastError: null, rowCount: rowsWritten });
+      db.update(schema.syncRuns).set({ status: 'success', completedAt: now, rowsSeen, rowsWritten, pageCount: activeLocations.length, notes: `locations=${activeLocations.length}` }).where(eq(schema.syncRuns.id, runId)).run();
+      return { status: 200, data: { ok: true, synced: rowsWritten, rowsSeen, locationCount: activeLocations.length, startedAt, completedAt: now } };
+    } catch (error: any) {
+      const errMsg = error?.message || String(error);
+      const now = new Date().toISOString();
+      try {
+        const { db } = initializeDatabase(teamId);
+        db.update(schema.syncRuns).set({ status: 'error', completedAt: now, error: errMsg }).where(eq(schema.syncRuns.id, runId)).run();
+        upsertSyncState(db, teamId, 'stylists', { lastSyncedAt: now, lastError: errMsg });
+      } catch {}
+      return apiError(502, 'YOT_ERROR', errMsg);
+    }
+  }
+
+  if (req.path === '/services' && req.method === 'GET') {
+    try {
+      const { db } = initializeDatabase(teamId);
+      const { limit, offset } = parsePagination(req.query);
+      const locationFilter = cleanString(req.query.locationId || req.query.location);
+      const activeFilter = parseBooleanFilter(req.query.active);
+      const search = cleanString(req.query.search || req.query.q);
+      let rows = db.select().from(schema.services).where(eq(schema.services.teamId, teamId)).all() as schema.Service[];
+      if (locationFilter) rows = rows.filter((row) => row.locationId === locationFilter);
+      if (activeFilter !== null) rows = rows.filter((row) => row.active === activeFilter);
+      if (search) {
+        const term = search.toLowerCase();
+        rows = rows.filter((row) => [row.name, row.id].some((value) => String(value || '').toLowerCase().includes(term)));
+      }
+      rows.sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+      const total = rows.length;
+      return { status: 200, data: { data: rows.slice(offset, offset + limit).map(mapServiceRecord), total, limit, offset } };
+    } catch (error: any) {
+      return apiError(500, 'DATABASE_ERROR', error?.message || 'Failed to read services');
+    }
+  }
+
+  if (req.path === '/services/sync' && req.method === 'POST') {
+    const config = readYotConfig(teamId);
+    if (!config) return apiError(400, 'NOT_CONFIGURED', 'YOT apiKey not set for this team. POST /config first.');
+
+    const parseDurationMinutes = (value: unknown): number | null => {
+      const text = cleanString(value);
+      if (!text) return null;
+      let total = 0;
+      const hourMatch = text.match(/(\d+)\s*hr/i);
+      const minuteMatch = text.match(/(\d+)\s*min/i);
+      if (hourMatch) total += Number(hourMatch[1]) * 60;
+      if (minuteMatch) total += Number(minuteMatch[1]);
+      return total > 0 ? total : null;
+    };
+
+    const startedAt = new Date().toISOString();
+    const runId = randomUUID();
+    try {
+      const { db } = initializeDatabase(teamId);
+      db.insert(schema.syncRuns).values({ id: runId, teamId, resource: 'services', status: 'running', startedAt }).run();
+      const locations = await fetchLocations(config);
+      const activeLocations = locations.filter((item) => item?.id != null && item?.active !== false);
+      const now = new Date().toISOString();
+      let rowsSeen = 0;
+      let rowsWritten = 0;
+      for (const location of activeLocations) {
+        const locationId = String(location.id);
+        const categories = await fetchLocationServices(config, Number(location.id));
+        for (const category of categories) {
+          const services = Array.isArray(category?.services) ? category.services : [];
+          rowsSeen += services.length;
+          for (const item of services) {
+            if (item?.serviceId == null) continue;
+            const serviceId = String(item.serviceId);
+            const rawItem = { ...item };
+            delete (rawItem as any).staffPrices;
+            const values: schema.NewService = {
+              id: `${locationId}:${serviceId}`,
+              teamId,
+              locationId,
+              name: cleanString(item.serviceName ?? item.name),
+              durationMinutes: parseDurationMinutes(item.length),
+              price: typeof item.priceValue === 'number' ? item.priceValue : null,
+              active: typeof item.active === 'boolean' ? item.active : null,
+              raw: JSON.stringify({ ...rawItem, locationId, category: cleanString(category?.category) }),
+              syncedAt: now,
+            };
+            const existing = db.select().from(schema.services).where(eq(schema.services.id, values.id)).all();
+            if (existing.length) {
+              db.update(schema.services).set({ ...values }).where(eq(schema.services.id, values.id)).run();
+            } else {
+              db.insert(schema.services).values(values).run();
+            }
+            rowsWritten++;
+          }
+        }
+      }
+      upsertSyncState(db, teamId, 'services', { lastSyncedAt: now, lastSuccessAt: now, lastError: null, rowCount: rowsWritten });
+      db.update(schema.syncRuns).set({ status: 'success', completedAt: now, rowsSeen, rowsWritten, pageCount: activeLocations.length, notes: `locations=${activeLocations.length}` }).where(eq(schema.syncRuns.id, runId)).run();
+      return { status: 200, data: { ok: true, synced: rowsWritten, rowsSeen, locationCount: activeLocations.length, startedAt, completedAt: now } };
+    } catch (error: any) {
+      const errMsg = error?.message || String(error);
+      const now = new Date().toISOString();
+      try {
+        const { db } = initializeDatabase(teamId);
+        db.update(schema.syncRuns).set({ status: 'error', completedAt: now, error: errMsg }).where(eq(schema.syncRuns.id, runId)).run();
+        upsertSyncState(db, teamId, 'services', { lastSyncedAt: now, lastError: errMsg });
       } catch {}
       return apiError(502, 'YOT_ERROR', errMsg);
     }

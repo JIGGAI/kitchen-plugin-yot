@@ -66,6 +66,22 @@ export async function fetchClients(
   return [];
 }
 
+export async function fetchLocationServices(config: YotConfig, locationId: number): Promise<Record<string, any>[]> {
+  const res = await yotFetch(config, `/${locationId}/services`);
+  if (!res.ok) throw new Error(`YOT /${locationId}/services failed: ${res.status}`);
+  const data = await res.json().catch(() => []);
+  return Array.isArray(data) ? (data as Record<string, any>[]) : [];
+}
+
+export async function fetchLocationStaff(config: YotConfig, locationId: number, opts: { services?: boolean } = {}): Promise<Record<string, any>[]> {
+  const params = new URLSearchParams();
+  params.set('services', String(opts.services ?? true));
+  const res = await yotFetch(config, `/${locationId}/staff?${params.toString()}`);
+  if (!res.ok) throw new Error(`YOT /${locationId}/staff failed: ${res.status}`);
+  const data = await res.json().catch(() => []);
+  return Array.isArray(data) ? (data as Record<string, any>[]) : [];
+}
+
 export async function characterizeClientPaging(
   config: YotConfig,
   opts: { locationId?: number; maxPages?: number } = {},
