@@ -57,7 +57,7 @@ import { api, boolLabel, describeFreshness, fmtNumber, formatDateTime, t } from 
           setMessage(`${label} complete • ${data?.manifest?.directory || 'snapshot written'}`);
         } else if (key === 'clients') {
           setMessage(`${label} complete • ${fmtNumber(data?.synced)} clients synced across ${fmtNumber(data?.pageCount)} pages`);
-        } else if (key === 'stylists' || key === 'services') {
+        } else if (key === 'stylists' || key === 'services' || key === 'appointments') {
           setMessage(`${label} complete • ${fmtNumber(data?.synced)} rows across ${fmtNumber(data?.locationCount)} locations`);
         } else {
           setMessage(`${label} complete`);
@@ -113,6 +113,7 @@ import { api, boolLabel, describeFreshness, fmtNumber, formatDateTime, t } from 
           h('button', { type: 'button', style: t.btnGhost, disabled: !!busy || !health?.yotConfigured, onClick: () => void runAction('clients', 'Limited client sync', '/clients/sync?maxPages=5') }, busy === 'clients' ? 'Syncing…' : 'Limited client sync'),
           h('button', { type: 'button', style: t.btnGhost, disabled: !!busy || !health?.yotConfigured, onClick: () => void runAction('stylists', 'Stylists sync', '/stylists/sync') }, busy === 'stylists' ? 'Syncing…' : 'Sync stylists'),
           h('button', { type: 'button', style: t.btnGhost, disabled: !!busy || !health?.yotConfigured, onClick: () => void runAction('services', 'Services sync', '/services/sync') }, busy === 'services' ? 'Syncing…' : 'Sync services'),
+          h('button', { type: 'button', style: t.btnGhost, disabled: !!busy || !health?.yotConfigured, onClick: () => void runAction('appointments', 'Appointments sync', '/appointments/sync?lookbackDays=30') }, busy === 'appointments' ? 'Syncing…' : 'Sync appointments (30d)'),
           h('button', { type: 'button', style: t.btnGhost, disabled: !!busy, onClick: () => void runAction('export', 'Export snapshot', '/export') }, busy === 'export' ? 'Exporting…' : 'Export snapshot')
         )
       ),
