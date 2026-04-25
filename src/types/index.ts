@@ -75,6 +75,10 @@ export interface StylistRecord {
   syncedAt: string;
 }
 
+export interface StylistDetailRecord extends StylistRecord {
+  raw: unknown | null;
+}
+
 export interface AppointmentRecord {
   id: string;
   clientId: string | null;
@@ -97,6 +101,11 @@ export interface ServiceRecord {
   price: number | null;
   active: boolean | null;
   syncedAt: string;
+}
+
+export interface ServiceDetailRecord extends ServiceRecord {
+  localId: string | null;
+  raw: unknown | null;
 }
 
 export interface SyncStateRecord {

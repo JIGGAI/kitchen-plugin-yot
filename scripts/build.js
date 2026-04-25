@@ -13,6 +13,10 @@ fs.mkdirSync(distDir, { recursive: true });
 fs.mkdirSync(path.join(distDir, 'api'), { recursive: true });
 fs.mkdirSync(path.join(distDir, 'tabs'), { recursive: true });
 
+const esbuildBin = process.platform === 'win32'
+  ? `"${path.join(root, 'node_modules', '.bin', 'esbuild.cmd')}"`
+  : `"${path.join(root, 'node_modules', '.bin', 'esbuild')}"`;
+
 const externals = [
   '--external:better-sqlite3',
   '--external:drizzle-orm',
@@ -27,13 +31,13 @@ const externals = [
 
 try {
   execSync(
-    `esbuild src/index.ts --bundle --platform=node --target=node18 --format=cjs --outfile=dist/index.js ${externals}`,
+    `${esbuildBin} src/index.ts --bundle --platform=node --target=node18 --format=cjs --outfile=dist/index.js ${externals}`,
     { cwd: root, stdio: 'inherit' }
   );
   console.log('✓ Built dist/index.js');
 
   execSync(
-    `esbuild src/api/handler.ts --bundle --platform=node --target=node18 --format=cjs --outfile=dist/api/handler.js ${externals}`,
+    `${esbuildBin} src/api/handler.ts --bundle --platform=node --target=node18 --format=cjs --outfile=dist/api/handler.js ${externals}`,
     { cwd: root, stdio: 'inherit' }
   );
   console.log('✓ Built dist/api/handler.js');
@@ -44,7 +48,7 @@ try {
     for (const tabFile of tabFiles) {
       const name = tabFile.replace('.tsx', '');
       execSync(
-        `esbuild src/tabs/${tabFile} --bundle --platform=browser --target=es2020 --format=iife --outfile=dist/tabs/${name}.js --jsx=automatic`,
+        `${esbuildBin} src/tabs/${tabFile} --bundle --platform=browser --target=es2020 --format=iife --outfile=dist/tabs/${name}.js --jsx=automatic`,
         { cwd: root, stdio: 'inherit' }
       );
       console.log(`✓ Built dist/tabs/${name}.js`);

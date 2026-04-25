@@ -17,7 +17,9 @@ import type {
   ExportManifestRecord,
   LocationDetailRecord,
   LocationRecord,
+  ServiceDetailRecord,
   ServiceRecord,
+  StylistDetailRecord,
   StylistRecord,
   SyncRunRecord,
   YotConfig,
@@ -185,6 +187,13 @@ function mapStylistRecord(row: schema.Stylist): StylistRecord {
   };
 }
 
+function mapStylistDetailRecord(row: schema.Stylist): StylistDetailRecord {
+  return {
+    ...mapStylistRecord(row),
+    raw: safeJsonParse(row.raw ?? null),
+  };
+}
+
 function mapSyncRun(row: schema.SyncRun): SyncRunRecord {
   return {
     id: row.id,
@@ -211,6 +220,25 @@ function mapServiceRecord(row: schema.Service): ServiceRecord {
     active: row.active ?? null,
     syncedAt: row.syncedAt,
   };
+}
+
+function mapServiceDetailRecord(row: schema.Service): ServiceDetailRecord {
+  return {
+    ...mapServiceRecord(row),
+    localId: row.id,
+    raw: safeJsonParse(row.raw ?? null),
+  };
+}
+
+function parseDurationMinutes(value: unknown): number | null {
+  const text = cleanString(value);
+  if (!text) return null;
+  let total = 0;
+  const hourMatch = text.match(/(\d+)\s*hr/i);
+  const minuteMatch = text.match(/(\d+)\s*min/i);
+  if (hourMatch) total += Number(hourMatch[1]) * 60;
+  if (minuteMatch) total += Number(minuteMatch[1]);
+  return total > 0 ? total : null;
 }
 
 function parseBooleanFilter(value: string | undefined): boolean | null {
@@ -567,6 +595,18 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     }
   }
 
+  const stylistMatch = req.path.match(/^\/stylists\/([^/]+)$/);
+  if (stylistMatch && req.method === 'GET') {
+    try {
+      const { db } = initializeDatabase(teamId);
+      const rows = db.select().from(schema.stylists).where(and(eq(schema.stylists.teamId, teamId), eq(schema.stylists.id, stylistMatch[1]!))).all();
+      if (!rows.length) return apiError(404, 'NOT_FOUND', 'Stylist not found');
+      return { status: 200, data: mapStylistDetailRecord(rows[0]) };
+    } catch (error: any) {
+      return apiError(500, 'DATABASE_ERROR', error?.message || 'Failed to read stylist');
+    }
+  }
+
   if (req.path === '/stylists' && req.method === 'GET') {
     try {
       const { db } = initializeDatabase(teamId);
@@ -743,6 +783,18 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     }
   }
 
+  const serviceMatch = req.path.match(/^\/services\/([^/]+)$/);
+  if (serviceMatch && req.method === 'GET') {
+    try {
+      const { db } = initializeDatabase(teamId);
+      const rows = db.select().from(schema.services).where(and(eq(schema.services.teamId, teamId), eq(schema.services.id, serviceMatch[1]!))).all();
+      if (!rows.length) return apiError(404, 'NOT_FOUND', 'Service not found');
+      return { status: 200, data: mapServiceDetailRecord(rows[0]) };
+    } catch (error: any) {
+      return apiError(500, 'DATABASE_ERROR', error?.message || 'Failed to read service');
+    }
+  }
+
   if (req.path === '/services' && req.method === 'GET') {
     try {
       const { db } = initializeDatabase(teamId);
@@ -768,17 +820,6 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
   if (req.path === '/services/sync' && req.method === 'POST') {
     const config = readYotConfig(teamId);
     if (!config) return apiError(400, 'NOT_CONFIGURED', 'YOT apiKey not set for this team. POST /config first.');
-
-    const parseDurationMinutes = (value: unknown): number | null => {
-      const text = cleanString(value);
-      if (!text) return null;
-      let total = 0;
-      const hourMatch = text.match(/(\d+)\s*hr/i);
-      const minuteMatch = text.match(/(\d+)\s*min/i);
-      if (hourMatch) total += Number(hourMatch[1]) * 60;
-      if (minuteMatch) total += Number(minuteMatch[1]);
-      return total > 0 ? total : null;
-    };
 
     const startedAt = new Date().toISOString();
     const runId = randomUUID();

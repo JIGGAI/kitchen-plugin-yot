@@ -46,6 +46,12 @@
         "bundle": "./dist/tabs/stylists.js"
       },
       {
+        "id": "services",
+        "label": "Services",
+        "icon": "list",
+        "bundle": "./dist/tabs/services.js"
+      },
+      {
         "id": "sync-runs",
         "label": "Sync Runs",
         "icon": "clock",

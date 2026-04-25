@@ -1,4 +1,4 @@
-import { api, boolLabel, describeFreshness, fieldValue, formatDateTime, formatRelativeTime, t } from './common';
+import { api, boolLabel, describeFreshness, fieldValue, formatDateTime, formatRelativeTime, modal, parseRawJson, t, useEscapeToClose } from './common';
 
 (function () {
   const R = (window as any).React;
@@ -21,6 +21,7 @@ import { api, boolLabel, describeFreshness, fieldValue, formatDateTime, formatRe
     syncedAt: string;
   };
 
+  type Detail = Row & { raw: unknown | null };
   type LocationOption = { id: string; name: string | null };
   type SyncState = { resource: string; lastSyncedAt: string | null; lastSuccessAt: string | null; lastError: string | null; rowCount: number | null };
   type SyncRun = { id: string; resource: string; status: string; startedAt: string; completedAt: string | null; rowsWritten: number | null; rowsSeen: number | null; error: string | null; notes: string | null };
@@ -36,6 +37,28 @@ import { api, boolLabel, describeFreshness, fieldValue, formatDateTime, formatRe
     minWidth: '10rem',
   };
 
+  const noteCard = {
+    background: 'rgba(255,255,255,0.02)',
+    border: '1px solid rgba(255,255,255,0.06)',
+    borderRadius: '10px',
+    padding: '0.75rem',
+  };
+
+  const detailLabel = {
+    fontSize: '0.72rem',
+    color: 'var(--ck-text-tertiary)',
+    textTransform: 'uppercase' as const,
+    letterSpacing: '0.04em',
+  };
+
+  const detailValue = {
+    marginTop: '0.2rem',
+    color: 'var(--ck-text-primary)',
+    fontSize: '0.9rem',
+    lineHeight: 1.4,
+    wordBreak: 'break-word' as const,
+  };
+
   function Stylists(props: any) {
     const teamId = typeof props?.teamId === 'string' && props.teamId.trim() ? props.teamId.trim() : null;
     const [rows, setRows] = useState([] as Row[]);
@@ -48,14 +71,46 @@ import { api, boolLabel, describeFreshness, fieldValue, formatDateTime, formatRe
     const [latestRun, setLatestRun] = useState(null as SyncRun | null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null as string | null);
+    const [selectedId, setSelectedId] = useState(null as string | null);
+    const [detail, setDetail] = useState(null as Detail | null);
+    const [detailLoading, setDetailLoading] = useState(false);
+    const [detailError, setDetailError] = useState(null as string | null);
 
-    const displayName = (row: Row) => row.fullName || [row.givenName, row.surname].filter(Boolean).join(' ').trim() || 'Unnamed stylist';
+    useEscapeToClose(R, !!selectedId, () => {
+      setSelectedId(null);
+      setDetail(null);
+      setDetailError(null);
+    });
+
+    const displayName = (row: Row | Detail) => row.fullName || [row.givenName, row.surname].filter(Boolean).join(' ').trim() || 'Unnamed stylist';
 
     const locationName = (id: string | null) => {
       if (!id) return '—';
       const match = locations.find((loc: LocationOption) => String(loc.id) === String(id));
       return match?.name || id;
     };
+
+    const openDetail = async (id: string) => {
+      if (!teamId) return;
+      setSelectedId(id);
+      setDetail(null);
+      setDetailError(null);
+      setDetailLoading(true);
+      try {
+        const data = await api('yot', teamId, `/stylists/${encodeURIComponent(id)}`) as Detail;
+        setDetail({ ...data, raw: parseRawJson(data?.raw) });
+      } catch (e: any) {
+        setDetailError(e?.message || 'Failed to load stylist details');
+      } finally {
+        setDetailLoading(false);
+      }
+    };
+
+    const detailField = (label: string, value: any) =>
+      h('div', { key: label, style: noteCard },
+        h('div', { style: detailLabel }, label),
+        h('div', { style: detailValue }, value)
+      );
 
     const load = async () => {
       if (!teamId) return;
@@ -172,7 +227,8 @@ import { api, boolLabel, describeFreshness, fieldValue, formatDateTime, formatRe
                   h('th', { style: t.th }, 'Location'),
                   h('th', { style: t.th }, 'Contact'),
                   h('th', { style: t.th }, 'Active'),
-                  h('th', { style: t.th }, 'Synced')
+                  h('th', { style: t.th }, 'Synced'),
+                  h('th', { style: t.th }, 'Details')
                 )),
                 h('tbody', null,
                   ...rows.map((row: Row) => h('tr', { key: row.id },
@@ -186,7 +242,10 @@ import { api, boolLabel, describeFreshness, fieldValue, formatDateTime, formatRe
                       h('div', { className: 'text-xs', style: t.faint }, row.mobilePhone || '—')
                     ),
                     h('td', { style: t.td }, boolLabel(row.active, 'Active', 'Inactive')),
-                    h('td', { style: t.td }, formatDateTime(row.syncedAt))
+                    h('td', { style: t.td }, formatDateTime(row.syncedAt)),
+                    h('td', { style: t.td },
+                      h('button', { type: 'button', style: t.btnGhost, onClick: () => void openDetail(row.id) }, 'View')
+                    )
                   ))
                 )
               )
@@ -201,7 +260,41 @@ import { api, boolLabel, describeFreshness, fieldValue, formatDateTime, formatRe
                 ? h('div', { className: 'mt-2 text-xs', style: latestRun.error ? t.danger : t.faint }, `Latest run ${formatRelativeTime(latestRun.startedAt)} (${formatDateTime(latestRun.startedAt)}): ${latestRun.error || latestRun.notes || latestRun.status}`)
                 : null
             )
-      )
+      ),
+      selectedId && modal(h, {
+        title: detail ? displayName(detail) : 'Stylist details',
+        subtitle: selectedId,
+        onClose: () => {
+          setSelectedId(null);
+          setDetail(null);
+          setDetailError(null);
+        },
+        width: '58rem',
+        children: detailLoading
+          ? h('div', { style: t.faint }, 'Loading stylist details…')
+          : detailError
+            ? h('div', { style: t.danger }, detailError)
+            : detail
+              ? h('div', { className: 'space-y-4' },
+                  h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '0.75rem' } },
+                    detailField('Full name', displayName(detail)),
+                    detailField('Stylist ID', fieldValue(detail.privateId)),
+                    detailField('Record ID', fieldValue(detail.id)),
+                    detailField('Given name', fieldValue(detail.givenName)),
+                    detailField('Surname', fieldValue(detail.surname)),
+                    detailField('Email', fieldValue(detail.emailAddress)),
+                    detailField('Mobile phone', fieldValue(detail.mobilePhone)),
+                    detailField('Location', locationName(detail.locationId || detail.sourceLocationId)),
+                    detailField('Status', boolLabel(detail.active, 'Active', 'Inactive')),
+                    detailField('Synced', formatDateTime(detail.syncedAt))
+                  ),
+                  h('div', { style: noteCard },
+                    h('div', { style: detailLabel }, 'Raw record'),
+                    h('pre', { style: { ...detailValue, margin: 0, whiteSpace: 'pre-wrap' as const, fontSize: '0.78rem' } }, JSON.stringify(detail.raw, null, 2) || 'null')
+                  )
+                )
+              : h('div', { style: t.faint }, 'No stylist details loaded.')
+      })
     );
   }
 
