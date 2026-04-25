@@ -15,6 +15,7 @@ export type {
   StylistRecord,
   StylistDetailRecord,
   AppointmentRecord,
+  AppointmentDetailRecord,
   ServiceRecord,
   ServiceDetailRecord,
   SyncStateRecord,

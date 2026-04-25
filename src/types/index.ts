@@ -89,21 +89,53 @@ export interface StylistDetailRecord extends StylistRecord {
 export interface AppointmentRecord {
   id: string;
   appointmentId: string | null;
+  internalId: string | null;
+  locationId: string | null;
+  locationName: string | null;
   clientId: string | null;
   clientName: string | null;
+  clientPhone: string | null;
   staffId: string | null;
   stylistId: string | null;
+  stylistName: string | null;
   serviceId: string | null;
+  serviceName: string | null;
   serviceNameRaw: string | null;
-  locationId: string | null;
+  serviceCategoryName: string | null;
   startsAt: string | null;
   endsAt: string | null;
   durationMinutes: number | null;
   status: string | null;
   statusCode: string | null;
   statusDescription: string | null;
+  categoryId: string | null;
+  categoryName: string | null;
+  descriptionText: string | null;
+  clientNotes: string | null;
   total: number | null;
+  createdAtRemote: string | null;
+  updatedAtRemote: string | null;
   syncedAt: string;
+}
+
+export interface AppointmentDetailRecord extends AppointmentRecord {
+  serviceNameNorm: string | null;
+  descriptionHtml: string | null;
+  referrer: string | null;
+  promotionCode: string | null;
+  arrivalNote: string | null;
+  reminderSent: boolean | null;
+  cancelledFlag: boolean | null;
+  onlineBooking: boolean | null;
+  newClient: boolean | null;
+  isClass: boolean | null;
+  processingLength: number | null;
+  grossAmount: number | null;
+  discountAmount: number | null;
+  netAmount: number | null;
+  createdBy: string | null;
+  updatedBy: string | null;
+  raw: unknown | null;
 }
 
 export interface ServiceRecord {
