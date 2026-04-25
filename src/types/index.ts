@@ -62,6 +62,7 @@ export interface LocationDetailRecord extends LocationRecord {
 
 export interface StylistRecord {
   id: string;
+  stylistId: string | null;
   locationId: string | null;
   privateId: string | null;
   givenName: string | null;
@@ -84,6 +85,17 @@ export interface AppointmentRecord {
   endsAt: string | null;
   status: string | null;
   total: number | null;
+  syncedAt: string;
+}
+
+export interface ServiceRecord {
+  id: string;
+  serviceId: string | null;
+  locationId: string | null;
+  name: string | null;
+  durationMinutes: number | null;
+  price: number | null;
+  active: boolean | null;
   syncedAt: string;
 }
 

@@ -14,6 +14,7 @@ export type {
   LocationDetailRecord,
   StylistRecord,
   AppointmentRecord,
+  ServiceRecord,
   SyncStateRecord,
   SyncRunRecord,
   ExportManifestRecord,

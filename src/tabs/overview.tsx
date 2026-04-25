@@ -19,7 +19,7 @@ import { api, boolLabel, describeFreshness, fmtNumber, formatDateTime, t } from 
     teamId: string;
     dbMode: string;
     yotConfigured: boolean;
-    counts: { clients: number; locations: number; stylists?: number; appointments: number; services?: number };
+    counts: { clients: number; locations: number; stylists: number; appointments: number; services: number };
     syncState: SyncStateRow[];
   };
 
@@ -57,6 +57,8 @@ import { api, boolLabel, describeFreshness, fmtNumber, formatDateTime, t } from 
           setMessage(`${label} complete • ${data?.manifest?.directory || 'snapshot written'}`);
         } else if (key === 'clients') {
           setMessage(`${label} complete • ${fmtNumber(data?.synced)} clients synced across ${fmtNumber(data?.pageCount)} pages`);
+        } else if (key === 'stylists' || key === 'services') {
+          setMessage(`${label} complete • ${fmtNumber(data?.synced)} rows across ${fmtNumber(data?.locationCount)} locations`);
         } else {
           setMessage(`${label} complete`);
         }
@@ -109,6 +111,8 @@ import { api, boolLabel, describeFreshness, fmtNumber, formatDateTime, t } from 
         h('div', { className: 'mt-3 flex flex-wrap gap-2' },
           h('button', { type: 'button', style: t.btnPrimary, disabled: !!busy || !health?.yotConfigured, onClick: () => void runAction('locations', 'Locations sync', '/locations/sync') }, busy === 'locations' ? 'Syncing…' : 'Sync locations'),
           h('button', { type: 'button', style: t.btnGhost, disabled: !!busy || !health?.yotConfigured, onClick: () => void runAction('clients', 'Limited client sync', '/clients/sync?maxPages=5') }, busy === 'clients' ? 'Syncing…' : 'Limited client sync'),
+          h('button', { type: 'button', style: t.btnGhost, disabled: !!busy || !health?.yotConfigured, onClick: () => void runAction('stylists', 'Stylists sync', '/stylists/sync') }, busy === 'stylists' ? 'Syncing…' : 'Sync stylists'),
+          h('button', { type: 'button', style: t.btnGhost, disabled: !!busy || !health?.yotConfigured, onClick: () => void runAction('services', 'Services sync', '/services/sync') }, busy === 'services' ? 'Syncing…' : 'Sync services'),
           h('button', { type: 'button', style: t.btnGhost, disabled: !!busy, onClick: () => void runAction('export', 'Export snapshot', '/export') }, busy === 'export' ? 'Exporting…' : 'Export snapshot')
         )
       ),
