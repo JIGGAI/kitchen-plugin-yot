@@ -12,6 +12,7 @@ import { characterizeClientPaging, extractAppointmentsRangeRows, fetchAppointmen
 import type { KitchenPluginContext } from './types-kitchen';
 import type {
   ApiError,
+  AppointmentDetailRecord,
   AppointmentRecord,
   ClientDetailRecord,
   ClientRecord,
@@ -203,24 +204,146 @@ function mapStylistDetailRecord(row: schema.Stylist): StylistDetailRecord {
 }
 
 function mapAppointmentRecord(row: schema.Appointment): AppointmentRecord {
+  const serviceCategoryName = row.categoryName ?? null;
   return {
     id: row.id,
     appointmentId: row.appointmentId ?? null,
+    internalId: row.internalId ?? null,
+    locationId: row.locationId ?? null,
+    locationName: null,
     clientId: row.clientId ?? null,
     clientName: row.clientName ?? null,
+    clientPhone: row.clientPhone ?? null,
     staffId: row.staffId ?? null,
     stylistId: row.stylistId ?? null,
+    stylistName: null,
     serviceId: row.serviceId ?? null,
+    serviceName: row.serviceNameRaw ?? null,
     serviceNameRaw: row.serviceNameRaw ?? null,
-    locationId: row.locationId ?? null,
+    serviceCategoryName,
     startsAt: row.startAt ?? row.startsAt ?? null,
     endsAt: row.endAt ?? row.endsAt ?? null,
     durationMinutes: row.durationMinutes ?? null,
     status: row.status ?? null,
     statusCode: row.statusCode ?? null,
     statusDescription: row.statusDescription ?? null,
+    categoryId: row.categoryId ?? null,
+    categoryName: row.categoryName ?? null,
+    descriptionText: row.descriptionText ?? null,
+    clientNotes: row.clientNotes ?? null,
     total: row.total ?? null,
+    createdAtRemote: row.createdAtRemote ?? null,
+    updatedAtRemote: row.updatedAtRemote ?? null,
     syncedAt: row.syncedAt,
+  };
+}
+
+type AppointmentLookupMaps = {
+  locationsById: Map<string, schema.Location>;
+  stylistsByScopedPrivateId: Map<string, schema.Stylist>;
+  stylistsByPrivateId: Map<string, schema.Stylist>;
+  clientsById: Map<string, schema.Client>;
+  servicesByScopedPrivateId: Map<string, schema.Service>;
+  servicesByPrivateId: Map<string, schema.Service>;
+};
+
+function buildAppointmentLookups(db: ReturnType<typeof initializeDatabase>['db'], teamId: string): AppointmentLookupMaps {
+  const locationsById = new Map<string, schema.Location>();
+  for (const row of db.select().from(schema.locations).where(eq(schema.locations.teamId, teamId)).all() as schema.Location[]) {
+    locationsById.set(row.id, row);
+  }
+
+  const stylistsByScopedPrivateId = new Map<string, schema.Stylist>();
+  const stylistsByPrivateId = new Map<string, schema.Stylist>();
+  for (const row of db.select().from(schema.stylists).where(eq(schema.stylists.teamId, teamId)).all() as schema.Stylist[]) {
+    const privateId = cleanString(row.privateId);
+    if (!privateId) continue;
+    if (row.locationId) stylistsByScopedPrivateId.set(`${row.locationId}:${privateId}`, row);
+    if (!stylistsByPrivateId.has(privateId)) stylistsByPrivateId.set(privateId, row);
+  }
+
+  const clientsById = new Map<string, schema.Client>();
+  for (const row of db.select().from(schema.clients).where(eq(schema.clients.teamId, teamId)).all() as schema.Client[]) {
+    clientsById.set(row.id, row);
+  }
+
+  const servicesByScopedPrivateId = new Map<string, schema.Service>();
+  const servicesByPrivateId = new Map<string, schema.Service>();
+  for (const row of db.select().from(schema.services).where(eq(schema.services.teamId, teamId)).all() as schema.Service[]) {
+    const privateId = cleanString(row.privateId);
+    if (!privateId) continue;
+    if (row.locationId) servicesByScopedPrivateId.set(`${row.locationId}:${privateId}`, row);
+    if (!servicesByPrivateId.has(privateId)) servicesByPrivateId.set(privateId, row);
+  }
+
+  return {
+    locationsById,
+    stylistsByScopedPrivateId,
+    stylistsByPrivateId,
+    clientsById,
+    servicesByScopedPrivateId,
+    servicesByPrivateId,
+  };
+}
+
+function findAppointmentStylist(row: schema.Appointment, lookups: AppointmentLookupMaps): schema.Stylist | null {
+  const privateId = cleanString(row.stylistId ?? row.staffId);
+  if (!privateId) return null;
+  if (row.locationId) {
+    const scoped = lookups.stylistsByScopedPrivateId.get(`${row.locationId}:${privateId}`);
+    if (scoped) return scoped;
+  }
+  return lookups.stylistsByPrivateId.get(privateId) || null;
+}
+
+function findAppointmentService(row: schema.Appointment, lookups: AppointmentLookupMaps): schema.Service | null {
+  const privateId = cleanString(row.serviceId);
+  if (!privateId) return null;
+  if (row.locationId) {
+    const scoped = lookups.servicesByScopedPrivateId.get(`${row.locationId}:${privateId}`);
+    if (scoped) return scoped;
+  }
+  return lookups.servicesByPrivateId.get(privateId) || null;
+}
+
+function mapAppointmentRecordWithLookups(row: schema.Appointment, lookups: AppointmentLookupMaps): AppointmentRecord {
+  const base = mapAppointmentRecord(row);
+  const location = row.locationId ? lookups.locationsById.get(row.locationId) : null;
+  const stylist = findAppointmentStylist(row, lookups);
+  const client = row.clientId ? lookups.clientsById.get(row.clientId) : null;
+  const service = findAppointmentService(row, lookups);
+  return {
+    ...base,
+    locationName: location?.name ?? null,
+    clientName: base.clientName || client?.fullName || null,
+    clientPhone: base.clientPhone || client?.mobilePhone || client?.phone || client?.homePhone || client?.businessPhone || null,
+    stylistName: stylist?.fullName ?? normalizeFullName(stylist as any) ?? null,
+    serviceName: service?.name ?? base.serviceNameRaw ?? null,
+    serviceCategoryName: service?.categoryName ?? base.serviceCategoryName,
+  };
+}
+
+function mapAppointmentDetailRecord(row: schema.Appointment, lookups: AppointmentLookupMaps): AppointmentDetailRecord {
+  const base = mapAppointmentRecordWithLookups(row, lookups);
+  return {
+    ...base,
+    serviceNameNorm: row.serviceNameNorm ?? null,
+    descriptionHtml: row.descriptionHtml ?? null,
+    referrer: row.referrer ?? null,
+    promotionCode: row.promotionCode ?? null,
+    arrivalNote: row.arrivalNote ?? null,
+    reminderSent: row.reminderSent ?? null,
+    cancelledFlag: row.cancelledFlag ?? null,
+    onlineBooking: row.onlineBooking ?? null,
+    newClient: row.newClient ?? null,
+    isClass: row.isClass ?? null,
+    processingLength: row.processingLength ?? null,
+    grossAmount: row.grossAmount ?? null,
+    discountAmount: row.discountAmount ?? null,
+    netAmount: row.netAmount ?? null,
+    createdBy: row.createdBy ?? null,
+    updatedBy: row.updatedBy ?? null,
+    raw: safeJsonParse(row.raw ?? null),
   };
 }
 
@@ -893,20 +1016,67 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       const locationFilter = cleanString(req.query.locationId || req.query.location);
       const stylistFilter = cleanString(req.query.stylistId || req.query.staffId);
       const statusFilter = cleanString(req.query.statusCode || req.query.status);
+      const categoryFilter = cleanString(req.query.categoryId || req.query.category);
       const search = cleanString(req.query.search || req.query.q);
+      const startsAfter = cleanString(req.query.startsAfter || req.query.startAtGte || req.query.dateFrom);
+      const startsBefore = cleanString(req.query.startsBefore || req.query.startAtLte || req.query.dateTo);
       let rows = db.select().from(schema.appointments).where(eq(schema.appointments.teamId, teamId)).all() as schema.Appointment[];
       if (locationFilter) rows = rows.filter((row) => row.locationId === locationFilter);
       if (stylistFilter) rows = rows.filter((row) => row.stylistId === stylistFilter || row.staffId === stylistFilter);
       if (statusFilter) rows = rows.filter((row) => row.statusCode === statusFilter || row.status === statusFilter);
+      if (categoryFilter) rows = rows.filter((row) => row.categoryId === categoryFilter || row.categoryName === categoryFilter);
+      if (startsAfter) rows = rows.filter((row) => String(row.startAt || row.startsAt || '') >= startsAfter);
+      if (startsBefore) rows = rows.filter((row) => String(row.startAt || row.startsAt || '') <= startsBefore);
       if (search) {
         const term = search.toLowerCase();
-        rows = rows.filter((row) => [row.clientName, row.serviceNameRaw, row.statusDescription, row.appointmentId, row.clientId].some((value) => String(value || '').toLowerCase().includes(term)));
+        const lookups = buildAppointmentLookups(db, teamId);
+        rows = rows
+          .map((row) => ({ row, mapped: mapAppointmentRecordWithLookups(row, lookups) }))
+          .filter(({ row, mapped }) =>
+            [
+              row.appointmentId,
+              row.internalId,
+              row.clientId,
+              mapped.clientName,
+              mapped.clientPhone,
+              mapped.locationName,
+              mapped.stylistName,
+              mapped.serviceName,
+              row.serviceNameRaw,
+              row.categoryName,
+              row.status,
+              row.statusCode,
+              row.statusDescription,
+              row.descriptionText,
+              row.clientNotes,
+            ].some((value) => String(value || '').toLowerCase().includes(term))
+          )
+          .map(({ row }) => row);
       }
       rows.sort((a, b) => String(b.startAt || b.startsAt || '').localeCompare(String(a.startAt || a.startsAt || '')));
       const total = rows.length;
-      return { status: 200, data: { data: rows.slice(offset, offset + limit).map(mapAppointmentRecord), total, limit, offset } };
+      const lookups = buildAppointmentLookups(db, teamId);
+      return { status: 200, data: { data: rows.slice(offset, offset + limit).map((row) => mapAppointmentRecordWithLookups(row, lookups)), total, limit, offset } };
     } catch (error: any) {
       return apiError(500, 'DATABASE_ERROR', error?.message || 'Failed to read appointments');
+    }
+  }
+
+  const appointmentMatch = req.path.match(/^\/appointments\/([^/]+)$/);
+  if (appointmentMatch && req.method === 'GET') {
+    try {
+      const { db } = initializeDatabase(teamId);
+      const requestedId = appointmentMatch[1]!;
+      let rows = db.select().from(schema.appointments).where(and(eq(schema.appointments.teamId, teamId), eq(schema.appointments.id, requestedId))).all() as schema.Appointment[];
+      if (!rows.length) {
+        rows = db.select().from(schema.appointments).where(and(eq(schema.appointments.teamId, teamId), eq(schema.appointments.appointmentId, requestedId))).all() as schema.Appointment[];
+      }
+      if (!rows.length) return apiError(404, 'NOT_FOUND', 'Appointment not found');
+      rows.sort((a, b) => String(b.startAt || b.startsAt || '').localeCompare(String(a.startAt || a.startsAt || '')));
+      const lookups = buildAppointmentLookups(db, teamId);
+      return { status: 200, data: mapAppointmentDetailRecord(rows[0], lookups) };
+    } catch (error: any) {
+      return apiError(500, 'DATABASE_ERROR', error?.message || 'Failed to read appointment');
     }
   }
 
