@@ -1,4 +1,4 @@
-import { api, fmtNumber, formatDateTime, t } from './common';
+import { api, fmtNumber, formatDateTime, formatRelativeTime, t } from './common';
 
 (function () {
   const R = (window as any).React;
@@ -55,7 +55,7 @@ import { api, fmtNumber, formatDateTime, t } from './common';
         h('div', { className: 'flex items-start justify-between gap-2' },
           h('div', null,
             h('div', { className: 'text-sm font-medium', style: t.text }, 'Sync Runs'),
-            h('div', { className: 'mt-1 text-xs', style: t.faint }, 'Most recent YOT sync executions and outcomes.')
+            h('div', { className: 'mt-1 text-xs', style: t.faint }, 'Recent sync executions with clearer timing, counts, and error context.')
           ),
           h('button', { type: 'button', onClick: () => void load(), style: t.btnGhost, disabled: loading }, loading ? 'Loading…' : '↻ Refresh')
         ),
@@ -75,20 +75,32 @@ import { api, fmtNumber, formatDateTime, t } from './common';
             )),
             h('tbody', null,
               rows.length
-                ? rows.map((row: Row) => h('tr', { key: row.id },
-                  h('td', { style: t.td },
-                    h('div', null, formatDateTime(row.startedAt)),
-                    h('div', { className: 'text-xs', style: t.faint }, row.id)
-                  ),
-                  h('td', { style: t.td }, row.resource),
-                  h('td', { style: t.td },
-                    h('span', { style: t.badge(row.status === 'success' ? 'rgba(74,222,128,0.7)' : row.status === 'error' ? 'rgba(248,113,113,0.7)' : 'rgba(251,191,36,0.7)') }, row.status)
-                  ),
-                  h('td', { style: t.td }, `${fmtNumber(row.rowsWritten)} written / ${fmtNumber(row.rowsSeen)} seen`),
-                  h('td', { style: t.td }, fmtNumber(row.pageCount)),
-                  h('td', { style: t.td }, formatDateTime(row.completedAt)),
-                  h('td', { style: { ...t.td, ...(row.error ? t.danger : t.faint) } }, row.error || row.notes || '—')
-                ))
+                ? rows.map((row: Row) => {
+                    const statusColor = row.status === 'success'
+                      ? 'rgba(74,222,128,0.7)'
+                      : row.status === 'error'
+                        ? 'rgba(248,113,113,0.7)'
+                        : 'rgba(251,191,36,0.7)';
+                    return h('tr', { key: row.id },
+                      h('td', { style: t.td },
+                        h('div', null, formatDateTime(row.startedAt)),
+                        h('div', { className: 'text-xs', style: t.faint }, `${formatRelativeTime(row.startedAt)} • ${row.id}`)
+                      ),
+                      h('td', { style: t.td }, row.resource),
+                      h('td', { style: t.td },
+                        h('span', { style: t.badge(statusColor) }, row.status)
+                      ),
+                      h('td', { style: t.td }, `${fmtNumber(row.rowsWritten)} written / ${fmtNumber(row.rowsSeen)} seen`),
+                      h('td', { style: t.td }, fmtNumber(row.pageCount)),
+                      h('td', { style: t.td }, row.completedAt ? `${formatDateTime(row.completedAt)}` : 'Still running / not recorded'),
+                      h('td', { style: { ...t.td, ...(row.error ? t.danger : t.faint) } },
+                        h('div', null, row.error || row.notes || '—'),
+                        row.completedAt
+                          ? h('div', { className: 'text-xs', style: t.faint }, `Finished ${formatRelativeTime(row.completedAt)}`)
+                          : null
+                      )
+                    );
+                  })
                 : h('tr', null, h('td', { style: t.td, colSpan: 7 }, loading ? 'Loading sync runs…' : 'No sync runs recorded yet.'))
             )
           )

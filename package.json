@@ -40,6 +40,12 @@
         "bundle": "./dist/tabs/clients.js"
       },
       {
+        "id": "stylists",
+        "label": "Stylists",
+        "icon": "scissors",
+        "bundle": "./dist/tabs/stylists.js"
+      },
+      {
         "id": "sync-runs",
         "label": "Sync Runs",
         "icon": "clock",

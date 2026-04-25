@@ -34,6 +34,12 @@ export interface ClientRecord {
   syncedAt: string;
 }
 
+export interface ClientDetailRecord extends ClientRecord {
+  address: string | null;
+  createdAtRemote: string | null;
+  raw: unknown | null;
+}
+
 export interface LocationRecord {
   id: string;
   name: string | null;
@@ -47,6 +53,24 @@ export interface LocationRecord {
   state: string | null;
   postcode: string | null;
   country: string | null;
+  syncedAt: string;
+}
+
+export interface LocationDetailRecord extends LocationRecord {
+  raw: unknown | null;
+}
+
+export interface StylistRecord {
+  id: string;
+  locationId: string | null;
+  privateId: string | null;
+  givenName: string | null;
+  surname: string | null;
+  fullName: string | null;
+  emailAddress: string | null;
+  mobilePhone: string | null;
+  active: boolean | null;
+  sourceLocationId: string | null;
   syncedAt: string;
 }
 

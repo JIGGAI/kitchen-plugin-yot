@@ -9,7 +9,10 @@ export * as schema from './db/schema';
 export type {
   YotConfig,
   ClientRecord,
+  ClientDetailRecord,
   LocationRecord,
+  LocationDetailRecord,
+  StylistRecord,
   AppointmentRecord,
   SyncStateRecord,
   SyncRunRecord,
