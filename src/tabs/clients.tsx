@@ -1,4 +1,4 @@
-import { api, boolLabel, fmtNumber, formatDateTime, t } from './common';
+import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, modal, t, useEscapeToClose } from './common';
 
 (function () {
   const R = (window as any).React;
@@ -27,8 +27,21 @@ import { api, boolLabel, fmtNumber, formatDateTime, t } from './common';
     syncedAt: string;
   };
 
-  type LocationOption = { id: string; name: string | null };
+  type Detail = Row & {
+    privateId: string | null;
+    birthday: string | null;
+    gender: string | null;
+    street: string | null;
+    suburb: string | null;
+    state: string | null;
+    postcode: string | null;
+    tags: string[];
+    address: string | null;
+    createdAtRemote: string | null;
+    raw: unknown | null;
+  };
 
+  type LocationOption = { id: string; name: string | null };
   type SortField = 'fullName' | 'lastVisitAt' | 'totalVisits' | 'totalSpend' | 'syncedAt';
   type SortDirection = 'asc' | 'desc';
 
@@ -52,7 +65,28 @@ import { api, boolLabel, fmtNumber, formatDateTime, t } from './common';
     minWidth: '10rem',
   };
 
-  // Build an ISO cutoff N days ago in UTC. We only need day-level precision here.
+  const noteCard = {
+    background: 'rgba(255,255,255,0.02)',
+    border: '1px solid rgba(255,255,255,0.06)',
+    borderRadius: '10px',
+    padding: '0.75rem',
+  };
+
+  const detailLabel = {
+    fontSize: '0.72rem',
+    color: 'var(--ck-text-tertiary)',
+    textTransform: 'uppercase' as const,
+    letterSpacing: '0.04em',
+  };
+
+  const detailValue = {
+    marginTop: '0.2rem',
+    color: 'var(--ck-text-primary)',
+    fontSize: '0.9rem',
+    lineHeight: 1.4,
+    wordBreak: 'break-word' as const,
+  };
+
   const daysAgoIso = (days: number): string => {
     const d = new Date();
     d.setUTCDate(d.getUTCDate() - days);
@@ -66,8 +100,8 @@ import { api, boolLabel, fmtNumber, formatDateTime, t } from './common';
     const [searchInput, setSearchInput] = useState('');
     const [search, setSearch] = useState('');
     const [locationId, setLocationId] = useState('');
-    const [activeFilter, setActiveFilter] = useState('all'); // all | active | inactive
-    const [recency, setRecency] = useState('all'); // all | 30 | 90 | 365 | never
+    const [activeFilter, setActiveFilter] = useState('all');
+    const [recency, setRecency] = useState('all');
     const [sortField, setSortField] = useState('syncedAt' as SortField);
     const [sortDirection, setSortDirection] = useState('desc' as SortDirection);
     const [offset, setOffset] = useState(0);
@@ -75,13 +109,23 @@ import { api, boolLabel, fmtNumber, formatDateTime, t } from './common';
     const [limit, setLimit] = useState(25);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null as string | null);
+    const [selectedId, setSelectedId] = useState(null as string | null);
+    const [detail, setDetail] = useState(null as Detail | null);
+    const [detailLoading, setDetailLoading] = useState(false);
+    const [detailError, setDetailError] = useState(null as string | null);
 
-    const displayName = (row: Row) => {
+    useEscapeToClose(R, !!selectedId, () => {
+      setSelectedId(null);
+      setDetail(null);
+      setDetailError(null);
+    });
+
+    const displayName = (row: Row | Detail) => {
       const fallback = [row.firstName, row.otherName, row.lastName].filter(Boolean).join(' ').trim();
       return row.fullName || fallback || 'Unnamed';
     };
 
-    const phoneLines = (row: Row) => {
+    const phoneLines = (row: Row | Detail) => {
       const entries = [
         row.phone,
         row.mobilePhone && row.mobilePhone !== row.phone ? `Mobile: ${row.mobilePhone}` : null,
@@ -92,7 +136,7 @@ import { api, boolLabel, fmtNumber, formatDateTime, t } from './common';
     };
 
     const locationNameById = (id: string | null): string => {
-      if (!id) return '—';
+      if (!id) return 'Unavailable in current client cache';
       const match = locations.find((loc: LocationOption) => String(loc.id) === String(id));
       return match?.name || id;
     };
@@ -127,9 +171,7 @@ import { api, boolLabel, fmtNumber, formatDateTime, t } from './common';
         qs.push('lastVisitNever=1');
       } else if (params.nextRecency !== 'all') {
         const days = parseInt(params.nextRecency, 10);
-        if (!Number.isNaN(days) && days > 0) {
-          qs.push(`lastVisitAfter=${encodeURIComponent(daysAgoIso(days))}`);
-        }
+        if (!Number.isNaN(days) && days > 0) qs.push(`lastVisitAfter=${encodeURIComponent(daysAgoIso(days))}`);
       }
       qs.push(`sort=${encodeURIComponent(params.nextSort)}`);
       qs.push(`direction=${params.nextDirection}`);
@@ -160,11 +202,7 @@ import { api, boolLabel, fmtNumber, formatDateTime, t } from './common';
       setLoading(true);
       setError(null);
       try {
-        const data = await api(
-          'yot',
-          teamId,
-          `/clients?${buildQuery(params)}`
-        ) as { data: Row[]; total: number; limit: number; offset: number };
+        const data = await api('yot', teamId, `/clients?${buildQuery(params)}`) as { data: Row[]; total: number; limit: number; offset: number };
         setRows(Array.isArray(data?.data) ? data.data : []);
         setTotal(Number(data?.total || 0));
         setOffset(Number(data?.offset || 0));
@@ -178,13 +216,28 @@ import { api, boolLabel, fmtNumber, formatDateTime, t } from './common';
     const loadLocations = async () => {
       if (!teamId) return;
       try {
-        // Page size of 500 matches the API cap; Hair Mechanix is well under that.
         const data = await api('yot', teamId, '/locations?limit=500') as { data: LocationOption[] };
         const list = Array.isArray(data?.data) ? data.data : [];
         list.sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
         setLocations(list);
       } catch {
-        // Non-fatal: the filter just stays empty.
+        setLocations([]);
+      }
+    };
+
+    const openDetail = async (id: string) => {
+      if (!teamId) return;
+      setSelectedId(id);
+      setDetail(null);
+      setDetailError(null);
+      setDetailLoading(true);
+      try {
+        const data = await api('yot', teamId, `/clients/${encodeURIComponent(id)}`) as Detail;
+        setDetail(data);
+      } catch (e: any) {
+        setDetailError(e?.message || 'Failed to load client details');
+      } finally {
+        setDetailLoading(false);
       }
     };
 
@@ -206,7 +259,6 @@ import { api, boolLabel, fmtNumber, formatDateTime, t } from './common';
       nextDirection: SortDirection;
       nextLimit: number;
     }>) => {
-      // Any filter/sort/page-size change resets to offset 0 so the user doesn't land on a phantom page.
       void load({ ...patch, nextOffset: 0 });
     };
 
@@ -235,6 +287,12 @@ import { api, boolLabel, fmtNumber, formatDateTime, t } from './common';
         title: 'Click to sort',
       }, `${label}${sortArrow(field)}`);
 
+    const detailField = (label: string, value: any, valueStyle?: any) =>
+      h('div', { key: label, style: noteCard },
+        h('div', { style: detailLabel }, label),
+        h('div', { style: { ...detailValue, ...(valueStyle || {}) } }, value)
+      );
+
     const page = Math.floor(offset / limit) + 1;
     const totalPages = Math.max(1, Math.ceil(total / limit));
 
@@ -251,13 +309,11 @@ import { api, boolLabel, fmtNumber, formatDateTime, t } from './common';
         h('div', { className: 'flex items-start justify-between gap-2' },
           h('div', null,
             h('div', { className: 'text-sm font-medium', style: t.text }, 'Clients Cache'),
-            h('div', { className: 'mt-1 text-xs', style: t.faint }, 'Search, filter, sort, and page through cached YOT clients.')
+            h('div', { className: 'mt-1 text-xs', style: t.faint }, 'Search, filter, sort, and open richer client detail from the local cache.')
           ),
           h('button', { type: 'button', onClick: () => void load(), style: t.btnGhost, disabled: loading }, loading ? 'Loading…' : '↻ Refresh')
         ),
         error && h('div', { className: 'mt-3 text-xs', style: t.danger }, error),
-
-        // Row 1: free-text search
         h('div', { className: 'mt-3 flex gap-2' },
           h('input', {
             value: searchInput,
@@ -284,8 +340,6 @@ import { api, boolLabel, fmtNumber, formatDateTime, t } from './common';
               }, 'Clear')
             : null
         ),
-
-        // Row 2: filters
         h('div', { className: 'mt-3', style: { display: 'flex', flexWrap: 'wrap', gap: '0.5rem', alignItems: 'center' } },
           h('select', {
             value: locationId,
@@ -323,7 +377,6 @@ import { api, boolLabel, fmtNumber, formatDateTime, t } from './common';
             ...PAGE_SIZES.map((size) => h('option', { key: size, value: String(size) }, `${size} / page`))
           )
         ),
-
         h('div', { className: 'mt-3 flex items-center justify-between text-xs', style: t.faint },
           h('div', null, `${fmtNumber(total)} total clients`),
           h('div', null, `Page ${fmtNumber(page)} / ${fmtNumber(totalPages)}`)
@@ -340,7 +393,8 @@ import { api, boolLabel, fmtNumber, formatDateTime, t } from './common';
               sortableTh('totalVisits', 'Visits'),
               sortableTh('totalSpend', 'Spend'),
               sortableTh('syncedAt', 'Synced'),
-              h('th', { style: t.th }, 'Active')
+              h('th', { style: t.th }, 'Active'),
+              h('th', { style: t.th }, 'Details')
             )),
             h('tbody', null,
               rows.length
@@ -353,14 +407,17 @@ import { api, boolLabel, fmtNumber, formatDateTime, t } from './common';
                     h('div', null, row.email || '—'),
                     ...phoneLines(row).map((line, idx) => h('div', { key: `${row.id}-phone-${idx}`, className: 'text-xs', style: t.faint }, line))
                   ),
-                  h('td', { style: t.td }, locationNameById(row.sourceLocationId)),
-                  h('td', { style: t.td }, row.lastVisitAt ? formatDateTime(row.lastVisitAt) : '—'),
+                  h('td', { style: t.td }, row.sourceLocationId ? locationNameById(row.sourceLocationId) : 'Unavailable in current client cache'),
+                  h('td', { style: t.td }, row.lastVisitAt ? formatDateTime(row.lastVisitAt) : 'Unavailable in current client cache'),
                   h('td', { style: t.td }, fmtNumber(row.totalVisits)),
                   h('td', { style: t.td }, fmtSpend(row.totalSpend)),
                   h('td', { style: t.td }, formatDateTime(row.syncedAt)),
-                  h('td', { style: t.td }, boolLabel(row.active, 'Active', 'Inactive'))
+                  h('td', { style: t.td }, boolLabel(row.active, 'Active', 'Inactive')),
+                  h('td', { style: t.td },
+                    h('button', { type: 'button', style: t.btnGhost, onClick: () => void openDetail(row.id) }, 'View')
+                  )
                 ))
-                : h('tr', null, h('td', { style: t.td, colSpan: 8 }, loading ? 'Loading clients…' : 'No cached clients found.'))
+                : h('tr', null, h('td', { style: t.td, colSpan: 9 }, loading ? 'Loading clients…' : 'No cached clients found.'))
             )
           )
         ),
@@ -379,7 +436,55 @@ import { api, boolLabel, fmtNumber, formatDateTime, t } from './common';
             onClick: () => void load({ nextOffset: offset + limit }),
           }, 'Next →')
         )
-      )
+      ),
+      selectedId && modal(h, {
+        title: detail ? displayName(detail) : 'Client details',
+        subtitle: selectedId,
+        onClose: () => {
+          setSelectedId(null);
+          setDetail(null);
+          setDetailError(null);
+        },
+        width: '64rem',
+        children: detailLoading
+          ? h('div', { style: t.faint }, 'Loading client details…')
+          : detailError
+            ? h('div', { style: t.danger }, detailError)
+            : detail
+              ? h('div', { className: 'space-y-4' },
+                  h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '0.75rem' } },
+                    detailField('Full name', displayName(detail)),
+                    detailField('Private ID', fieldValue(detail.privateId)),
+                    detailField('Status', boolLabel(detail.active, 'Active', 'Inactive')),
+                    detailField('Birthday', fieldValue(detail.birthday)),
+                    detailField('Gender', fieldValue(detail.gender)),
+                    detailField('Created remotely', fieldValue(detail.createdAtRemote ? formatDateTime(detail.createdAtRemote) : null)),
+                    detailField('Synced', formatDateTime(detail.syncedAt)),
+                    detailField('Last visit', detail.lastVisitAt ? formatDateTime(detail.lastVisitAt) : 'Unavailable in current client cache'),
+                    detailField('Source location', detail.sourceLocationId ? locationNameById(detail.sourceLocationId) : 'Unavailable in current client cache'),
+                    detailField('Visits', fmtNumber(detail.totalVisits)),
+                    detailField('Spend', fmtSpend(detail.totalSpend)),
+                    detailField('Tags', detail.tags?.length ? detail.tags.join(', ') : '—')
+                  ),
+                  h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '0.75rem' } },
+                    detailField('Primary email', fieldValue(detail.email)),
+                    detailField('Primary phone', fieldValue(detail.phone)),
+                    detailField('Mobile phone', fieldValue(detail.mobilePhone)),
+                    detailField('Home phone', fieldValue(detail.homePhone)),
+                    detailField('Business phone', fieldValue(detail.businessPhone)),
+                    detailField('Address', fieldValue(detail.address || joinAddress([detail.street, detail.suburb, detail.state, detail.postcode, detail.country])))
+                  ),
+                  h('div', { style: { ...noteCard, borderColor: 'rgba(251,191,36,0.35)' } },
+                    h('div', { className: 'text-xs font-medium', style: t.warning }, 'Cache note'),
+                    h('div', { className: 'mt-2 text-sm', style: t.text }, 'Location and last-visit fields are shown when present, but the current YOT client cache is often missing them. Blank values here usually mean the source payload did not include that data yet.')
+                  ),
+                  h('div', { style: noteCard },
+                    h('div', { style: detailLabel }, 'Raw record'),
+                    h('pre', { style: { ...detailValue, margin: 0, whiteSpace: 'pre-wrap' as const, fontSize: '0.78rem' } }, JSON.stringify(detail.raw, null, 2) || 'null')
+                  )
+                )
+              : h('div', { style: t.faint }, 'No client details loaded.')
+      })
     );
   }
 

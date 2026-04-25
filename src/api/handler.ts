@@ -10,7 +10,18 @@ import { initializeDatabase } from '../db';
 import * as schema from '../db/schema';
 import { characterizeClientPaging, fetchBusiness, fetchClients, fetchLocationServices, fetchLocationStaff, fetchLocations, ping } from '../drivers/yot-client';
 import type { KitchenPluginContext } from './types-kitchen';
-import type { ApiError, ClientRecord, ExportManifestRecord, LocationRecord, ServiceRecord, StylistRecord, SyncRunRecord, YotConfig } from '../types';
+import type {
+  ApiError,
+  ClientDetailRecord,
+  ClientRecord,
+  ExportManifestRecord,
+  LocationDetailRecord,
+  LocationRecord,
+  ServiceRecord,
+  StylistRecord,
+  SyncRunRecord,
+  YotConfig,
+} from '../types';
 
 export type PluginRequest = {
   method: string;
@@ -84,6 +95,15 @@ function safeJsonParseArray(value: string | null): string[] {
   }
 }
 
+function safeJsonParse(value: string | null): unknown | null {
+  if (!value) return null;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
 function mapClientRecord(row: schema.Client): ClientRecord {
   return {
     id: row.id,
@@ -114,6 +134,15 @@ function mapClientRecord(row: schema.Client): ClientRecord {
   };
 }
 
+function mapClientDetailRecord(row: schema.Client): ClientDetailRecord {
+  return {
+    ...mapClientRecord(row),
+    address: row.address ?? null,
+    createdAtRemote: row.createdAtRemote ?? null,
+    raw: safeJsonParse(row.raw ?? null),
+  };
+}
+
 function mapLocationRecord(row: schema.Location): LocationRecord {
   return {
     id: row.id,
@@ -132,6 +161,30 @@ function mapLocationRecord(row: schema.Location): LocationRecord {
   };
 }
 
+function mapLocationDetailRecord(row: schema.Location): LocationDetailRecord {
+  return {
+    ...mapLocationRecord(row),
+    raw: safeJsonParse(row.raw ?? null),
+  };
+}
+
+function mapStylistRecord(row: schema.Stylist): StylistRecord {
+  return {
+    id: row.id,
+    stylistId: row.privateId ?? null,
+    locationId: row.locationId ?? null,
+    privateId: row.privateId ?? null,
+    givenName: row.givenName ?? null,
+    surname: row.surname ?? null,
+    fullName: row.fullName ?? null,
+    emailAddress: row.emailAddress ?? null,
+    mobilePhone: row.mobilePhone ?? null,
+    active: row.active ?? null,
+    sourceLocationId: row.sourceLocationId ?? null,
+    syncedAt: row.syncedAt,
+  };
+}
+
 function mapSyncRun(row: schema.SyncRun): SyncRunRecord {
   return {
     id: row.id,
@@ -144,19 +197,6 @@ function mapSyncRun(row: schema.SyncRun): SyncRunRecord {
     pageCount: row.pageCount ?? null,
     notes: row.notes ?? null,
     error: row.error ?? null,
-  };
-}
-
-function mapStylistRecord(row: schema.Stylist): StylistRecord {
-  return {
-    id: row.id,
-    stylistId: row.privateId ?? null,
-    locationId: row.locationId ?? null,
-    fullName: row.fullName ?? null,
-    givenName: row.givenName ?? null,
-    surname: row.surname ?? null,
-    active: row.active ?? null,
-    syncedAt: row.syncedAt,
   };
 }
 
@@ -376,6 +416,18 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     }
   }
 
+  const locationMatch = req.path.match(/^\/locations\/([^/]+)$/);
+  if (locationMatch && req.method === 'GET') {
+    try {
+      const { db } = initializeDatabase(teamId);
+      const rows = db.select().from(schema.locations).where(and(eq(schema.locations.teamId, teamId), eq(schema.locations.id, locationMatch[1]!))).all();
+      if (!rows.length) return apiError(404, 'NOT_FOUND', 'Location not found');
+      return { status: 200, data: mapLocationDetailRecord(rows[0]) };
+    } catch (error: any) {
+      return apiError(500, 'DATABASE_ERROR', error?.message || 'Failed to read location');
+    }
+  }
+
   if (req.path === '/locations/sync' && req.method === 'POST') {
     const config = readYotConfig(teamId);
     if (!config) return apiError(400, 'NOT_CONFIGURED', 'YOT apiKey not set for this team. POST /config first.');
@@ -509,9 +561,39 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       const { db } = initializeDatabase(teamId);
       const rows = db.select().from(schema.clients).where(and(eq(schema.clients.teamId, teamId), eq(schema.clients.id, clientMatch[1]!))).all();
       if (!rows.length) return apiError(404, 'NOT_FOUND', 'Client not found');
-      return { status: 200, data: mapClientRecord(rows[0]) };
+      return { status: 200, data: mapClientDetailRecord(rows[0]) };
     } catch (error: any) {
       return apiError(500, 'DATABASE_ERROR', error?.message || 'Failed to read client');
+    }
+  }
+
+  if (req.path === '/stylists' && req.method === 'GET') {
+    try {
+      const { db } = initializeDatabase(teamId);
+      const { limit, offset } = parsePagination(req.query);
+      const activeFilter = parseBooleanFilter(req.query.active);
+      const locationFilter = cleanString(req.query.locationId || req.query.location);
+      const search = cleanString(req.query.search || req.query.q);
+
+      let rows = db.select().from(schema.stylists).where(eq(schema.stylists.teamId, teamId)).all() as schema.Stylist[];
+      if (activeFilter !== null) rows = rows.filter((row) => row.active === activeFilter);
+      if (locationFilter) rows = rows.filter((row) => row.locationId === locationFilter || row.sourceLocationId === locationFilter);
+      if (search) {
+        const term = search.toLowerCase();
+        rows = rows.filter((row) =>
+          [row.fullName, row.givenName, row.surname, row.emailAddress, row.mobilePhone, row.privateId]
+            .some((value) => String(value || '').toLowerCase().includes(term))
+        );
+      }
+
+      rows.sort((a, b) => String(a.fullName || a.givenName || '').localeCompare(String(b.fullName || b.givenName || '')));
+      const total = rows.length;
+      return { status: 200, data: { data: rows.slice(offset, offset + limit).map(mapStylistRecord), total, limit, offset } };
+    } catch (error: any) {
+      if (String(error?.message || '').toLowerCase().includes('no such table')) {
+        return { status: 200, data: { data: [], total: 0, limit: parsePagination(req.query).limit, offset: parsePagination(req.query).offset } };
+      }
+      return apiError(500, 'DATABASE_ERROR', error?.message || 'Failed to read stylists');
     }
   }
 
@@ -598,32 +680,6 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         upsertSyncState(db, teamId, 'clients', { lastSyncedAt: now, lastError: errMsg });
       } catch {}
       return apiError(502, 'YOT_ERROR', errMsg);
-    }
-  }
-
-
-  if (req.path === '/stylists' && req.method === 'GET') {
-    try {
-      const { db } = initializeDatabase(teamId);
-      const { limit, offset } = parsePagination(req.query);
-      const locationFilter = cleanString(req.query.locationId || req.query.location);
-      const activeFilter = parseBooleanFilter(req.query.active);
-      const search = cleanString(req.query.search || req.query.q);
-      let rows = db.select().from(schema.stylists).where(eq(schema.stylists.teamId, teamId)).all() as schema.Stylist[];
-      if (locationFilter) rows = rows.filter((row) => row.locationId === locationFilter);
-      if (activeFilter !== null) rows = rows.filter((row) => row.active === activeFilter);
-      if (search) {
-        const term = search.toLowerCase();
-        rows = rows.filter((row) =>
-          [row.fullName, row.givenName, row.surname, row.privateId]
-            .some((value) => String(value || '').toLowerCase().includes(term))
-        );
-      }
-      rows.sort((a, b) => String(a.fullName || a.givenName || '').localeCompare(String(b.fullName || b.givenName || '')));
-      const total = rows.length;
-      return { status: 200, data: { data: rows.slice(offset, offset + limit).map(mapStylistRecord), total, limit, offset } };
-    } catch (error: any) {
-      return apiError(500, 'DATABASE_ERROR', error?.message || 'Failed to read stylists');
     }
   }
 
@@ -805,7 +861,9 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     try {
       const { db } = initializeDatabase(teamId);
       const { limit, offset } = parsePagination(req.query);
-      const rows = db.select().from(schema.syncRuns).where(eq(schema.syncRuns.teamId, teamId)).all() as schema.SyncRun[];
+      const resourceFilter = cleanString(req.query.resource);
+      let rows = db.select().from(schema.syncRuns).where(eq(schema.syncRuns.teamId, teamId)).all() as schema.SyncRun[];
+      if (resourceFilter) rows = rows.filter((row) => row.resource === resourceFilter);
       rows.sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)));
       const total = rows.length;
       return { status: 200, data: { data: rows.slice(offset, offset + limit).map(mapSyncRun), total, limit, offset } };

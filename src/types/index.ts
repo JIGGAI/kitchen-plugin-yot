@@ -34,6 +34,12 @@ export interface ClientRecord {
   syncedAt: string;
 }
 
+export interface ClientDetailRecord extends ClientRecord {
+  address: string | null;
+  createdAtRemote: string | null;
+  raw: unknown | null;
+}
+
 export interface LocationRecord {
   id: string;
   name: string | null;
@@ -50,6 +56,25 @@ export interface LocationRecord {
   syncedAt: string;
 }
 
+export interface LocationDetailRecord extends LocationRecord {
+  raw: unknown | null;
+}
+
+export interface StylistRecord {
+  id: string;
+  stylistId: string | null;
+  locationId: string | null;
+  privateId: string | null;
+  givenName: string | null;
+  surname: string | null;
+  fullName: string | null;
+  emailAddress: string | null;
+  mobilePhone: string | null;
+  active: boolean | null;
+  sourceLocationId: string | null;
+  syncedAt: string;
+}
+
 export interface AppointmentRecord {
   id: string;
   clientId: string | null;
@@ -60,17 +85,6 @@ export interface AppointmentRecord {
   endsAt: string | null;
   status: string | null;
   total: number | null;
-  syncedAt: string;
-}
-
-export interface StylistRecord {
-  id: string;
-  stylistId: string | null;
-  locationId: string | null;
-  fullName: string | null;
-  givenName: string | null;
-  surname: string | null;
-  active: boolean | null;
   syncedAt: string;
 }
 
