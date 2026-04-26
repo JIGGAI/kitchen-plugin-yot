@@ -7,9 +7,23 @@ on:
         description: "Tag to publish (e.g. v0.6.1). If provided, workflow will checkout this tag before publishing."
         required: false
         type: string
+  workflow_run:
+    workflows:
+      - Release
+    types:
+      - completed
 
 jobs:
   publish:
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' ||
+        (
+          github.event_name == 'workflow_run' &&
+          github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.head_branch == 'main'
+        )
+      }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -18,11 +32,39 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.ref }}
 
-      - name: Checkout tag (workflow_dispatch)
-        if: ${{ inputs.tag != '' }}
+      - name: Resolve release tag
+        id: release
+        shell: bash
         run: |
-          git checkout "${{ inputs.tag }}"
+          set -euo pipefail
+          git fetch --force --tags origin
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG_INPUT='${{ inputs.tag }}'
+            if [[ -n "$TAG_INPUT" ]]; then
+              TAG="$TAG_INPUT"
+              git checkout "$TAG"
+            else
+              TAG=$(git describe --tags --abbrev=0)
+              git checkout "$TAG"
+            fi
+          else
+            TAG=$(git tag --points-at HEAD | sort -V | tail -n 1)
+            if [[ -z "$TAG" ]]; then
+              echo "No git tag points at ${GITHUB_SHA}. Release should push a version tag before Publish runs." >&2
+              exit 1
+            fi
+            git checkout "$TAG"
+          fi
+
+          VERSION="${TAG#v}"
+          PACKAGE_NAME=$(node -p "require('./package.json').name")
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "package_name=$PACKAGE_NAME" >> "$GITHUB_OUTPUT"
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -37,7 +79,29 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Check whether version is already published
+        id: npm
+        shell: bash
+        run: |
+          set -euo pipefail
+          if npm view "${{ steps.release.outputs.package_name }}@${{ steps.release.outputs.version }}" version >/dev/null 2>&1; then
+            echo "already_published=true" >> "$GITHUB_OUTPUT"
+            echo "Version already exists on npm; skipping publish."
+          else
+            echo "already_published=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Publish
+        if: ${{ steps.npm.outputs.already_published != 'true' }}
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --access public --provenance
+
+      - name: Summarize result
+        shell: bash
+        run: |
+          if [[ "${{ steps.npm.outputs.already_published }}" == "true" ]]; then
+            echo "${{ steps.release.outputs.package_name }}@${{ steps.release.outputs.version }} was already published; no-op."
+          else
+            echo "Published ${{ steps.release.outputs.package_name }}@${{ steps.release.outputs.version }} from ${{ steps.release.outputs.tag }}."
+          fi

@@ -15,7 +15,6 @@ on:
 
 permissions:
   contents: write
-  id-token: write
 
 jobs:
   release:
@@ -48,11 +47,6 @@ jobs:
 
       - name: Push version commit + tag
         run: git push origin main --follow-tags
-
-      - name: Publish to npm
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public --provenance
 
       - name: Pack tarball
         run: npm pack
