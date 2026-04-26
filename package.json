@@ -74,10 +74,12 @@
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
+    "adm-zip": "^0.5.16",
     "better-sqlite3": "^11.0.0",
     "drizzle-orm": "^0.36.0"
   },
   "devDependencies": {
+    "@types/adm-zip": "^0.5.7",
     "@types/better-sqlite3": "^7.6.0",
     "@types/node": "^20.0.0",
     "esbuild": "^0.24.0",
