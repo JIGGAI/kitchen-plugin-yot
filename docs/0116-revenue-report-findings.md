@@ -102,15 +102,26 @@ Representative parsed detail row (`Auburn Hills MI`, `26/4/2026`):
 - `scripts/characterize-revenue-reports.ts`
   - end-to-end characterization harness using the generic framework
 
+## Landed ingestion slice
+
+- `src/reports/sync-revenue-facts.ts`
+  - runs `DailyRevenueSummaryReport`, maps report location names onto local `locations.id`, and upserts daily rows into `revenue_facts`
+  - enriches each `(location_id, date)` row with local `appointments` counts / unique clients when that cache is present
+  - records audit metadata in `sync_runs` + `sync_state`
+- `scripts/sync-revenue-facts.ts`
+  - operational entry point for populating `revenue_facts` without waiting on any UI/API surface
+  - example: `npx tsx scripts/sync-revenue-facts.ts --start=2026-04-26 --end=2026-05-02`
+
+Current normalization written into `revenue_facts`:
+
+- `gross_amount` ← report `totalRevenue`
+- `discount_amount` ← `0` for now (the report does not expose discounts directly)
+- `net_amount` ← report `revenueLessTax` when present, otherwise total revenue
+- `appointment_count` / `unique_client_count` ← local `appointments` cache rollups for the same `(location_id, date)` when available
+
 ## Recommended next slice
 
-Use the `DailyRevenueSummaryReport` adapter to write normalized rows into `revenue_facts` (and any richer downstream revenue tables we add later), keyed by:
-
-- `team_id`
-- `location_id`
-- `date`
-
-with parsed values for:
+If we want richer finance analytics beyond the existing dashboard rollup table, add a dedicated raw-or-wide revenue table fed by the same reports framework so we can persist:
 
 - payments (cash/card/voucher/other/account/total)
 - sales (service/product/voucher/membership)
