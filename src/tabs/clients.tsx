@@ -27,6 +27,7 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, mod
     syncedAt: string;
   };
 
+  type Link = { id: string; label: string; appointmentCount: number; lastAppointmentAt: string | null };
   type Detail = Row & {
     privateId: string | null;
     birthday: string | null;
@@ -38,6 +39,17 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, mod
     tags: string[];
     address: string | null;
     createdAtRemote: string | null;
+    relationships?: {
+      appointmentCount: number;
+      uniqueClientCount: number;
+      uniqueStylistCount: number;
+      uniqueLocationCount: number;
+      lastAppointmentAt: string | null;
+      recentAppointmentCount: number;
+      stylists: Link[];
+      locations: Link[];
+      clients: Link[];
+    } | null;
     raw: unknown | null;
   };
 
@@ -113,11 +125,15 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, mod
     const [detail, setDetail] = useState(null as Detail | null);
     const [detailLoading, setDetailLoading] = useState(false);
     const [detailError, setDetailError] = useState(null as string | null);
+    const [linkedLocation, setLinkedLocation] = useState(null as any);
+    const [linkedStylist, setLinkedStylist] = useState(null as any);
 
     useEscapeToClose(R, !!selectedId, () => {
       setSelectedId(null);
       setDetail(null);
       setDetailError(null);
+      setLinkedLocation(null);
+      setLinkedStylist(null);
     });
 
     const displayName = (row: Row | Detail) => {
@@ -231,6 +247,8 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, mod
       setDetail(null);
       setDetailError(null);
       setDetailLoading(true);
+      setLinkedLocation(null);
+      setLinkedStylist(null);
       try {
         const data = await api('yot', teamId, `/clients/${encodeURIComponent(id)}`) as Detail;
         setDetail(data);
@@ -239,6 +257,16 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, mod
       } finally {
         setDetailLoading(false);
       }
+    };
+
+    const openLinkedLocation = async (id: string) => {
+      if (!teamId) return;
+      setLinkedLocation(await api('yot', teamId, `/locations/${encodeURIComponent(id)}`));
+    };
+
+    const openLinkedStylist = async (id: string) => {
+      if (!teamId) return;
+      setLinkedStylist(await api('yot', teamId, `/stylists/${encodeURIComponent(id)}`));
     };
 
     useEffect(() => {
@@ -444,6 +472,8 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, mod
           setSelectedId(null);
           setDetail(null);
           setDetailError(null);
+          setLinkedLocation(null);
+          setLinkedStylist(null);
         },
         width: '64rem',
         children: detailLoading
@@ -476,8 +506,27 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, mod
                   ),
                   h('div', { style: { ...noteCard, borderColor: 'rgba(251,191,36,0.35)' } },
                     h('div', { className: 'text-xs font-medium', style: t.warning }, 'Cache note'),
-                    h('div', { className: 'mt-2 text-sm', style: t.text }, 'Location and last-visit fields are shown when present, but the current YOT client cache is often missing them. Blank values here usually mean the source payload did not include that data yet.')
+                    h('div', { className: 'mt-2 text-sm', style: t.text }, 'Source location and last-visit fields can still be sparse in the client cache, but linked appointments now recover known stylists and locations whenever the appointments cache has them.')
                   ),
+                  detail.relationships ? h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: '0.75rem' } },
+                    detailField('Known appointments', fmtNumber(detail.relationships.appointmentCount)),
+                    detailField('Known stylists', fmtNumber(detail.relationships.uniqueStylistCount)),
+                    detailField('Known locations', fmtNumber(detail.relationships.uniqueLocationCount)),
+                    detailField('Recent 90d appointments', fmtNumber(detail.relationships.recentAppointmentCount)),
+                    detailField('Last appointment from linked cache', detail.relationships.lastAppointmentAt ? formatDateTime(detail.relationships.lastAppointmentAt) : '—')
+                  ) : null,
+                  detail.relationships ? h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: '0.75rem' } },
+                    h('div', { style: noteCard },
+                      h('div', { style: detailLabel }, 'Known stylists from appointments'),
+                      ...(detail.relationships.stylists.length ? detail.relationships.stylists.map((item: Link) => h('div', { key: item.id, style: { ...detailValue, marginTop: '0.5rem' } }, h('span', null, `${item.label} • ${fmtNumber(item.appointmentCount)} appts`), h('button', { type: 'button', style: { ...t.btnGhost, padding: '0.25rem 0.45rem', marginLeft: '0.5rem' }, onClick: () => void openLinkedStylist(item.id) }, 'Open'))) : [h('div', { style: detailValue }, 'No linked stylists found.')])
+                    ),
+                    h('div', { style: noteCard },
+                      h('div', { style: detailLabel }, 'Known locations from appointments'),
+                      ...(detail.relationships.locations.length ? detail.relationships.locations.map((item: Link) => h('div', { key: item.id, style: { ...detailValue, marginTop: '0.5rem' } }, h('span', null, `${item.label} • ${fmtNumber(item.appointmentCount)} appts`), h('button', { type: 'button', style: { ...t.btnGhost, padding: '0.25rem 0.45rem', marginLeft: '0.5rem' }, onClick: () => void openLinkedLocation(item.id) }, 'Open'))) : [h('div', { style: detailValue }, 'No linked locations found.')])
+                    )
+                  ) : null,
+                  linkedStylist ? h('div', { style: { ...noteCard, borderColor: 'rgba(255,255,255,0.14)' } }, h('div', { style: detailLabel }, 'Linked stylist preview'), h('div', { style: detailValue }, `${linkedStylist.fullName || [linkedStylist.givenName, linkedStylist.surname].filter(Boolean).join(' ') || linkedStylist.id} • ${fieldValue(linkedStylist.emailAddress)} • ${fieldValue(linkedStylist.mobilePhone)}`)) : null,
+                  linkedLocation ? h('div', { style: { ...noteCard, borderColor: 'rgba(255,255,255,0.14)' } }, h('div', { style: detailLabel }, 'Linked location preview'), h('div', { style: detailValue }, `${linkedLocation.name || linkedLocation.id} • ${joinAddress([linkedLocation.street, linkedLocation.suburb, linkedLocation.state, linkedLocation.postcode, linkedLocation.country])}`)) : null,
                   h('div', { style: noteCard },
                     h('div', { style: detailLabel }, 'Raw record'),
                     h('pre', { style: { ...detailValue, margin: 0, whiteSpace: 'pre-wrap' as const, fontSize: '0.78rem' } }, JSON.stringify(detail.raw, null, 2) || 'null')

@@ -37,6 +37,7 @@ export interface ClientRecord {
 export interface ClientDetailRecord extends ClientRecord {
   address: string | null;
   createdAtRemote: string | null;
+  relationships?: RelationshipSummary | null;
   raw: unknown | null;
 }
 
@@ -57,6 +58,7 @@ export interface LocationRecord {
 }
 
 export interface LocationDetailRecord extends LocationRecord {
+  relationships?: RelationshipSummary | null;
   raw: unknown | null;
 }
 
@@ -82,8 +84,40 @@ export interface StylistRecord {
 }
 
 export interface StylistDetailRecord extends StylistRecord {
+  relationships?: RelationshipSummary | null;
   profileRaw: unknown | null;
   raw: unknown | null;
+}
+
+export interface RelationshipEntityLink {
+  id: string;
+  label: string;
+  appointmentCount: number;
+  lastAppointmentAt: string | null;
+}
+
+export interface RevenueSummary {
+  available: boolean;
+  source: 'revenue_facts' | 'appointments' | 'none';
+  grossAmount: number | null;
+  discountAmount: number | null;
+  netAmount: number | null;
+  appointmentCount: number;
+  lastUpdatedAt: string | null;
+  note?: string | null;
+}
+
+export interface RelationshipSummary {
+  appointmentCount: number;
+  uniqueClientCount: number;
+  uniqueStylistCount: number;
+  uniqueLocationCount: number;
+  lastAppointmentAt: string | null;
+  recentAppointmentCount: number;
+  clients: RelationshipEntityLink[];
+  stylists: RelationshipEntityLink[];
+  locations: RelationshipEntityLink[];
+  revenue?: RevenueSummary | null;
 }
 
 export interface AppointmentRecord {
