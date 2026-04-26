@@ -19,6 +19,7 @@ import type {
   ExportManifestRecord,
   LocationDetailRecord,
   LocationRecord,
+  RelationshipSummary,
   ServiceDetailRecord,
   ServiceRecord,
   StylistDetailRecord,
@@ -108,6 +109,146 @@ function safeJsonParse(value: string | null): unknown | null {
   }
 }
 
+
+type RelationshipLinkAccumulator = { id: string; label: string; appointmentCount: number; lastAppointmentAt: string | null };
+
+type RelationshipComputation = RelationshipSummary;
+
+function mostRecentIso(a: string | null, b: string | null): string | null {
+  if (!a) return b;
+  if (!b) return a;
+  return a >= b ? a : b;
+}
+
+function toRelationshipLinks(items: Map<string, RelationshipLinkAccumulator>) {
+  return Array.from(items.values())
+    .sort((a, b) => {
+      if (b.appointmentCount !== a.appointmentCount) return b.appointmentCount - a.appointmentCount;
+      return String(a.label || '').localeCompare(String(b.label || ''));
+    })
+    .slice(0, 8);
+}
+
+function computeRevenueSummary(db: ReturnType<typeof initializeDatabase>['db'], teamId: string, locationId: string | null) {
+  if (!locationId) {
+    return {
+      available: false,
+      source: 'none' as const,
+      grossAmount: null,
+      discountAmount: null,
+      netAmount: null,
+      appointmentCount: 0,
+      lastUpdatedAt: null,
+      note: 'Revenue needs a location-scoped local source.',
+    };
+  }
+
+  const facts = db.select().from(schema.revenueFacts)
+    .where(and(eq(schema.revenueFacts.teamId, teamId), eq(schema.revenueFacts.locationId, locationId))).all() as schema.RevenueFact[];
+  if (facts.length) {
+    let grossAmount = 0;
+    let discountAmount = 0;
+    let netAmount = 0;
+    let appointmentCount = 0;
+    let lastUpdatedAt: string | null = null;
+    for (const row of facts) {
+      grossAmount += row.grossAmount || 0;
+      discountAmount += row.discountAmount || 0;
+      netAmount += row.netAmount || 0;
+      appointmentCount += row.appointmentCount || 0;
+      lastUpdatedAt = mostRecentIso(lastUpdatedAt, row.lastUpdatedAt || null);
+    }
+    return { available: true, source: 'revenue_facts' as const, grossAmount, discountAmount, netAmount, appointmentCount, lastUpdatedAt, note: null };
+  }
+
+  const appointments = db.select().from(schema.appointments)
+    .where(and(eq(schema.appointments.teamId, teamId), eq(schema.appointments.locationId, locationId))).all() as schema.Appointment[];
+  const withAmounts = appointments.filter((row) => row.netAmount != null || row.grossAmount != null || row.total != null);
+  if (withAmounts.length) {
+    let grossAmount = 0;
+    let discountAmount = 0;
+    let netAmount = 0;
+    let lastUpdatedAt: string | null = null;
+    for (const row of withAmounts) {
+      grossAmount += row.grossAmount ?? row.total ?? 0;
+      discountAmount += row.discountAmount ?? 0;
+      netAmount += row.netAmount ?? row.total ?? row.grossAmount ?? 0;
+      lastUpdatedAt = mostRecentIso(lastUpdatedAt, row.updatedAtRemote || row.syncedAt || null);
+    }
+    return { available: true, source: 'appointments' as const, grossAmount, discountAmount, netAmount, appointmentCount: withAmounts.length, lastUpdatedAt, note: null };
+  }
+
+  return {
+    available: false,
+    source: 'none' as const,
+    grossAmount: null,
+    discountAmount: null,
+    netAmount: null,
+    appointmentCount: appointments.length,
+    lastUpdatedAt: appointments.reduce((latest, row) => mostRecentIso(latest, row.updatedAtRemote || row.syncedAt || null), null as string | null),
+    note: appointments.length ? 'Appointments are linked, but this cache does not yet include money fields for them.' : 'No local revenue rows found for this location yet.',
+  };
+}
+
+function buildRelationshipSummary(db: ReturnType<typeof initializeDatabase>['db'], teamId: string, focus: { clientId?: string | null; stylistId?: string | null; locationId?: string | null }): RelationshipComputation {
+  const lookups = buildAppointmentLookups(db, teamId);
+  let appointments = db.select().from(schema.appointments).where(eq(schema.appointments.teamId, teamId)).all() as schema.Appointment[];
+  if (focus.clientId) appointments = appointments.filter((row) => row.clientId === focus.clientId);
+  if (focus.locationId) appointments = appointments.filter((row) => row.locationId === focus.locationId);
+  if (focus.stylistId) appointments = appointments.filter((row) => cleanString(row.stylistId ?? row.staffId) === focus.stylistId);
+
+  const clients = new Map<string, RelationshipLinkAccumulator>();
+  const stylists = new Map<string, RelationshipLinkAccumulator>();
+  const locations = new Map<string, RelationshipLinkAccumulator>();
+  let lastAppointmentAt: string | null = null;
+  let recentAppointmentCount = 0;
+  const recentCutoff = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
+
+  for (const row of appointments) {
+    const startsAt = cleanString(row.startAt ?? row.startsAt);
+    if (startsAt && startsAt >= recentCutoff) recentAppointmentCount++;
+    lastAppointmentAt = mostRecentIso(lastAppointmentAt, startsAt);
+
+    if (row.clientId) {
+      const client = lookups.clientsById.get(row.clientId);
+      const existing = clients.get(row.clientId) || { id: row.clientId, label: client?.fullName ?? client?.firstName ?? row.clientName ?? row.clientId, appointmentCount: 0, lastAppointmentAt: null };
+      existing.appointmentCount += 1;
+      existing.lastAppointmentAt = mostRecentIso(existing.lastAppointmentAt, startsAt);
+      clients.set(row.clientId, existing);
+    }
+
+    const stylist = findAppointmentStylist(row, lookups);
+    const stylistKey = stylist?.id || cleanString(row.stylistId ?? row.staffId);
+    if (stylistKey) {
+      const existing = stylists.get(stylistKey) || { id: stylistKey, label: stylist?.fullName ?? normalizeFullName(stylist as any) ?? row.stylistId ?? row.staffId ?? stylistKey, appointmentCount: 0, lastAppointmentAt: null };
+      existing.appointmentCount += 1;
+      existing.lastAppointmentAt = mostRecentIso(existing.lastAppointmentAt, startsAt);
+      stylists.set(stylistKey, existing);
+    }
+
+    if (row.locationId) {
+      const location = lookups.locationsById.get(row.locationId);
+      const existing = locations.get(row.locationId) || { id: row.locationId, label: location?.name ?? row.locationId, appointmentCount: 0, lastAppointmentAt: null };
+      existing.appointmentCount += 1;
+      existing.lastAppointmentAt = mostRecentIso(existing.lastAppointmentAt, startsAt);
+      locations.set(row.locationId, existing);
+    }
+  }
+
+  return {
+    appointmentCount: appointments.length,
+    uniqueClientCount: clients.size,
+    uniqueStylistCount: stylists.size,
+    uniqueLocationCount: locations.size,
+    lastAppointmentAt,
+    recentAppointmentCount,
+    clients: toRelationshipLinks(clients),
+    stylists: toRelationshipLinks(stylists),
+    locations: toRelationshipLinks(locations),
+    revenue: focus.locationId ? computeRevenueSummary(db, teamId, focus.locationId) : null,
+  };
+}
+
 function mapClientRecord(row: schema.Client): ClientRecord {
   return {
     id: row.id,
@@ -138,11 +279,12 @@ function mapClientRecord(row: schema.Client): ClientRecord {
   };
 }
 
-function mapClientDetailRecord(row: schema.Client): ClientDetailRecord {
+function mapClientDetailRecord(row: schema.Client, relationships?: RelationshipSummary | null): ClientDetailRecord {
   return {
     ...mapClientRecord(row),
     address: row.address ?? null,
     createdAtRemote: row.createdAtRemote ?? null,
+    relationships: relationships ?? null,
     raw: safeJsonParse(row.raw ?? null),
   };
 }
@@ -165,9 +307,10 @@ function mapLocationRecord(row: schema.Location): LocationRecord {
   };
 }
 
-function mapLocationDetailRecord(row: schema.Location): LocationDetailRecord {
+function mapLocationDetailRecord(row: schema.Location, relationships?: RelationshipSummary | null): LocationDetailRecord {
   return {
     ...mapLocationRecord(row),
+    relationships: relationships ?? null,
     raw: safeJsonParse(row.raw ?? null),
   };
 }
@@ -195,9 +338,10 @@ function mapStylistRecord(row: schema.Stylist): StylistRecord {
   };
 }
 
-function mapStylistDetailRecord(row: schema.Stylist): StylistDetailRecord {
+function mapStylistDetailRecord(row: schema.Stylist, relationships?: RelationshipSummary | null): StylistDetailRecord {
   return {
     ...mapStylistRecord(row),
+    relationships: relationships ?? null,
     profileRaw: safeJsonParse(row.profileRaw ?? null),
     raw: safeJsonParse(row.raw ?? null),
   };
@@ -641,8 +785,37 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       const { db } = initializeDatabase(teamId);
       const { limit, offset } = parsePagination(req.query);
       const activeFilter = parseBooleanFilter(req.query.active);
+      const locationFilter = cleanString(req.query.locationId || req.query.location);
+      const stylistFilter = cleanString(req.query.stylistId || req.query.stylist || req.query.staffId);
+      const clientFilter = cleanString(req.query.clientId || req.query.client);
       let rows = db.select().from(schema.locations).where(eq(schema.locations.teamId, teamId)).all();
       if (activeFilter !== null) rows = rows.filter((row: schema.Location) => row.active === activeFilter);
+      if (locationFilter) rows = rows.filter((row: schema.Location) => row.id === locationFilter);
+      if (stylistFilter || clientFilter) {
+        const allowedLocationIds = new Set<string>();
+        if (stylistFilter) {
+          const stylists = db.select().from(schema.stylists).where(eq(schema.stylists.teamId, teamId)).all() as schema.Stylist[];
+          for (const stylist of stylists) {
+            if (stylist.id === stylistFilter || stylist.privateId === stylistFilter) {
+              if (stylist.locationId) allowedLocationIds.add(stylist.locationId);
+              if (stylist.sourceLocationId) allowedLocationIds.add(stylist.sourceLocationId);
+            }
+          }
+        }
+        if (clientFilter) {
+          const clients = db.select().from(schema.clients).where(eq(schema.clients.teamId, teamId)).all() as schema.Client[];
+          for (const client of clients) {
+            if (client.id === clientFilter && client.sourceLocationId) allowedLocationIds.add(client.sourceLocationId);
+          }
+        }
+        const appointments = db.select().from(schema.appointments).where(eq(schema.appointments.teamId, teamId)).all() as schema.Appointment[];
+        for (const appointment of appointments) {
+          const stylistMatch = stylistFilter && (appointment.stylistId === stylistFilter || appointment.staffId === stylistFilter);
+          const clientMatch = clientFilter && appointment.clientId === clientFilter;
+          if ((stylistMatch || clientMatch) && appointment.locationId) allowedLocationIds.add(appointment.locationId);
+        }
+        rows = rows.filter((row: schema.Location) => allowedLocationIds.has(row.id));
+      }
       if (req.query.search) {
         const term = String(req.query.search).toLowerCase();
         rows = rows.filter((row: schema.Location) =>
@@ -664,7 +837,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       const { db } = initializeDatabase(teamId);
       const rows = db.select().from(schema.locations).where(and(eq(schema.locations.teamId, teamId), eq(schema.locations.id, locationMatch[1]!))).all();
       if (!rows.length) return apiError(404, 'NOT_FOUND', 'Location not found');
-      return { status: 200, data: mapLocationDetailRecord(rows[0]) };
+      return { status: 200, data: mapLocationDetailRecord(rows[0], buildRelationshipSummary(db, teamId, { locationId: rows[0].id })) };
     } catch (error: any) {
       return apiError(500, 'DATABASE_ERROR', error?.message || 'Failed to read location');
     }
@@ -730,12 +903,20 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       const { limit, offset } = parsePagination(req.query);
       const activeFilter = parseBooleanFilter(req.query.active);
       const locationFilter = cleanString(req.query.locationId || req.query.location);
+      const clientFilter = cleanString(req.query.clientId || req.query.client);
+      const stylistFilter = cleanString(req.query.stylistId || req.query.stylist || req.query.staffId);
       const search = cleanString(req.query.search || req.query.q);
       const { field, direction } = parseSort(req.query);
 
       let rows = db.select().from(schema.clients).where(eq(schema.clients.teamId, teamId)).all() as schema.Client[];
       if (activeFilter !== null) rows = rows.filter((row) => row.active === activeFilter);
       if (locationFilter) rows = rows.filter((row) => row.sourceLocationId === locationFilter);
+      if (clientFilter) rows = rows.filter((row) => row.id === clientFilter || row.privateId === clientFilter);
+      if (stylistFilter) {
+        const appointments = db.select().from(schema.appointments).where(eq(schema.appointments.teamId, teamId)).all() as schema.Appointment[];
+        const allowedClientIds = new Set(appointments.filter((row) => row.clientId && (row.stylistId === stylistFilter || row.staffId === stylistFilter)).map((row) => row.clientId as string));
+        rows = rows.filter((row) => allowedClientIds.has(row.id));
+      }
 
       // Recency window filter: `lastVisitNever=1` keeps only clients with no recorded visit.
       // `lastVisitBefore` / `lastVisitAfter` keep clients with a non-null last visit on the
@@ -803,7 +984,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       const { db } = initializeDatabase(teamId);
       const rows = db.select().from(schema.clients).where(and(eq(schema.clients.teamId, teamId), eq(schema.clients.id, clientMatch[1]!))).all();
       if (!rows.length) return apiError(404, 'NOT_FOUND', 'Client not found');
-      return { status: 200, data: mapClientDetailRecord(rows[0]) };
+      return { status: 200, data: mapClientDetailRecord(rows[0], buildRelationshipSummary(db, teamId, { clientId: rows[0].id })) };
     } catch (error: any) {
       return apiError(500, 'DATABASE_ERROR', error?.message || 'Failed to read client');
     }
@@ -815,7 +996,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       const { db } = initializeDatabase(teamId);
       const rows = db.select().from(schema.stylists).where(and(eq(schema.stylists.teamId, teamId), eq(schema.stylists.id, stylistMatch[1]!))).all();
       if (!rows.length) return apiError(404, 'NOT_FOUND', 'Stylist not found');
-      return { status: 200, data: mapStylistDetailRecord(rows[0]) };
+      return { status: 200, data: mapStylistDetailRecord(rows[0], buildRelationshipSummary(db, teamId, { stylistId: rows[0].privateId })) };
     } catch (error: any) {
       return apiError(500, 'DATABASE_ERROR', error?.message || 'Failed to read stylist');
     }
@@ -827,11 +1008,24 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       const { limit, offset } = parsePagination(req.query);
       const activeFilter = parseBooleanFilter(req.query.active);
       const locationFilter = cleanString(req.query.locationId || req.query.location);
+      const stylistFilter = cleanString(req.query.stylistId || req.query.stylist || req.query.staffId);
+      const clientFilter = cleanString(req.query.clientId || req.query.client);
       const search = cleanString(req.query.search || req.query.q);
 
       let rows = db.select().from(schema.stylists).where(eq(schema.stylists.teamId, teamId)).all() as schema.Stylist[];
       if (activeFilter !== null) rows = rows.filter((row) => row.active === activeFilter);
       if (locationFilter) rows = rows.filter((row) => row.locationId === locationFilter || row.sourceLocationId === locationFilter);
+      if (stylistFilter) rows = rows.filter((row) => row.id === stylistFilter || row.privateId === stylistFilter);
+      if (clientFilter) {
+        const appointments = db.select().from(schema.appointments).where(eq(schema.appointments.teamId, teamId)).all() as schema.Appointment[];
+        const allowedStylistIds = new Set<string>();
+        for (const appointment of appointments) {
+          if (appointment.clientId !== clientFilter) continue;
+          if (appointment.stylistId) allowedStylistIds.add(appointment.stylistId);
+          if (appointment.staffId) allowedStylistIds.add(appointment.staffId);
+        }
+        rows = rows.filter((row) => allowedStylistIds.has(row.privateId || '') || allowedStylistIds.has(row.id));
+      }
       if (search) {
         const term = search.toLowerCase();
         rows = rows.filter((row) =>
@@ -1014,7 +1208,9 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       const { db } = initializeDatabase(teamId);
       const { limit, offset } = parsePagination(req.query);
       const locationFilter = cleanString(req.query.locationId || req.query.location);
-      const stylistFilter = cleanString(req.query.stylistId || req.query.staffId);
+      const stylistFilter = cleanString(req.query.stylistId || req.query.stylist || req.query.staffId);
+      const clientFilter = cleanString(req.query.clientId || req.query.client);
+      const appointmentFilter = cleanString(req.query.appointmentId || req.query.appointment);
       const statusFilter = cleanString(req.query.statusCode || req.query.status);
       const categoryFilter = cleanString(req.query.categoryId || req.query.category);
       const search = cleanString(req.query.search || req.query.q);
@@ -1023,6 +1219,8 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       let rows = db.select().from(schema.appointments).where(eq(schema.appointments.teamId, teamId)).all() as schema.Appointment[];
       if (locationFilter) rows = rows.filter((row) => row.locationId === locationFilter);
       if (stylistFilter) rows = rows.filter((row) => row.stylistId === stylistFilter || row.staffId === stylistFilter);
+      if (clientFilter) rows = rows.filter((row) => row.clientId === clientFilter);
+      if (appointmentFilter) rows = rows.filter((row) => row.id === appointmentFilter || row.appointmentId === appointmentFilter);
       if (statusFilter) rows = rows.filter((row) => row.statusCode === statusFilter || row.status === statusFilter);
       if (categoryFilter) rows = rows.filter((row) => row.categoryId === categoryFilter || row.categoryName === categoryFilter);
       if (startsAfter) rows = rows.filter((row) => String(row.startAt || row.startsAt || '') >= startsAfter);

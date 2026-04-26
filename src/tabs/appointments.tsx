@@ -1,4 +1,4 @@
-import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, modal, t, useEscapeToClose } from './common';
+import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, modal, readLinkedViewParams, t, useEscapeToClose } from './common';
 
 (function () {
   const R = (window as any).React;
@@ -101,15 +101,19 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, modal, t, useEsc
   const toDateEnd = (value: string) => value ? `${value}T23:59:59` : '';
 
   function Appointments(props: any) {
-    const teamId = typeof props?.teamId === 'string' && props.teamId.trim() ? props.teamId.trim() : null;
+    const incoming = readLinkedViewParams(props);
+    const teamId = typeof props?.teamId === 'string' && props.teamId.trim() ? props.teamId.trim() : (incoming.teamId || null);
     const [rows, setRows] = useState([] as Row[]);
     const [locations, setLocations] = useState([] as LocationOption[]);
-    const [searchInput, setSearchInput] = useState('');
-    const [search, setSearch] = useState('');
-    const [locationId, setLocationId] = useState('');
-    const [statusFilter, setStatusFilter] = useState('');
-    const [startDate, setStartDate] = useState('');
-    const [endDate, setEndDate] = useState('');
+    const [searchInput, setSearchInput] = useState(incoming.search || incoming.appointmentId || incoming.clientId || incoming.stylistId || '');
+    const [search, setSearch] = useState(incoming.search || '');
+    const [locationId, setLocationId] = useState(incoming.locationId || '');
+    const [stylistId, setStylistId] = useState(incoming.stylistId || '');
+    const [clientId, setClientId] = useState(incoming.clientId || '');
+    const [appointmentId, setAppointmentId] = useState(incoming.appointmentId || '');
+    const [statusFilter, setStatusFilter] = useState(incoming.status || '');
+    const [startDate, setStartDate] = useState(incoming.startDate || '');
+    const [endDate, setEndDate] = useState(incoming.endDate || '');
     const [offset, setOffset] = useState(0);
     const [total, setTotal] = useState(0);
     const [limit, setLimit] = useState(25);
@@ -157,6 +161,9 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, modal, t, useEsc
       nextLimit: number;
       nextSearch: string;
       nextLocationId: string;
+      nextStylistId: string;
+      nextClientId: string;
+      nextAppointmentId: string;
       nextStatus: string;
       nextStartDate: string;
       nextEndDate: string;
@@ -167,6 +174,9 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, modal, t, useEsc
       ];
       if (params.nextSearch) qs.push(`search=${encodeURIComponent(params.nextSearch)}`);
       if (params.nextLocationId) qs.push(`locationId=${encodeURIComponent(params.nextLocationId)}`);
+      if (params.nextStylistId) qs.push(`stylistId=${encodeURIComponent(params.nextStylistId)}`);
+      if (params.nextClientId) qs.push(`clientId=${encodeURIComponent(params.nextClientId)}`);
+      if (params.nextAppointmentId) qs.push(`appointmentId=${encodeURIComponent(params.nextAppointmentId)}`);
       if (params.nextStatus) qs.push(`status=${encodeURIComponent(params.nextStatus)}`);
       if (params.nextStartDate) qs.push(`startsAfter=${encodeURIComponent(toDateStart(params.nextStartDate))}`);
       if (params.nextEndDate) qs.push(`startsBefore=${encodeURIComponent(toDateEnd(params.nextEndDate))}`);
@@ -178,6 +188,9 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, modal, t, useEsc
       nextLimit: number;
       nextSearch: string;
       nextLocationId: string;
+      nextStylistId: string;
+      nextClientId: string;
+      nextAppointmentId: string;
       nextStatus: string;
       nextStartDate: string;
       nextEndDate: string;
@@ -188,6 +201,9 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, modal, t, useEsc
         nextLimit: overrides?.nextLimit ?? limit,
         nextSearch: overrides?.nextSearch ?? search,
         nextLocationId: overrides?.nextLocationId ?? locationId,
+        nextStylistId: overrides?.nextStylistId ?? stylistId,
+        nextClientId: overrides?.nextClientId ?? clientId,
+        nextAppointmentId: overrides?.nextAppointmentId ?? appointmentId,
         nextStatus: overrides?.nextStatus ?? statusFilter,
         nextStartDate: overrides?.nextStartDate ?? startDate,
         nextEndDate: overrides?.nextEndDate ?? endDate,
@@ -234,6 +250,9 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, modal, t, useEsc
     const applyFilters = (patch: Partial<{
       nextSearch: string;
       nextLocationId: string;
+      nextStylistId: string;
+      nextClientId: string;
+      nextAppointmentId: string;
       nextStatus: string;
       nextStartDate: string;
       nextEndDate: string;
