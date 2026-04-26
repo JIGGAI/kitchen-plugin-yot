@@ -7,9 +7,6 @@ on:
         description: "Tag to publish (e.g. v0.6.1). If provided, workflow will checkout this tag before publishing."
         required: false
         type: string
-  push:
-    tags:
-      - "v*"
 
 jobs:
   publish:
@@ -23,7 +20,7 @@ jobs:
           fetch-depth: 0
 
       - name: Checkout tag (workflow_dispatch)
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.tag != '' }}
+        if: ${{ inputs.tag != '' }}
         run: |
           git checkout "${{ inputs.tag }}"
 
