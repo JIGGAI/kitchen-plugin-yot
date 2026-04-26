@@ -2,7 +2,7 @@
 
 ClawKitchen plugin that wraps the **You're On Time** CRM API (https://api2.youreontime.com) so HMX team workflows and dashboards can consume real CRM data without the dashboard holding credentials or direct API access.
 
-## Why
+## Why oh Why?
 
 The Hair Mechanix dashboard is a lightweight front end. Every external integration lives in a ClawKitchen plugin so:
 
