@@ -1,6 +1,6 @@
 {
   "name": "@jiggai/kitchen-plugin-yot",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "You're On Time CRM plugin for ClawKitchen",
   "repository": {
     "type": "git",
