@@ -1,4 +1,4 @@
-import { api, boolLabel, describeFreshness, fieldValue, fmtNumber, formatDateTime, formatRelativeTime, modal, parseRawJson, t, useEscapeToClose } from './common';
+import { api, boolLabel, describeFreshness, fieldValue, fmtNumber, formatDateTime, formatRelativeTime, modal, parseRawJson, readLinkedViewParams, t, useEscapeToClose } from './common';
 
 (function () {
   const R = (window as any).React;
@@ -21,12 +21,15 @@ import { api, boolLabel, describeFreshness, fieldValue, fmtNumber, formatDateTim
   const detailValue = { marginTop: '0.2rem', color: 'var(--ck-text-primary)', fontSize: '0.9rem', lineHeight: 1.4, wordBreak: 'break-word' as const };
 
   function Stylists(props: any) {
-    const teamId = typeof props?.teamId === 'string' && props.teamId.trim() ? props.teamId.trim() : null;
+    const incoming = readLinkedViewParams(props);
+    const teamId = typeof props?.teamId === 'string' && props.teamId.trim() ? props.teamId.trim() : (incoming.teamId || null);
     const [rows, setRows] = useState([] as Row[]);
     const [locations, setLocations] = useState([] as LocationOption[]);
-    const [searchInput, setSearchInput] = useState('');
-    const [search, setSearch] = useState('');
-    const [locationId, setLocationId] = useState('');
+    const [searchInput, setSearchInput] = useState(incoming.search || incoming.stylistId || incoming.clientId || '');
+    const [search, setSearch] = useState(incoming.search || '');
+    const [locationId, setLocationId] = useState(incoming.locationId || '');
+    const [stylistId, setStylistId] = useState(incoming.stylistId || '');
+    const [clientId, setClientId] = useState(incoming.clientId || '');
     const [activeFilter, setActiveFilter] = useState('all');
     const [syncState, setSyncState] = useState(null as SyncState | null);
     const [latestRun, setLatestRun] = useState(null as SyncRun | null);
@@ -66,6 +69,8 @@ import { api, boolLabel, describeFreshness, fieldValue, fmtNumber, formatDateTim
         const query: string[] = ['limit=200'];
         if (search) query.push(`search=${encodeURIComponent(search)}`);
         if (locationId) query.push(`locationId=${encodeURIComponent(locationId)}`);
+        if (stylistId) query.push(`stylistId=${encodeURIComponent(stylistId)}`);
+        if (clientId) query.push(`clientId=${encodeURIComponent(clientId)}`);
         if (activeFilter === 'active') query.push('active=true'); else if (activeFilter === 'inactive') query.push('active=false');
         const [stylistsRes, locationsRes, healthRes, runsRes] = await Promise.all([
           api('yot', teamId, `/stylists?${query.join('&')}`) as Promise<{ data: Row[] }>,
@@ -97,6 +102,7 @@ import { api, boolLabel, describeFreshness, fieldValue, fmtNumber, formatDateTim
           h('div', { style: { ...t.card, padding: '0.75rem' } }, h('div', { className: 'text-xs', style: t.faint }, 'Latest run'), latestRun ? h('div', null, h('div', { className: 'mt-1 text-sm font-medium', style: t.text }, `${latestRun.status} • ${formatRelativeTime(latestRun.startedAt)}`), h('div', { className: 'mt-1 text-xs', style: latestRun.error ? t.danger : t.faint }, latestRun.error || latestRun.notes || `${fieldValue(latestRun.rowsWritten)} written / ${fieldValue(latestRun.rowsSeen)} seen`)) : h('div', { className: 'mt-1 text-sm', style: t.faint }, 'No stylist sync runs recorded yet.'))
         ),
         h('div', { className: 'mt-3 flex gap-2' }, h('input', { value: searchInput, onChange: (e: any) => setSearchInput(e.target.value), onKeyDown: (e: any) => { if (e.key === 'Enter') setSearch(searchInput); }, placeholder: 'Search stylist name, email, phone, or private ID', style: t.input }), h('button', { type: 'button', onClick: () => setSearch(searchInput), style: t.btnPrimary }, 'Search'), searchInput || search ? h('button', { type: 'button', onClick: () => { setSearchInput(''); setSearch(''); }, style: t.btnGhost }, 'Clear') : null),
+        (locationId || stylistId || clientId) ? h('div', { className: 'mt-3 text-xs', style: t.faint }, `Linked scope • ${[locationId ? `location=${locationId}` : '', stylistId ? `stylist=${stylistId}` : '', clientId ? `client=${clientId}` : ''].filter(Boolean).join(' • ')}`) : null,
         h('div', { className: 'mt-3', style: { display: 'flex', flexWrap: 'wrap', gap: '0.5rem', alignItems: 'center' } },
           h('select', { value: locationId, onChange: (e: any) => setLocationId(e.target.value), style: select }, h('option', { value: '' }, 'All locations'), ...locations.map((loc: LocationOption) => h('option', { key: loc.id, value: String(loc.id) }, loc.name || `Location ${loc.id}`))),
           h('select', { value: activeFilter, onChange: (e: any) => setActiveFilter(e.target.value), style: select }, h('option', { value: 'all' }, 'Active & inactive'), h('option', { value: 'active' }, 'Active only'), h('option', { value: 'inactive' }, 'Inactive only'))

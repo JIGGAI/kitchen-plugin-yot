@@ -785,8 +785,37 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       const { db } = initializeDatabase(teamId);
       const { limit, offset } = parsePagination(req.query);
       const activeFilter = parseBooleanFilter(req.query.active);
+      const locationFilter = cleanString(req.query.locationId || req.query.location);
+      const stylistFilter = cleanString(req.query.stylistId || req.query.stylist || req.query.staffId);
+      const clientFilter = cleanString(req.query.clientId || req.query.client);
       let rows = db.select().from(schema.locations).where(eq(schema.locations.teamId, teamId)).all();
       if (activeFilter !== null) rows = rows.filter((row: schema.Location) => row.active === activeFilter);
+      if (locationFilter) rows = rows.filter((row: schema.Location) => row.id === locationFilter);
+      if (stylistFilter || clientFilter) {
+        const allowedLocationIds = new Set<string>();
+        if (stylistFilter) {
+          const stylists = db.select().from(schema.stylists).where(eq(schema.stylists.teamId, teamId)).all() as schema.Stylist[];
+          for (const stylist of stylists) {
+            if (stylist.id === stylistFilter || stylist.privateId === stylistFilter) {
+              if (stylist.locationId) allowedLocationIds.add(stylist.locationId);
+              if (stylist.sourceLocationId) allowedLocationIds.add(stylist.sourceLocationId);
+            }
+          }
+        }
+        if (clientFilter) {
+          const clients = db.select().from(schema.clients).where(eq(schema.clients.teamId, teamId)).all() as schema.Client[];
+          for (const client of clients) {
+            if (client.id === clientFilter && client.sourceLocationId) allowedLocationIds.add(client.sourceLocationId);
+          }
+        }
+        const appointments = db.select().from(schema.appointments).where(eq(schema.appointments.teamId, teamId)).all() as schema.Appointment[];
+        for (const appointment of appointments) {
+          const stylistMatch = stylistFilter && (appointment.stylistId === stylistFilter || appointment.staffId === stylistFilter);
+          const clientMatch = clientFilter && appointment.clientId === clientFilter;
+          if ((stylistMatch || clientMatch) && appointment.locationId) allowedLocationIds.add(appointment.locationId);
+        }
+        rows = rows.filter((row: schema.Location) => allowedLocationIds.has(row.id));
+      }
       if (req.query.search) {
         const term = String(req.query.search).toLowerCase();
         rows = rows.filter((row: schema.Location) =>
@@ -874,12 +903,20 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       const { limit, offset } = parsePagination(req.query);
       const activeFilter = parseBooleanFilter(req.query.active);
       const locationFilter = cleanString(req.query.locationId || req.query.location);
+      const clientFilter = cleanString(req.query.clientId || req.query.client);
+      const stylistFilter = cleanString(req.query.stylistId || req.query.stylist || req.query.staffId);
       const search = cleanString(req.query.search || req.query.q);
       const { field, direction } = parseSort(req.query);
 
       let rows = db.select().from(schema.clients).where(eq(schema.clients.teamId, teamId)).all() as schema.Client[];
       if (activeFilter !== null) rows = rows.filter((row) => row.active === activeFilter);
       if (locationFilter) rows = rows.filter((row) => row.sourceLocationId === locationFilter);
+      if (clientFilter) rows = rows.filter((row) => row.id === clientFilter || row.privateId === clientFilter);
+      if (stylistFilter) {
+        const appointments = db.select().from(schema.appointments).where(eq(schema.appointments.teamId, teamId)).all() as schema.Appointment[];
+        const allowedClientIds = new Set(appointments.filter((row) => row.clientId && (row.stylistId === stylistFilter || row.staffId === stylistFilter)).map((row) => row.clientId as string));
+        rows = rows.filter((row) => allowedClientIds.has(row.id));
+      }
 
       // Recency window filter: `lastVisitNever=1` keeps only clients with no recorded visit.
       // `lastVisitBefore` / `lastVisitAfter` keep clients with a non-null last visit on the
@@ -971,11 +1008,24 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       const { limit, offset } = parsePagination(req.query);
       const activeFilter = parseBooleanFilter(req.query.active);
       const locationFilter = cleanString(req.query.locationId || req.query.location);
+      const stylistFilter = cleanString(req.query.stylistId || req.query.stylist || req.query.staffId);
+      const clientFilter = cleanString(req.query.clientId || req.query.client);
       const search = cleanString(req.query.search || req.query.q);
 
       let rows = db.select().from(schema.stylists).where(eq(schema.stylists.teamId, teamId)).all() as schema.Stylist[];
       if (activeFilter !== null) rows = rows.filter((row) => row.active === activeFilter);
       if (locationFilter) rows = rows.filter((row) => row.locationId === locationFilter || row.sourceLocationId === locationFilter);
+      if (stylistFilter) rows = rows.filter((row) => row.id === stylistFilter || row.privateId === stylistFilter);
+      if (clientFilter) {
+        const appointments = db.select().from(schema.appointments).where(eq(schema.appointments.teamId, teamId)).all() as schema.Appointment[];
+        const allowedStylistIds = new Set<string>();
+        for (const appointment of appointments) {
+          if (appointment.clientId !== clientFilter) continue;
+          if (appointment.stylistId) allowedStylistIds.add(appointment.stylistId);
+          if (appointment.staffId) allowedStylistIds.add(appointment.staffId);
+        }
+        rows = rows.filter((row) => allowedStylistIds.has(row.privateId || '') || allowedStylistIds.has(row.id));
+      }
       if (search) {
         const term = search.toLowerCase();
         rows = rows.filter((row) =>
@@ -1158,7 +1208,9 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       const { db } = initializeDatabase(teamId);
       const { limit, offset } = parsePagination(req.query);
       const locationFilter = cleanString(req.query.locationId || req.query.location);
-      const stylistFilter = cleanString(req.query.stylistId || req.query.staffId);
+      const stylistFilter = cleanString(req.query.stylistId || req.query.stylist || req.query.staffId);
+      const clientFilter = cleanString(req.query.clientId || req.query.client);
+      const appointmentFilter = cleanString(req.query.appointmentId || req.query.appointment);
       const statusFilter = cleanString(req.query.statusCode || req.query.status);
       const categoryFilter = cleanString(req.query.categoryId || req.query.category);
       const search = cleanString(req.query.search || req.query.q);
@@ -1167,6 +1219,8 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       let rows = db.select().from(schema.appointments).where(eq(schema.appointments.teamId, teamId)).all() as schema.Appointment[];
       if (locationFilter) rows = rows.filter((row) => row.locationId === locationFilter);
       if (stylistFilter) rows = rows.filter((row) => row.stylistId === stylistFilter || row.staffId === stylistFilter);
+      if (clientFilter) rows = rows.filter((row) => row.clientId === clientFilter);
+      if (appointmentFilter) rows = rows.filter((row) => row.id === appointmentFilter || row.appointmentId === appointmentFilter);
       if (statusFilter) rows = rows.filter((row) => row.statusCode === statusFilter || row.status === statusFilter);
       if (categoryFilter) rows = rows.filter((row) => row.categoryId === categoryFilter || row.categoryName === categoryFilter);
       if (startsAfter) rows = rows.filter((row) => String(row.startAt || row.startsAt || '') >= startsAfter);

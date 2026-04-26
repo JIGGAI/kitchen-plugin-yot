@@ -1,4 +1,4 @@
-import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, modal, t, useEscapeToClose } from './common';
+import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, modal, readLinkedViewParams, t, useEscapeToClose } from './common';
 
 (function () {
   const R = (window as any).React;
@@ -106,12 +106,15 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, mod
   };
 
   function Clients(props: any) {
-    const teamId = typeof props?.teamId === 'string' && props.teamId.trim() ? props.teamId.trim() : null;
+    const incoming = readLinkedViewParams(props);
+    const teamId = typeof props?.teamId === 'string' && props.teamId.trim() ? props.teamId.trim() : (incoming.teamId || null);
     const [rows, setRows] = useState([] as Row[]);
     const [locations, setLocations] = useState([] as LocationOption[]);
-    const [searchInput, setSearchInput] = useState('');
-    const [search, setSearch] = useState('');
-    const [locationId, setLocationId] = useState('');
+    const [searchInput, setSearchInput] = useState(incoming.search || incoming.clientId || incoming.stylistId || '');
+    const [search, setSearch] = useState(incoming.search || '');
+    const [locationId, setLocationId] = useState(incoming.locationId || '');
+    const [stylistId, setStylistId] = useState(incoming.stylistId || '');
+    const [clientId, setClientId] = useState(incoming.clientId || '');
     const [activeFilter, setActiveFilter] = useState('all');
     const [recency, setRecency] = useState('all');
     const [sortField, setSortField] = useState('syncedAt' as SortField);
@@ -171,6 +174,8 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, mod
       nextLimit: number;
       nextSearch: string;
       nextLocation: string;
+      nextStylistId: string;
+      nextClientId: string;
       nextActive: string;
       nextRecency: string;
       nextSort: SortField;
@@ -181,6 +186,8 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, mod
       qs.push(`offset=${params.nextOffset}`);
       if (params.nextSearch) qs.push(`search=${encodeURIComponent(params.nextSearch)}`);
       if (params.nextLocation) qs.push(`locationId=${encodeURIComponent(params.nextLocation)}`);
+      if (params.nextStylistId) qs.push(`stylistId=${encodeURIComponent(params.nextStylistId)}`);
+      if (params.nextClientId) qs.push(`clientId=${encodeURIComponent(params.nextClientId)}`);
       if (params.nextActive === 'active') qs.push('active=true');
       else if (params.nextActive === 'inactive') qs.push('active=false');
       if (params.nextRecency === 'never') {
@@ -199,6 +206,8 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, mod
       nextLimit: number;
       nextSearch: string;
       nextLocation: string;
+      nextStylistId: string;
+      nextClientId: string;
       nextActive: string;
       nextRecency: string;
       nextSort: SortField;
@@ -210,6 +219,8 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, mod
         nextLimit: overrides?.nextLimit ?? limit,
         nextSearch: overrides?.nextSearch ?? search,
         nextLocation: overrides?.nextLocation ?? locationId,
+        nextStylistId: overrides?.nextStylistId ?? stylistId,
+        nextClientId: overrides?.nextClientId ?? clientId,
         nextActive: overrides?.nextActive ?? activeFilter,
         nextRecency: overrides?.nextRecency ?? recency,
         nextSort: overrides?.nextSort ?? sortField,
@@ -281,6 +292,8 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, mod
     const applyFilters = (patch: Partial<{
       nextSearch: string;
       nextLocation: string;
+      nextStylistId: string;
+      nextClientId: string;
       nextActive: string;
       nextRecency: string;
       nextSort: SortField;

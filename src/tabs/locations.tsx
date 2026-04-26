@@ -1,4 +1,4 @@
-import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, modal, t, useEscapeToClose } from './common';
+import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, modal, readLinkedViewParams, t, useEscapeToClose } from './common';
 
 (function () {
   const R = (window as any).React;
@@ -40,17 +40,19 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, mod
   type Row = Pick<Detail, 'id' | 'name' | 'suburb' | 'state' | 'postcode' | 'businessPhone' | 'mobilePhone' | 'emailAddress' | 'active' | 'syncedAt'>;
   type StylistRow = { id: string; fullName: string | null; givenName: string | null; surname: string | null; privateId: string | null; emailAddress: string | null; mobilePhone: string | null; active: boolean | null; syncedAt: string };
   type AppointmentRow = { id: string; clientName: string | null; stylistName: string | null; serviceName: string | null; startsAt: string | null; statusDescription: string | null; status: string | null };
-  type Pane = 'summary' | 'stylists' | 'appointments' | 'revenue';
+  type ClientRow = { id: string; fullName: string | null; firstName: string | null; otherName: string | null; lastName: string | null; mobilePhone: string | null; email: string | null; emailAddress: string | null; lastVisitAt: string | null; totalVisits: number | null; syncedAt: string };
+  type Pane = 'summary' | 'stylists' | 'appointments' | 'clients' | 'revenue';
 
   const noteCard = { background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)', borderRadius: '10px', padding: '0.75rem' };
   const detailLabel = { fontSize: '0.72rem', color: 'var(--ck-text-tertiary)', textTransform: 'uppercase' as const, letterSpacing: '0.04em' };
   const detailValue = { marginTop: '0.2rem', color: 'var(--ck-text-primary)', fontSize: '0.9rem', lineHeight: 1.4, wordBreak: 'break-word' as const };
 
   function Locations(props: any) {
-    const teamId = typeof props?.teamId === 'string' && props.teamId.trim() ? props.teamId.trim() : null;
+    const incoming = readLinkedViewParams(props);
+    const teamId = typeof props?.teamId === 'string' && props.teamId.trim() ? props.teamId.trim() : (incoming.teamId || null);
     const [rows, setRows] = useState([] as Row[]);
-    const [searchInput, setSearchInput] = useState('');
-    const [search, setSearch] = useState('');
+    const [searchInput, setSearchInput] = useState(incoming.search || incoming.locationId || incoming.clientId || incoming.stylistId || '');
+    const [search, setSearch] = useState(incoming.search || '');
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null as string | null);
     const [selectedId, setSelectedId] = useState(null as string | null);
@@ -60,6 +62,7 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, mod
     const [pane, setPane] = useState('summary' as Pane);
     const [relatedStylists, setRelatedStylists] = useState([] as StylistRow[]);
     const [relatedAppointments, setRelatedAppointments] = useState([] as AppointmentRow[]);
+    const [relatedClients, setRelatedClients] = useState([] as ClientRow[]);
     const [paneLoading, setPaneLoading] = useState(false);
 
     useEscapeToClose(R, !!selectedId, () => { setSelectedId(null); setDetail(null); setDetailError(null); setPane('summary'); });
@@ -76,7 +79,8 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, mod
       if (!teamId) return;
       setLoading(true); setError(null);
       try {
-        const data = await api('yot', teamId, `/locations?limit=200${search ? `&search=${encodeURIComponent(search)}` : ''}`) as { data: Row[] };
+        const scopeQuery = [incoming.locationId ? `locationId=${encodeURIComponent(incoming.locationId)}` : '', incoming.clientId ? `clientId=${encodeURIComponent(incoming.clientId)}` : '', incoming.stylistId ? `stylistId=${encodeURIComponent(incoming.stylistId)}` : ''].filter(Boolean).join('&');
+        const data = await api('yot', teamId, `/locations?limit=200${search ? `&search=${encodeURIComponent(search)}` : ''}${scopeQuery ? `${search ? '&' : '&'}${scopeQuery}` : ''}`) as { data: Row[] };
         setRows(Array.isArray(data?.data) ? data.data : []);
       } catch (e: any) {
         setError(e?.message || 'Failed to load locations');
@@ -85,7 +89,7 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, mod
 
     const openDetail = async (id: string) => {
       if (!teamId) return;
-      setSelectedId(id); setDetail(null); setDetailError(null); setDetailLoading(true); setPane('summary'); setRelatedStylists([]); setRelatedAppointments([]);
+      setSelectedId(id); setDetail(null); setDetailError(null); setDetailLoading(true); setPane('summary'); setRelatedStylists([]); setRelatedAppointments([]); setRelatedClients([]);
       try {
         const data = await api('yot', teamId, `/locations/${encodeURIComponent(id)}`) as Detail;
         setDetail(data);
@@ -106,6 +110,10 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, mod
         if (nextPane === 'appointments') {
           const res = await api('yot', teamId, `/appointments?limit=100&locationId=${encodeURIComponent(selectedId)}`) as { data: AppointmentRow[] };
           setRelatedAppointments(Array.isArray(res?.data) ? res.data : []);
+        }
+        if (nextPane === 'clients') {
+          const res = await api('yot', teamId, `/clients?limit=100&locationId=${encodeURIComponent(selectedId)}`) as { data: ClientRow[] };
+          setRelatedClients(Array.isArray(res?.data) ? res.data : []);
         }
       } finally { setPaneLoading(false); }
     };
@@ -162,6 +170,7 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, mod
             paneButton('summary', 'Summary'),
             paneButton('stylists', `Stylists${relationships ? ` (${fmtNumber(relationships.uniqueStylistCount)})` : ''}`),
             paneButton('appointments', `Appointments${relationships ? ` (${fmtNumber(relationships.appointmentCount)})` : ''}`),
+            paneButton('clients', `Clients${relationships ? ` (${fmtNumber(relationships.uniqueClientCount)})` : ''}`),
             paneButton('revenue', 'Revenue', !revenue?.available)
           ),
           pane === 'summary' ? h('div', { className: 'space-y-4' },
@@ -169,13 +178,15 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, mod
               detailField('Name', fieldValue(detail.name)), detailField('Status', boolLabel(detail.active, 'Active', 'Inactive')), detailField('Can book online', boolLabel(detail.canBookOnline, 'Yes', 'No')), detailField('Business phone', fieldValue(detail.businessPhone)), detailField('Mobile phone', fieldValue(detail.mobilePhone)), detailField('Email', fieldValue(detail.emailAddress)), detailField('Address', joinAddress([detail.street, detail.suburb, detail.state, detail.postcode, detail.country])), detailField('Appointments', fmtNumber(relationships?.appointmentCount)), detailField('Unique stylists', fmtNumber(relationships?.uniqueStylistCount)), detailField('Unique clients', fmtNumber(relationships?.uniqueClientCount)), detailField('Recent 90d appointments', fmtNumber(relationships?.recentAppointmentCount)), detailField('Last appointment', relationships?.lastAppointmentAt ? formatDateTime(relationships.lastAppointmentAt) : '—'), detailField('Synced', formatDateTime(detail.syncedAt))
             ),
             relationships ? h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: '0.75rem' } },
-              h('div', { style: noteCard }, h('div', { style: detailLabel }, 'Top stylists'), ...(relationships.stylists.length ? relationships.stylists.map((item: Link) => h('div', { key: item.id, style: { ...detailValue, marginTop: '0.5rem' } }, `${item.label} • ${fmtNumber(item.appointmentCount)} appts`)) : [h('div', { style: detailValue }, 'No linked stylists found.')])),
-              h('div', { style: noteCard }, h('div', { style: detailLabel }, 'Recent clients'), ...(relationships.clients.length ? relationships.clients.map((item: Link) => h('div', { key: item.id, style: { ...detailValue, marginTop: '0.5rem' } }, `${item.label} • ${fmtNumber(item.appointmentCount)} appts`)) : [h('div', { style: detailValue }, 'No linked clients found.')]))
+              h('div', { style: noteCard }, h('div', { style: detailLabel }, 'Top stylists'), h('button', { type: 'button', style: { ...t.btnGhost, marginTop: '0.5rem', padding: '0.35rem 0.55rem' }, onClick: () => void openPane('stylists') }, 'Open filtered stylists'), ...(relationships.stylists.length ? relationships.stylists.map((item: Link) => h('div', { key: item.id, style: { ...detailValue, marginTop: '0.5rem' } }, `${item.label} • ${fmtNumber(item.appointmentCount)} appts`)) : [h('div', { style: detailValue }, 'No linked stylists found.')])),
+              h('div', { style: noteCard }, h('div', { style: detailLabel }, 'Recent appointments'), h('button', { type: 'button', style: { ...t.btnGhost, marginTop: '0.5rem', padding: '0.35rem 0.55rem' }, onClick: () => void openPane('appointments') }, 'Open filtered appointments'), h('div', { style: { ...detailValue, marginTop: '0.5rem' } }, `${fmtNumber(relationships.appointmentCount)} linked appointments`)),
+              h('div', { style: noteCard }, h('div', { style: detailLabel }, 'Recent clients'), h('button', { type: 'button', style: { ...t.btnGhost, marginTop: '0.5rem', padding: '0.35rem 0.55rem' }, onClick: () => void openPane('clients') }, 'Open filtered clients'), ...(relationships.clients.length ? relationships.clients.map((item: Link) => h('div', { key: item.id, style: { ...detailValue, marginTop: '0.5rem' } }, `${item.label} • ${fmtNumber(item.appointmentCount)} appts`)) : [h('div', { style: detailValue }, 'No linked clients found.')]))
             ) : null,
             h('div', { style: noteCard }, h('div', { style: detailLabel }, 'Raw record'), h('pre', { style: { ...detailValue, margin: 0, whiteSpace: 'pre-wrap' as const, fontSize: '0.78rem' } }, JSON.stringify(detail.raw, null, 2) || 'null'))
           ) : null,
           pane === 'stylists' ? h('div', { style: noteCard }, paneLoading ? 'Loading stylists…' : relatedStylists.length ? h('div', { style: t.tableWrap }, h('table', { style: t.table }, h('thead', null, h('tr', null, h('th', { style: t.th }, 'Stylist'), h('th', { style: t.th }, 'Contact'), h('th', { style: t.th }, 'Active'), h('th', { style: t.th }, 'Synced'))), h('tbody', null, ...relatedStylists.map((row: any) => h('tr', { key: row.id }, h('td', { style: t.td }, h('div', { className: 'text-sm font-medium', style: t.text }, row.fullName || [row.givenName, row.surname].filter(Boolean).join(' ') || 'Unnamed stylist'), h('div', { className: 'text-xs', style: t.faint }, row.privateId || row.id)), h('td', { style: t.td }, h('div', null, row.emailAddress || '—'), h('div', { className: 'text-xs', style: t.faint }, row.mobilePhone || '—')), h('td', { style: t.td }, boolLabel(row.active, 'Active', 'Inactive')), h('td', { style: t.td }, formatDateTime(row.syncedAt))))))) : 'No linked stylists found for this location.') : null,
           pane === 'appointments' ? h('div', { style: noteCard }, paneLoading ? 'Loading appointments…' : relatedAppointments.length ? h('div', { style: t.tableWrap }, h('table', { style: t.table }, h('thead', null, h('tr', null, h('th', { style: t.th }, 'When'), h('th', { style: t.th }, 'Client'), h('th', { style: t.th }, 'Stylist'), h('th', { style: t.th }, 'Service'), h('th', { style: t.th }, 'Status'))), h('tbody', null, ...relatedAppointments.map((row: any) => h('tr', { key: row.id }, h('td', { style: t.td }, row.startsAt ? formatDateTime(row.startsAt) : '—'), h('td', { style: t.td }, row.clientName || '—'), h('td', { style: t.td }, row.stylistName || '—'), h('td', { style: t.td }, row.serviceName || '—'), h('td', { style: t.td }, row.statusDescription || row.status || '—')))))) : 'No linked appointments found for this location.') : null,
+          pane === 'clients' ? h('div', { style: noteCard }, paneLoading ? 'Loading clients…' : relatedClients.length ? h('div', { style: t.tableWrap }, h('table', { style: t.table }, h('thead', null, h('tr', null, h('th', { style: t.th }, 'Client'), h('th', { style: t.th }, 'Contact'), h('th', { style: t.th }, 'Last visit'), h('th', { style: t.th }, 'Visits'), h('th', { style: t.th }, 'Synced'))), h('tbody', null, ...relatedClients.map((row: any) => h('tr', { key: row.id }, h('td', { style: t.td }, h('div', { className: 'text-sm font-medium', style: t.text }, row.fullName || [row.firstName, row.otherName, row.lastName].filter(Boolean).join(' ') || 'Unnamed client'), h('div', { className: 'text-xs', style: t.faint }, row.id)), h('td', { style: t.td }, h('div', null, row.mobilePhone || '—'), h('div', { className: 'text-xs', style: t.faint }, row.emailAddress || row.email || '—')), h('td', { style: t.td }, row.lastVisitAt ? formatDateTime(row.lastVisitAt) : '—'), h('td', { style: t.td }, fmtNumber(row.totalVisits)), h('td', { style: t.td }, formatDateTime(row.syncedAt))))))) : 'No linked clients found for this location.') : null,
           pane === 'revenue' ? h('div', { style: noteCard },
             revenue?.available ? h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '0.75rem' } }, detailField('Source', revenue.source), detailField('Gross', fmtCurrency(revenue.grossAmount)), detailField('Discounts', fmtCurrency(revenue.discountAmount)), detailField('Net', fmtCurrency(revenue.netAmount)), detailField('Appointments in revenue view', fmtNumber(revenue.appointmentCount)), detailField('Last updated', revenue.lastUpdatedAt ? formatDateTime(revenue.lastUpdatedAt) : '—')) : h('div', null, h('div', { className: 'text-sm font-medium', style: t.warning }, 'Revenue is not available from the current local cache yet.'), h('div', { className: 'mt-2 text-sm', style: t.text }, revenue?.note || 'No revenue facts or appointment money fields were available for this location.'))
           ) : null

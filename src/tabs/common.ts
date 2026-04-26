@@ -300,6 +300,58 @@ export function useEscapeToClose(R: any, open: boolean, onClose: () => void) {
   }, [open, onClose]);
 }
 
+function firstNonEmptyString(...values: unknown[]): string {
+  for (const value of values) {
+    if (typeof value !== 'string') continue;
+    const trimmed = value.trim();
+    if (trimmed) return trimmed;
+  }
+  return '';
+}
+
+function extractSearchParams(input: string): URLSearchParams {
+  const text = String(input || '');
+  const queryIndex = text.indexOf('?');
+  if (queryIndex >= 0) return new URLSearchParams(text.slice(queryIndex + 1));
+  return new URLSearchParams(text);
+}
+
+export function readLinkedViewParams(props: any) {
+  const urlParams = typeof window !== 'undefined'
+    ? [
+        new URLSearchParams(window.location.search || ''),
+        extractSearchParams(window.location.hash || ''),
+      ]
+    : [];
+  const buckets = [
+    props,
+    props?.variables,
+    props?.params,
+    props?.query,
+    props?.filters,
+    props?.context,
+    props?.context?.variables,
+    props?.context?.params,
+    props?.context?.query,
+  ].filter(Boolean);
+  const pick = (...keys: string[]) => firstNonEmptyString(
+    ...buckets.flatMap((bucket: any) => keys.map((key) => bucket?.[key])),
+    ...urlParams.flatMap((params) => keys.map((key) => params.get(key)))
+  );
+
+  return {
+    teamId: pick('teamId', 'team'),
+    locationId: pick('locationId', 'location'),
+    stylistId: pick('stylistId', 'stylist', 'staffId'),
+    clientId: pick('clientId', 'client'),
+    appointmentId: pick('appointmentId', 'appointment'),
+    search: pick('search', 'q'),
+    status: pick('status', 'statusCode'),
+    startDate: pick('startDate', 'dateFrom'),
+    endDate: pick('endDate', 'dateTo'),
+  };
+}
+
 export async function api<T = any>(pluginId: string, teamId: string, path: string, init?: RequestInit): Promise<T> {
   const join = path.startsWith('/') ? path : `/${path}`;
   const url = `/api/plugins/${pluginId}${join}${join.includes('?') ? '&' : '?'}team=${encodeURIComponent(teamId)}`;
