@@ -1,4 +1,4 @@
-import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, modal, readLinkedViewParams, t, useEscapeToClose } from './common';
+import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, loadCacheMeta, modal, readLinkedViewParams, renderCacheSummaryCards, t, useEscapeToClose } from './common';
 
 (function () {
   const R = (window as any).React;
@@ -117,6 +117,8 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, modal, readLinke
     const [offset, setOffset] = useState(0);
     const [total, setTotal] = useState(0);
     const [limit, setLimit] = useState(25);
+    const [syncState, setSyncState] = useState(null as any);
+    const [latestRun, setLatestRun] = useState(null as any);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null as string | null);
     const [selectedId, setSelectedId] = useState(null as string | null);
@@ -211,14 +213,17 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, modal, readLinke
       setLoading(true);
       setError(null);
       try {
-        const [appointmentsRes, locationsRes] = await Promise.all([
+        const [appointmentsRes, locationsRes, meta] = await Promise.all([
           api('yot', teamId, `/appointments?${buildQuery(params)}`) as Promise<{ data: Row[]; total: number; limit: number; offset: number }>,
           api('yot', teamId, '/locations?limit=500') as Promise<{ data: LocationOption[] }>,
+          loadCacheMeta(teamId, 'appointments'),
         ]);
         setRows(Array.isArray(appointmentsRes?.data) ? appointmentsRes.data : []);
         setTotal(Number(appointmentsRes?.total || 0));
         setOffset(Number(appointmentsRes?.offset || 0));
         setLocations(Array.isArray(locationsRes?.data) ? locationsRes.data : []);
+        setSyncState(meta.syncState);
+        setLatestRun(meta.latestRun);
       } catch (e: any) {
         setError(e?.message || 'Failed to load appointments');
       } finally {
@@ -292,6 +297,7 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, modal, readLinke
           h('button', { type: 'button', onClick: () => void load(), style: t.btnGhost, disabled: loading }, loading ? 'Loading…' : '↻ Refresh')
         ),
         error && h('div', { className: 'mt-3 text-xs', style: t.danger }, error),
+        renderCacheSummaryCards(h, { syncState, latestRun, emptyLatestRunText: 'No appointment sync runs recorded yet.' }),
         h('div', { className: 'mt-3 flex gap-2' },
           h('input', {
             value: searchInput,

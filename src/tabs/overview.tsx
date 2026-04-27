@@ -59,7 +59,7 @@ import { api, boolLabel, describeFreshness, fmtNumber, formatDateTime, t } from 
           setMessage(`${label} complete • ${fmtNumber(data?.synced)} clients synced across ${fmtNumber(data?.pageCount)} pages`);
         } else if (key === 'stylists' || key === 'services' || key === 'appointments') {
           setMessage(`${label} complete • ${fmtNumber(data?.synced)} rows across ${fmtNumber(data?.locationCount)} locations`);
-        } else if (key === 'revenue-yesterday' || key === 'revenue-backfill') {
+        } else if (key === 'revenue-yesterday') {
           setMessage(`${label} complete • ${fmtNumber(data?.rowsWritten)} rows written across ${fmtNumber(data?.matchedLocationCount)} locations`);
         } else {
           setMessage(`${label} complete`);
@@ -118,7 +118,6 @@ import { api, boolLabel, describeFreshness, fmtNumber, formatDateTime, t } from 
           h('button', { type: 'button', style: t.btnGhost, disabled: !!busy || !health?.yotConfigured, onClick: () => void runAction('services', 'Services sync', '/services/sync') }, busy === 'services' ? 'Syncing…' : 'Sync services'),
           h('button', { type: 'button', style: t.btnGhost, disabled: !!busy || !health?.yotConfigured, onClick: () => void runAction('appointments', 'Appointments sync', '/appointments/sync?lookbackDays=30') }, busy === 'appointments' ? 'Syncing…' : 'Sync appointments (30d)'),
           h('button', { type: 'button', style: t.btnGhost, disabled: !!busy || !health?.yotConfigured, onClick: () => void runAction('revenue-yesterday', 'Revenue sync (yesterday)', '/revenue/sync?days=1') }, busy === 'revenue-yesterday' ? 'Syncing…' : 'Sync revenue (yesterday)'),
-          h('button', { type: 'button', style: t.btnGhost, disabled: !!busy || !health?.yotConfigured, onClick: () => void runAction('revenue-backfill', 'Revenue backfill (90d)', '/revenue/sync?days=90') }, busy === 'revenue-backfill' ? 'Backfilling…' : 'Backfill revenue (90d)'),
           h('button', { type: 'button', style: t.btnGhost, disabled: !!busy, onClick: () => void runAction('export', 'Export snapshot', '/export') }, busy === 'export' ? 'Exporting…' : 'Export snapshot')
         )
       ),
