@@ -1,4 +1,4 @@
-import { api, boolLabel, detectRevenueDatePreset, fmtNumber, formatDateTime, joinAddress, loadCacheMeta, readLinkedViewParams, renderCacheSummaryCards, resolveRevenueDatePreset, REVENUE_DATE_PRESET_OPTIONS, t } from './common';
+import { api, boolLabel, detectRevenueDatePreset, fmtNumber, formatDateTime, joinAddress, loadCacheMeta, readLinkedViewParams, renderCacheSummaryCards, resolveDefaultRevenueRange, resolveRevenueDatePreset, REVENUE_DATE_PRESET_OPTIONS, t } from './common';
 
 (function () {
   const R = (window as any).React;
@@ -63,10 +63,11 @@ import { api, boolLabel, detectRevenueDatePreset, fmtNumber, formatDateTime, joi
     const incoming = readLinkedViewParams(props);
     const teamId = typeof props?.teamId === 'string' && props.teamId.trim() ? props.teamId.trim() : (incoming.teamId || null);
     const incomingHasRange = Boolean(incoming.startDate && incoming.endDate);
+    const fallbackRange = resolveDefaultRevenueRange();
     const defaultRange = incomingHasRange
       ? { startDate: incoming.startDate, endDate: incoming.endDate }
-      : (resolveRevenueDatePreset('this-week') || { startDate: '', endDate: '' });
-    const defaultPreset = incomingHasRange ? detectRevenueDatePreset(defaultRange.startDate, defaultRange.endDate) : 'this-week';
+      : fallbackRange;
+    const defaultPreset = detectRevenueDatePreset(defaultRange.startDate, defaultRange.endDate);
     const [locations, setLocations] = useState([] as LocationRow[]);
     const [data, setData] = useState(null as RevenueResponse | null);
     const [grain, setGrain] = useState('day' as 'day' | 'week' | 'month');
@@ -192,7 +193,7 @@ import { api, boolLabel, detectRevenueDatePreset, fmtNumber, formatDateTime, joi
         ),
         h('div', { className: 'mt-3 flex flex-wrap gap-2' },
           h('button', { type: 'button', style: t.btnPrimary, onClick: () => { setStartDate(startDateInput); setEndDate(endDateInput); } }, 'Apply filters'),
-          h('button', { type: 'button', style: t.btnGhost, onClick: () => { const range = resolveRevenueDatePreset('this-week') || { startDate: '', endDate: '' }; setPreset('this-week'); setLocationId(''); setStartDateInput(range.startDate); setEndDateInput(range.endDate); setStartDate(range.startDate); setEndDate(range.endDate); setLinkedLocation(null); } }, 'Reset'),
+          h('button', { type: 'button', style: t.btnGhost, onClick: () => { const range = resolveDefaultRevenueRange(); setPreset('custom'); setLocationId(''); setStartDateInput(range.startDate); setEndDateInput(range.endDate); setStartDate(range.startDate); setEndDate(range.endDate); setLinkedLocation(null); } }, 'Reset'),
           h('button', { type: 'button', style: t.btnGhost, disabled: !!busy, onClick: () => void runSync('yesterday', 'Revenue sync (yesterday)', '/revenue/sync?days=1') }, busy === 'yesterday' ? 'Syncing…' : 'Sync yesterday')
         ),
         data?.availableRange?.minDate || data?.availableRange?.maxDate ? h('div', { className: 'mt-3 text-xs', style: t.faint }, `Available cache window: ${data?.availableRange?.minDate || '—'} → ${data?.availableRange?.maxDate || '—'}`) : null
