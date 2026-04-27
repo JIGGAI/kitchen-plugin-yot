@@ -1,4 +1,4 @@
-import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, modal, readLinkedViewParams, t, useEscapeToClose } from './common';
+import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, loadCacheMeta, modal, readLinkedViewParams, renderCacheSummaryCards, resolveRevenueDatePreset, t, useEscapeToClose } from './common';
 
 (function () {
   const R = (window as any).React;
@@ -9,6 +9,17 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, mod
 
   type Link = { id: string; label: string; appointmentCount: number; lastAppointmentAt: string | null };
   type Revenue = { available: boolean; source: 'revenue_facts' | 'appointments' | 'none'; grossAmount: number | null; discountAmount: number | null; netAmount: number | null; appointmentCount: number; lastUpdatedAt: string | null; note?: string | null };
+  type RevenuePeriodRow = { periodKey: string; periodStart: string; periodEnd: string; label: string; grossAmount: number; discountAmount: number; netAmount: number; appointmentCount: number; uniqueClientCount: number; locationCount: number; dayCount: number; lastUpdatedAt: string | null };
+  type RevenueView = {
+    grain: 'day' | 'week' | 'month';
+    locationId: string | null;
+    startDate: string | null;
+    endDate: string | null;
+    availableRange: { minDate: string | null; maxDate: string | null };
+    totals: { grossAmount: number; discountAmount: number; netAmount: number; appointmentCount: number; uniqueClientCount: number; rowCount: number; locationCount: number; lastUpdatedAt: string | null };
+    byPeriod: RevenuePeriodRow[];
+    byLocation: Array<{ locationId: string; locationName: string | null; grossAmount: number; discountAmount: number; netAmount: number; appointmentCount: number; uniqueClientCount: number; dayCount: number; lastUpdatedAt: string | null }>;
+  };
   type Detail = {
     id: string;
     name: string | null;
@@ -63,9 +74,12 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, mod
     const [relatedStylists, setRelatedStylists] = useState([] as StylistRow[]);
     const [relatedAppointments, setRelatedAppointments] = useState([] as AppointmentRow[]);
     const [relatedClients, setRelatedClients] = useState([] as ClientRow[]);
+    const [revenueViews, setRevenueViews] = useState({ summary: null, day: null, week: null, month: null } as { summary: RevenueView | null; day: RevenueView | null; week: RevenueView | null; month: RevenueView | null });
+    const [syncState, setSyncState] = useState(null as any);
+    const [latestRun, setLatestRun] = useState(null as any);
     const [paneLoading, setPaneLoading] = useState(false);
 
-    useEscapeToClose(R, !!selectedId, () => { setSelectedId(null); setDetail(null); setDetailError(null); setPane('summary'); });
+    useEscapeToClose(R, !!selectedId, () => { setSelectedId(null); setDetail(null); setDetailError(null); setPane('summary'); setRevenueViews({ summary: null, day: null, week: null, month: null }); });
 
     const fmtCurrency = (value: number | null | undefined) => {
       if (value == null || Number.isNaN(value)) return '—';
@@ -73,6 +87,16 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, mod
     };
 
     const detailField = (label: string, value: any) => h('div', { key: label, style: noteCard }, h('div', { style: detailLabel }, label), h('div', { style: detailValue }, value));
+    const renderRevenueTable = (title: string, rows: RevenuePeriodRow[], limit: number) => h('div', { style: noteCard },
+      h('div', { style: detailLabel }, title),
+      rows.length
+        ? h('div', { style: { ...t.tableWrap, marginTop: '0.5rem' } },
+            h('table', { style: t.table },
+              h('thead', null, h('tr', null, h('th', { style: t.th }, 'Period'), h('th', { style: t.th }, 'Gross'), h('th', { style: t.th }, 'Net'), h('th', { style: t.th }, 'Appointments'))),
+              h('tbody', null, ...rows.slice(0, limit).map((row) => h('tr', { key: row.periodKey }, h('td', { style: t.td }, h('div', { className: 'text-sm font-medium', style: t.text }, row.label), row.periodStart !== row.periodEnd ? h('div', { className: 'text-xs', style: t.faint }, `${row.periodStart} → ${row.periodEnd}`) : null), h('td', { style: t.td }, fmtCurrency(row.grossAmount)), h('td', { style: t.td }, fmtCurrency(row.netAmount)), h('td', { style: t.td }, fmtNumber(row.appointmentCount))))))
+          )
+        : h('div', { style: { ...detailValue, marginTop: '0.5rem' } }, 'No revenue rows loaded yet.')
+    );
     const locationLabel = (row: Row | Detail) => row.name || 'Unnamed';
 
     const load = async () => {
@@ -82,6 +106,9 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, mod
         const scopeQuery = [incoming.locationId ? `locationId=${encodeURIComponent(incoming.locationId)}` : '', incoming.clientId ? `clientId=${encodeURIComponent(incoming.clientId)}` : '', incoming.stylistId ? `stylistId=${encodeURIComponent(incoming.stylistId)}` : ''].filter(Boolean).join('&');
         const data = await api('yot', teamId, `/locations?limit=200${search ? `&search=${encodeURIComponent(search)}` : ''}${scopeQuery ? `${search ? '&' : '&'}${scopeQuery}` : ''}`) as { data: Row[] };
         setRows(Array.isArray(data?.data) ? data.data : []);
+        const meta = await loadCacheMeta(teamId, 'locations');
+        setSyncState(meta.syncState);
+        setLatestRun(meta.latestRun);
       } catch (e: any) {
         setError(e?.message || 'Failed to load locations');
       } finally { setLoading(false); }
@@ -89,7 +116,7 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, mod
 
     const openDetail = async (id: string) => {
       if (!teamId) return;
-      setSelectedId(id); setDetail(null); setDetailError(null); setDetailLoading(true); setPane('summary'); setRelatedStylists([]); setRelatedAppointments([]); setRelatedClients([]);
+      setSelectedId(id); setDetail(null); setDetailError(null); setDetailLoading(true); setPane('summary'); setRelatedStylists([]); setRelatedAppointments([]); setRelatedClients([]); setRevenueViews({ summary: null, day: null, week: null, month: null });
       try {
         const data = await api('yot', teamId, `/locations/${encodeURIComponent(id)}`) as Detail;
         setDetail(data);
@@ -100,7 +127,7 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, mod
 
     const openPane = async (nextPane: Pane) => {
       setPane(nextPane);
-      if (!teamId || !selectedId || nextPane === 'summary' || nextPane === 'revenue') return;
+      if (!teamId || !selectedId || nextPane === 'summary') return;
       setPaneLoading(true);
       try {
         if (nextPane === 'stylists') {
@@ -115,6 +142,16 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, mod
           const res = await api('yot', teamId, `/clients?limit=100&locationId=${encodeURIComponent(selectedId)}`) as { data: ClientRow[] };
           setRelatedClients(Array.isArray(res?.data) ? res.data : []);
         }
+        if (nextPane === 'revenue') {
+          const currentWeek = resolveRevenueDatePreset('this-week') || { startDate: '', endDate: '' };
+          const [day, week, month, summary] = await Promise.all([
+            api('yot', teamId, `/revenue?grain=day&locationId=${encodeURIComponent(selectedId)}`),
+            api('yot', teamId, `/revenue?grain=week&locationId=${encodeURIComponent(selectedId)}`),
+            api('yot', teamId, `/revenue?grain=month&locationId=${encodeURIComponent(selectedId)}`),
+            api('yot', teamId, `/revenue?grain=week&locationId=${encodeURIComponent(selectedId)}&startDate=${encodeURIComponent(currentWeek.startDate)}&endDate=${encodeURIComponent(currentWeek.endDate)}`),
+          ]) as [RevenueView, RevenueView, RevenueView, RevenueView];
+          setRevenueViews({ summary, day, week, month });
+        }
       } finally { setPaneLoading(false); }
     };
 
@@ -124,6 +161,10 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, mod
 
     const relationships = detail?.relationships || null;
     const revenue = relationships?.revenue || null;
+    const revenueSummary = revenueViews.summary;
+    const revenueDay = revenueViews.day;
+    const revenueWeek = revenueViews.week;
+    const revenueMonth = revenueViews.month;
     const paneButton = (key: Pane, label: string, disabled = false) => h('button', { type: 'button', style: { ...t.btnGhost, opacity: disabled ? 0.55 : 1, cursor: disabled ? 'not-allowed' : 'pointer', borderColor: pane === key ? 'rgba(255,255,255,0.18)' : (t.btnGhost as any).border }, disabled, onClick: () => { if (!disabled) void openPane(key); } }, label);
 
     return h('div', { className: 'space-y-3' },
@@ -136,6 +177,7 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, mod
           h('button', { type: 'button', onClick: () => void load(), style: t.btnGhost, disabled: loading }, loading ? 'Loading…' : '↻ Refresh')
         ),
         error && h('div', { className: 'mt-3 text-xs', style: t.danger }, error),
+        renderCacheSummaryCards(h, { syncState, latestRun, emptyLatestRunText: 'No location sync runs recorded yet.' }),
         h('div', { className: 'mt-3 flex gap-2' },
           h('input', { value: searchInput, onChange: (e: any) => setSearchInput(e.target.value), onKeyDown: (e: any) => { if (e.key === 'Enter') setSearch(searchInput); }, placeholder: 'Search by name, suburb, phone, or email', style: t.input }),
           h('button', { type: 'button', onClick: () => setSearch(searchInput), style: t.btnPrimary }, 'Search'),
@@ -163,7 +205,7 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, mod
       selectedId && modal(h, {
         title: detail?.name || 'Location details',
         subtitle: selectedId,
-        onClose: () => { setSelectedId(null); setDetail(null); setDetailError(null); setPane('summary'); },
+        onClose: () => { setSelectedId(null); setDetail(null); setDetailError(null); setPane('summary'); setRevenueViews({ summary: null, day: null, week: null, month: null }); },
         width: '68rem',
         children: detailLoading ? h('div', { style: t.faint }, 'Loading location details…') : detailError ? h('div', { style: t.danger }, detailError) : detail ? h('div', { className: 'space-y-4' },
           h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '0.5rem' } },
@@ -171,7 +213,7 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, mod
             paneButton('stylists', `Stylists${relationships ? ` (${fmtNumber(relationships.uniqueStylistCount)})` : ''}`),
             paneButton('appointments', `Appointments${relationships ? ` (${fmtNumber(relationships.appointmentCount)})` : ''}`),
             paneButton('clients', `Clients${relationships ? ` (${fmtNumber(relationships.uniqueClientCount)})` : ''}`),
-            paneButton('revenue', 'Revenue', !revenue?.available)
+            paneButton('revenue', 'Revenue')
           ),
           pane === 'summary' ? h('div', { className: 'space-y-4' },
             h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '0.75rem' } },
@@ -187,8 +229,23 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, mod
           pane === 'stylists' ? h('div', { style: noteCard }, paneLoading ? 'Loading stylists…' : relatedStylists.length ? h('div', { style: t.tableWrap }, h('table', { style: t.table }, h('thead', null, h('tr', null, h('th', { style: t.th }, 'Stylist'), h('th', { style: t.th }, 'Contact'), h('th', { style: t.th }, 'Active'), h('th', { style: t.th }, 'Synced'))), h('tbody', null, ...relatedStylists.map((row: any) => h('tr', { key: row.id }, h('td', { style: t.td }, h('div', { className: 'text-sm font-medium', style: t.text }, row.fullName || [row.givenName, row.surname].filter(Boolean).join(' ') || 'Unnamed stylist'), h('div', { className: 'text-xs', style: t.faint }, row.privateId || row.id)), h('td', { style: t.td }, h('div', null, row.emailAddress || '—'), h('div', { className: 'text-xs', style: t.faint }, row.mobilePhone || '—')), h('td', { style: t.td }, boolLabel(row.active, 'Active', 'Inactive')), h('td', { style: t.td }, formatDateTime(row.syncedAt))))))) : 'No linked stylists found for this location.') : null,
           pane === 'appointments' ? h('div', { style: noteCard }, paneLoading ? 'Loading appointments…' : relatedAppointments.length ? h('div', { style: t.tableWrap }, h('table', { style: t.table }, h('thead', null, h('tr', null, h('th', { style: t.th }, 'When'), h('th', { style: t.th }, 'Client'), h('th', { style: t.th }, 'Stylist'), h('th', { style: t.th }, 'Service'), h('th', { style: t.th }, 'Status'))), h('tbody', null, ...relatedAppointments.map((row: any) => h('tr', { key: row.id }, h('td', { style: t.td }, row.startsAt ? formatDateTime(row.startsAt) : '—'), h('td', { style: t.td }, row.clientName || '—'), h('td', { style: t.td }, row.stylistName || '—'), h('td', { style: t.td }, row.serviceName || '—'), h('td', { style: t.td }, row.statusDescription || row.status || '—')))))) : 'No linked appointments found for this location.') : null,
           pane === 'clients' ? h('div', { style: noteCard }, paneLoading ? 'Loading clients…' : relatedClients.length ? h('div', { style: t.tableWrap }, h('table', { style: t.table }, h('thead', null, h('tr', null, h('th', { style: t.th }, 'Client'), h('th', { style: t.th }, 'Contact'), h('th', { style: t.th }, 'Last visit'), h('th', { style: t.th }, 'Visits'), h('th', { style: t.th }, 'Synced'))), h('tbody', null, ...relatedClients.map((row: any) => h('tr', { key: row.id }, h('td', { style: t.td }, h('div', { className: 'text-sm font-medium', style: t.text }, row.fullName || [row.firstName, row.otherName, row.lastName].filter(Boolean).join(' ') || 'Unnamed client'), h('div', { className: 'text-xs', style: t.faint }, row.id)), h('td', { style: t.td }, h('div', null, row.mobilePhone || '—'), h('div', { className: 'text-xs', style: t.faint }, row.emailAddress || row.email || '—')), h('td', { style: t.td }, row.lastVisitAt ? formatDateTime(row.lastVisitAt) : '—'), h('td', { style: t.td }, fmtNumber(row.totalVisits)), h('td', { style: t.td }, formatDateTime(row.syncedAt))))))) : 'No linked clients found for this location.') : null,
-          pane === 'revenue' ? h('div', { style: noteCard },
-            revenue?.available ? h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '0.75rem' } }, detailField('Source', revenue.source), detailField('Gross', fmtCurrency(revenue.grossAmount)), detailField('Discounts', fmtCurrency(revenue.discountAmount)), detailField('Net', fmtCurrency(revenue.netAmount)), detailField('Appointments in revenue view', fmtNumber(revenue.appointmentCount)), detailField('Last updated', revenue.lastUpdatedAt ? formatDateTime(revenue.lastUpdatedAt) : '—')) : h('div', null, h('div', { className: 'text-sm font-medium', style: t.warning }, 'Revenue is not available from the current local cache yet.'), h('div', { className: 'mt-2 text-sm', style: t.text }, revenue?.note || 'No revenue facts or appointment money fields were available for this location.'))
+          pane === 'revenue' ? h('div', { className: 'space-y-4' },
+            paneLoading && !revenueDay ? h('div', { style: noteCard }, 'Loading revenue…') : null,
+            revenueSummary?.totals?.rowCount || revenue?.available ? h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '0.75rem' } },
+              detailField('Source', revenue?.source || 'revenue_facts'),
+              detailField('Summary preset', 'Current week'),
+              detailField('Gross', fmtCurrency(revenueSummary?.totals?.grossAmount ?? revenue?.grossAmount)),
+              detailField('Discounts', fmtCurrency(revenueSummary?.totals?.discountAmount ?? revenue?.discountAmount)),
+              detailField('Net', fmtCurrency(revenueSummary?.totals?.netAmount ?? revenue?.netAmount)),
+              detailField('Appointments in view', fmtNumber(revenueSummary?.totals?.appointmentCount ?? revenue?.appointmentCount)),
+              detailField('Last updated', (revenueSummary?.totals?.lastUpdatedAt || revenue?.lastUpdatedAt) ? formatDateTime(revenueSummary?.totals?.lastUpdatedAt || revenue?.lastUpdatedAt || null) : '—')
+            ) : h('div', { style: noteCard }, h('div', { className: 'text-sm font-medium', style: t.warning }, 'Revenue is not available from the current local cache yet.'), h('div', { className: 'mt-2 text-sm', style: t.text }, revenue?.note || 'No revenue facts or appointment money fields were available for this location.')),
+            revenueSummary?.totals?.rowCount ? h('div', { style: noteCard }, h('div', { style: detailLabel }, 'Loaded window'), h('div', { style: detailValue }, `${revenueSummary.startDate || '—'} → ${revenueSummary.endDate || '—'}`)) : null,
+            revenueDay?.byPeriod?.length || revenueWeek?.byPeriod?.length || revenueMonth?.byPeriod?.length ? h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: '0.75rem' } },
+              renderRevenueTable('Daily revenue', revenueDay?.byPeriod || [], 14),
+              renderRevenueTable('Weekly revenue', revenueWeek?.byPeriod || [], 12),
+              renderRevenueTable('Monthly revenue', revenueMonth?.byPeriod || [], 12)
+            ) : null
           ) : null
         ) : h('div', { style: t.faint }, 'No location details loaded.')
       })

@@ -200,6 +200,165 @@ export function fieldValue(value: unknown, emptyText = '—'): string {
   return text || emptyText;
 }
 
+export type SyncStateSummary = {
+  resource: string;
+  lastSyncedAt: string | null;
+  lastSuccessAt: string | null;
+  lastError: string | null;
+  rowCount: number | null;
+};
+
+export type SyncRunSummary = {
+  id: string;
+  resource: string;
+  status: string;
+  startedAt: string;
+  completedAt: string | null;
+  rowsWritten: number | null;
+  rowsSeen: number | null;
+  error: string | null;
+  notes: string | null;
+};
+
+export function findSyncState(rows: SyncStateSummary[] | null | undefined, resource: string): SyncStateSummary | null {
+  return (Array.isArray(rows) ? rows : []).find((row) => row.resource === resource) || null;
+}
+
+export function findLatestSyncRun(rows: SyncRunSummary[] | null | undefined, resource: string): SyncRunSummary | null {
+  return (Array.isArray(rows) ? rows : []).find((row) => row.resource === resource) || null;
+}
+
+export async function loadCacheMeta(teamId: string, resource: string): Promise<{ syncState: SyncStateSummary | null; latestRun: SyncRunSummary | null }> {
+  const [healthRes, runsRes] = await Promise.all([
+    api('yot', teamId, '/health') as Promise<{ syncState: SyncStateSummary[] }>,
+    api('yot', teamId, '/sync-runs?limit=50') as Promise<{ data: SyncRunSummary[] }>,
+  ]);
+  return {
+    syncState: findSyncState(healthRes?.syncState, resource),
+    latestRun: findLatestSyncRun(runsRes?.data, resource),
+  };
+}
+
+export function renderCacheSummaryCards(
+  h: (...args: any[]) => any,
+  options: {
+    syncState: SyncStateSummary | null;
+    latestRun: SyncRunSummary | null;
+    emptyLatestRunText: string;
+  }
+) {
+  const freshness = describeFreshness(options.syncState || {});
+  return h('div', { className: 'mt-3', style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '0.75rem' } },
+    h('div', { style: { ...t.card, padding: '0.75rem' } },
+      h('div', { className: 'text-xs', style: t.faint }, 'Freshness'),
+      h('div', { className: 'mt-2' }, h('span', { style: t.badge(freshness.color) }, freshness.label)),
+      h('div', { className: 'mt-2 text-xs', style: t.faint }, freshness.detail)
+    ),
+    h('div', { style: { ...t.card, padding: '0.75rem' } },
+      h('div', { className: 'text-xs', style: t.faint }, 'Cached rows'),
+      h('div', { className: 'mt-1 text-sm font-medium', style: t.text }, fieldValue(options.syncState?.rowCount))
+    ),
+    h('div', { style: { ...t.card, padding: '0.75rem' } },
+      h('div', { className: 'text-xs', style: t.faint }, 'Latest run'),
+      options.latestRun
+        ? h('div', null,
+            h('div', { className: 'mt-1 text-sm font-medium', style: t.text }, `${options.latestRun.status} • ${formatRelativeTime(options.latestRun.startedAt)}`),
+            h('div', { className: 'mt-1 text-xs', style: options.latestRun.error ? t.danger : t.faint }, options.latestRun.error || options.latestRun.notes || `${fieldValue(options.latestRun.rowsWritten)} written / ${fieldValue(options.latestRun.rowsSeen)} seen`)
+          )
+        : h('div', { className: 'mt-1 text-sm', style: t.faint }, options.emptyLatestRunText)
+    )
+  );
+}
+
+export type RevenueDatePreset = 'today' | 'yesterday' | 'this-week' | 'last-week' | 'this-month' | 'last-month' | 'this-year' | 'custom';
+
+export const REVENUE_DATE_PRESET_OPTIONS: Array<{ value: RevenueDatePreset; label: string }> = [
+  { value: 'today', label: 'Today' },
+  { value: 'yesterday', label: 'Yesterday' },
+  { value: 'this-week', label: 'This week' },
+  { value: 'last-week', label: 'Last week' },
+  { value: 'this-month', label: 'This month' },
+  { value: 'last-month', label: 'Last month' },
+  { value: 'this-year', label: 'This year' },
+  { value: 'custom', label: 'Custom' },
+];
+
+function toLocalDateOnly(value: Date): string {
+  const year = value.getFullYear();
+  const month = String(value.getMonth() + 1).padStart(2, '0');
+  const day = String(value.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function parseLocalDateOnly(value: string): Date {
+  const [year, month, day] = value.split('-').map((part) => parseInt(part, 10));
+  return new Date(year || 0, (month || 1) - 1, day || 1);
+}
+
+function addLocalDays(value: string, days: number): string {
+  const date = parseLocalDateOnly(value);
+  date.setDate(date.getDate() + days);
+  return toLocalDateOnly(date);
+}
+
+function startOfLocalWeek(value: string): string {
+  const date = parseLocalDateOnly(value);
+  const dayOfWeek = (date.getDay() + 6) % 7;
+  date.setDate(date.getDate() - dayOfWeek);
+  return toLocalDateOnly(date);
+}
+
+function endOfLocalWeek(value: string): string {
+  return addLocalDays(startOfLocalWeek(value), 6);
+}
+
+function startOfLocalMonth(value: string): string {
+  const date = parseLocalDateOnly(value);
+  date.setDate(1);
+  return toLocalDateOnly(date);
+}
+
+function endOfLocalMonth(value: string): string {
+  const date = parseLocalDateOnly(value);
+  date.setMonth(date.getMonth() + 1, 0);
+  return toLocalDateOnly(date);
+}
+
+function startOfLocalYear(value: string): string {
+  const date = parseLocalDateOnly(value);
+  date.setMonth(0, 1);
+  return toLocalDateOnly(date);
+}
+
+export function resolveRevenueDatePreset(preset: RevenueDatePreset, today = toLocalDateOnly(new Date())): { startDate: string; endDate: string } | null {
+  if (preset === 'custom') return null;
+  if (preset === 'today') return { startDate: today, endDate: today };
+  if (preset === 'yesterday') {
+    const yesterday = addLocalDays(today, -1);
+    return { startDate: yesterday, endDate: yesterday };
+  }
+  if (preset === 'this-week') return { startDate: startOfLocalWeek(today), endDate: endOfLocalWeek(today) };
+  if (preset === 'last-week') {
+    const anchor = addLocalDays(startOfLocalWeek(today), -1);
+    return { startDate: startOfLocalWeek(anchor), endDate: endOfLocalWeek(anchor) };
+  }
+  if (preset === 'this-month') return { startDate: startOfLocalMonth(today), endDate: endOfLocalMonth(today) };
+  if (preset === 'last-month') {
+    const anchor = addLocalDays(startOfLocalMonth(today), -1);
+    return { startDate: startOfLocalMonth(anchor), endDate: endOfLocalMonth(anchor) };
+  }
+  return { startDate: startOfLocalYear(today), endDate: today };
+}
+
+export function detectRevenueDatePreset(startDate: string, endDate: string, today = toLocalDateOnly(new Date())): RevenueDatePreset {
+  for (const option of REVENUE_DATE_PRESET_OPTIONS) {
+    if (option.value === 'custom') continue;
+    const range = resolveRevenueDatePreset(option.value, today);
+    if (range && range.startDate === startDate && range.endDate === endDate) return option.value;
+  }
+  return 'custom';
+}
+
 export function joinAddress(parts: Array<string | null | undefined>): string {
   return parts.map((part) => fieldValue(part, '')).filter(Boolean).join(', ') || '—';
 }

@@ -19,7 +19,7 @@ import { api, boolLabel, describeFreshness, fmtNumber, formatDateTime, t } from 
     teamId: string;
     dbMode: string;
     yotConfigured: boolean;
-    counts: { clients: number; locations: number; stylists: number; appointments: number; services: number };
+    counts: { clients: number; locations: number; stylists: number; appointments: number; services: number; revenue_facts: number };
     syncState: SyncStateRow[];
   };
 
@@ -59,6 +59,8 @@ import { api, boolLabel, describeFreshness, fmtNumber, formatDateTime, t } from 
           setMessage(`${label} complete • ${fmtNumber(data?.synced)} clients synced across ${fmtNumber(data?.pageCount)} pages`);
         } else if (key === 'stylists' || key === 'services' || key === 'appointments') {
           setMessage(`${label} complete • ${fmtNumber(data?.synced)} rows across ${fmtNumber(data?.locationCount)} locations`);
+        } else if (key === 'revenue-yesterday') {
+          setMessage(`${label} complete • ${fmtNumber(data?.rowsWritten)} rows written across ${fmtNumber(data?.matchedLocationCount)} locations`);
         } else {
           setMessage(`${label} complete`);
         }
@@ -79,6 +81,7 @@ import { api, boolLabel, describeFreshness, fmtNumber, formatDateTime, t } from 
       ['Stylists cached', fmtNumber(health?.counts?.stylists)],
       ['Appointments cached', fmtNumber(health?.counts?.appointments)],
       ['Services cached', fmtNumber(health?.counts?.services)],
+      ['Revenue facts', fmtNumber(health?.counts?.revenue_facts)],
     ];
 
     const summaryRows = Array.isArray(health?.syncState) ? health!.syncState : [];
@@ -114,6 +117,7 @@ import { api, boolLabel, describeFreshness, fmtNumber, formatDateTime, t } from 
           h('button', { type: 'button', style: t.btnGhost, disabled: !!busy || !health?.yotConfigured, onClick: () => void runAction('stylists', 'Stylists sync', '/stylists/sync') }, busy === 'stylists' ? 'Syncing…' : 'Sync stylists'),
           h('button', { type: 'button', style: t.btnGhost, disabled: !!busy || !health?.yotConfigured, onClick: () => void runAction('services', 'Services sync', '/services/sync') }, busy === 'services' ? 'Syncing…' : 'Sync services'),
           h('button', { type: 'button', style: t.btnGhost, disabled: !!busy || !health?.yotConfigured, onClick: () => void runAction('appointments', 'Appointments sync', '/appointments/sync?lookbackDays=30') }, busy === 'appointments' ? 'Syncing…' : 'Sync appointments (30d)'),
+          h('button', { type: 'button', style: t.btnGhost, disabled: !!busy || !health?.yotConfigured, onClick: () => void runAction('revenue-yesterday', 'Revenue sync (yesterday)', '/revenue/sync?days=1') }, busy === 'revenue-yesterday' ? 'Syncing…' : 'Sync revenue (yesterday)'),
           h('button', { type: 'button', style: t.btnGhost, disabled: !!busy, onClick: () => void runAction('export', 'Export snapshot', '/export') }, busy === 'export' ? 'Exporting…' : 'Export snapshot')
         )
       ),

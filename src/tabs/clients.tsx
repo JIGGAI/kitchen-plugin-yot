@@ -1,4 +1,4 @@
-import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, modal, readLinkedViewParams, t, useEscapeToClose } from './common';
+import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, loadCacheMeta, modal, readLinkedViewParams, renderCacheSummaryCards, t, useEscapeToClose } from './common';
 
 (function () {
   const R = (window as any).React;
@@ -122,6 +122,8 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, mod
     const [offset, setOffset] = useState(0);
     const [total, setTotal] = useState(0);
     const [limit, setLimit] = useState(25);
+    const [syncState, setSyncState] = useState(null as any);
+    const [latestRun, setLatestRun] = useState(null as any);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null as string | null);
     const [selectedId, setSelectedId] = useState(null as string | null);
@@ -229,10 +231,15 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, mod
       setLoading(true);
       setError(null);
       try {
-        const data = await api('yot', teamId, `/clients?${buildQuery(params)}`) as { data: Row[]; total: number; limit: number; offset: number };
+        const [data, meta] = await Promise.all([
+          api('yot', teamId, `/clients?${buildQuery(params)}`) as Promise<{ data: Row[]; total: number; limit: number; offset: number }>,
+          loadCacheMeta(teamId, 'clients'),
+        ]);
         setRows(Array.isArray(data?.data) ? data.data : []);
         setTotal(Number(data?.total || 0));
         setOffset(Number(data?.offset || 0));
+        setSyncState(meta.syncState);
+        setLatestRun(meta.latestRun);
       } catch (e: any) {
         setError(e?.message || 'Failed to load clients');
       } finally {
@@ -355,6 +362,7 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, mod
           h('button', { type: 'button', onClick: () => void load(), style: t.btnGhost, disabled: loading }, loading ? 'Loading…' : '↻ Refresh')
         ),
         error && h('div', { className: 'mt-3 text-xs', style: t.danger }, error),
+        renderCacheSummaryCards(h, { syncState, latestRun, emptyLatestRunText: 'No client sync runs recorded yet.' }),
         h('div', { className: 'mt-3 flex gap-2' },
           h('input', {
             value: searchInput,

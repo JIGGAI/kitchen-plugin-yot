@@ -107,6 +107,58 @@ export interface RevenueSummary {
   note?: string | null;
 }
 
+export interface RevenueTotalsRecord {
+  grossAmount: number;
+  discountAmount: number;
+  netAmount: number;
+  appointmentCount: number;
+  uniqueClientCount: number;
+  rowCount: number;
+  locationCount: number;
+  lastUpdatedAt: string | null;
+}
+
+export interface RevenuePeriodRecord {
+  periodKey: string;
+  periodStart: string;
+  periodEnd: string;
+  label: string;
+  grossAmount: number;
+  discountAmount: number;
+  netAmount: number;
+  appointmentCount: number;
+  uniqueClientCount: number;
+  locationCount: number;
+  dayCount: number;
+  lastUpdatedAt: string | null;
+}
+
+export interface RevenueLocationRollupRecord {
+  locationId: string;
+  locationName: string | null;
+  grossAmount: number;
+  discountAmount: number;
+  netAmount: number;
+  appointmentCount: number;
+  uniqueClientCount: number;
+  dayCount: number;
+  lastUpdatedAt: string | null;
+}
+
+export interface RevenueQueryResponse {
+  grain: 'day' | 'week' | 'month';
+  locationId: string | null;
+  startDate: string | null;
+  endDate: string | null;
+  availableRange: {
+    minDate: string | null;
+    maxDate: string | null;
+  };
+  totals: RevenueTotalsRecord;
+  byPeriod: RevenuePeriodRecord[];
+  byLocation: RevenueLocationRollupRecord[];
+}
+
 export interface RelationshipSummary {
   appointmentCount: number;
   uniqueClientCount: number;

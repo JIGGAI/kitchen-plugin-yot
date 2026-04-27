@@ -1,4 +1,4 @@
-import { api, boolLabel, describeFreshness, fieldValue, fmtNumber, formatDateTime, formatRelativeTime, modal, parseRawJson, readLinkedViewParams, t, useEscapeToClose } from './common';
+import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, loadCacheMeta, modal, parseRawJson, readLinkedViewParams, renderCacheSummaryCards, t, useEscapeToClose } from './common';
 
 (function () {
   const R = (window as any).React;
@@ -12,9 +12,6 @@ import { api, boolLabel, describeFreshness, fieldValue, fmtNumber, formatDateTim
   type LocationDetail = { id: string; name: string | null; suburb: string | null; state: string | null; postcode: string | null; active: boolean | null; syncedAt: string };
   type Row = { id: string; locationId: string | null; privateId: string | null; givenName: string | null; surname: string | null; fullName: string | null; emailAddress: string | null; mobilePhone: string | null; active: boolean | null; sourceLocationId: string | null; syncedAt: string };
   type Detail = Row & { serviceCategoryNames?: string[]; serviceNames?: string[]; relationships?: { appointmentCount: number; uniqueClientCount: number; uniqueLocationCount: number; recentAppointmentCount: number; lastAppointmentAt: string | null; clients: Link[]; locations: Link[] } | null; raw: unknown | null };
-  type SyncState = { resource: string; lastSyncedAt: string | null; lastSuccessAt: string | null; lastError: string | null; rowCount: number | null };
-  type SyncRun = { id: string; resource: string; status: string; startedAt: string; completedAt: string | null; rowsWritten: number | null; rowsSeen: number | null; error: string | null; notes: string | null };
-
   const select = { ...({} as any), background: 'rgba(255,255,255,0.03)', border: '1px solid var(--ck-border-subtle)', borderRadius: '10px', padding: '0.5rem 0.6rem', color: 'var(--ck-text-primary)', fontSize: '0.8rem', minWidth: '10rem' };
   const noteCard = { background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)', borderRadius: '10px', padding: '0.75rem' };
   const detailLabel = { fontSize: '0.72rem', color: 'var(--ck-text-tertiary)', textTransform: 'uppercase' as const, letterSpacing: '0.04em' };
@@ -31,8 +28,8 @@ import { api, boolLabel, describeFreshness, fieldValue, fmtNumber, formatDateTim
     const [stylistId, setStylistId] = useState(incoming.stylistId || '');
     const [clientId, setClientId] = useState(incoming.clientId || '');
     const [activeFilter, setActiveFilter] = useState('all');
-    const [syncState, setSyncState] = useState(null as SyncState | null);
-    const [latestRun, setLatestRun] = useState(null as SyncRun | null);
+    const [syncState, setSyncState] = useState(null as any);
+    const [latestRun, setLatestRun] = useState(null as any);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null as string | null);
     const [selectedId, setSelectedId] = useState(null as string | null);
@@ -72,35 +69,26 @@ import { api, boolLabel, describeFreshness, fieldValue, fmtNumber, formatDateTim
         if (stylistId) query.push(`stylistId=${encodeURIComponent(stylistId)}`);
         if (clientId) query.push(`clientId=${encodeURIComponent(clientId)}`);
         if (activeFilter === 'active') query.push('active=true'); else if (activeFilter === 'inactive') query.push('active=false');
-        const [stylistsRes, locationsRes, healthRes, runsRes] = await Promise.all([
+        const [stylistsRes, locationsRes, meta] = await Promise.all([
           api('yot', teamId, `/stylists?${query.join('&')}`) as Promise<{ data: Row[] }>,
           api('yot', teamId, '/locations?limit=500') as Promise<{ data: LocationOption[] }>,
-          api('yot', teamId, '/health') as Promise<{ syncState: SyncState[] }>,
-          api('yot', teamId, '/sync-runs?limit=50') as Promise<{ data: SyncRun[] }>,
+          loadCacheMeta(teamId, 'stylists'),
         ]);
         setRows(Array.isArray(stylistsRes?.data) ? stylistsRes.data : []);
         setLocations(Array.isArray(locationsRes?.data) ? locationsRes.data : []);
-        const states = Array.isArray(healthRes?.syncState) ? healthRes.syncState : [];
-        setSyncState(states.find((row) => row.resource === 'stylists') || null);
-        const runs = Array.isArray(runsRes?.data) ? runsRes.data : [];
-        setLatestRun(runs.find((row) => row.resource === 'stylists') || null);
+        setSyncState(meta.syncState);
+        setLatestRun(meta.latestRun);
       } catch (e: any) { setError(e?.message || 'Failed to load stylists'); } finally { setLoading(false); }
     };
 
     useEffect(() => { if (teamId) void load(); else setLoading(false); }, [teamId, search, locationId, activeFilter]);
     if (!teamId) return h('div', { style: t.card }, h('div', { className: 'text-sm font-medium', style: t.text }, 'Stylists Cache'), h('div', { className: 'mt-2 text-sm', style: t.danger }, 'No team context was provided to the YOT Stylists tab.'));
 
-    const freshness = describeFreshness(syncState || {});
-
     return h('div', { className: 'space-y-3' },
       h('div', { style: t.card },
         h('div', { className: 'flex items-start justify-between gap-2' }, h('div', null, h('div', { className: 'text-sm font-medium', style: t.text }, 'Stylists Cache'), h('div', { className: 'mt-1 text-xs', style: t.faint }, 'Cached stylists/staff records with linked locations and relationship summaries.')), h('button', { type: 'button', onClick: () => void load(), style: t.btnGhost, disabled: loading }, loading ? 'Loading…' : '↻ Refresh')),
         error && h('div', { className: 'mt-3 text-xs', style: t.danger }, error),
-        h('div', { className: 'mt-3', style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '0.75rem' } },
-          h('div', { style: { ...t.card, padding: '0.75rem' } }, h('div', { className: 'text-xs', style: t.faint }, 'Freshness'), h('div', { className: 'mt-2' }, h('span', { style: t.badge(freshness.color) }, freshness.label)), h('div', { className: 'mt-2 text-xs', style: t.faint }, freshness.detail)),
-          h('div', { style: { ...t.card, padding: '0.75rem' } }, h('div', { className: 'text-xs', style: t.faint }, 'Cached rows'), h('div', { className: 'mt-1 text-sm font-medium', style: t.text }, fieldValue(syncState?.rowCount))),
-          h('div', { style: { ...t.card, padding: '0.75rem' } }, h('div', { className: 'text-xs', style: t.faint }, 'Latest run'), latestRun ? h('div', null, h('div', { className: 'mt-1 text-sm font-medium', style: t.text }, `${latestRun.status} • ${formatRelativeTime(latestRun.startedAt)}`), h('div', { className: 'mt-1 text-xs', style: latestRun.error ? t.danger : t.faint }, latestRun.error || latestRun.notes || `${fieldValue(latestRun.rowsWritten)} written / ${fieldValue(latestRun.rowsSeen)} seen`)) : h('div', { className: 'mt-1 text-sm', style: t.faint }, 'No stylist sync runs recorded yet.'))
-        ),
+        renderCacheSummaryCards(h, { syncState, latestRun, emptyLatestRunText: 'No stylist sync runs recorded yet.' }),
         h('div', { className: 'mt-3 flex gap-2' }, h('input', { value: searchInput, onChange: (e: any) => setSearchInput(e.target.value), onKeyDown: (e: any) => { if (e.key === 'Enter') setSearch(searchInput); }, placeholder: 'Search stylist name, email, phone, or private ID', style: t.input }), h('button', { type: 'button', onClick: () => setSearch(searchInput), style: t.btnPrimary }, 'Search'), searchInput || search ? h('button', { type: 'button', onClick: () => { setSearchInput(''); setSearch(''); }, style: t.btnGhost }, 'Clear') : null),
         (locationId || stylistId || clientId) ? h('div', { className: 'mt-3 text-xs', style: t.faint }, `Linked scope • ${[locationId ? `location=${locationId}` : '', stylistId ? `stylist=${stylistId}` : '', clientId ? `client=${clientId}` : ''].filter(Boolean).join(' • ')}`) : null,
         h('div', { className: 'mt-3', style: { display: 'flex', flexWrap: 'wrap', gap: '0.5rem', alignItems: 'center' } },

@@ -1,4 +1,4 @@
-import { api, boolLabel, fieldValue, formatDateTime, modal, t, useEscapeToClose } from './common';
+import { api, boolLabel, fieldValue, formatDateTime, loadCacheMeta, modal, renderCacheSummaryCards, t, useEscapeToClose } from './common';
 
 (function () {
   const R = (window as any).React;
@@ -66,6 +66,8 @@ import { api, boolLabel, fieldValue, formatDateTime, modal, t, useEscapeToClose 
     const [search, setSearch] = useState('');
     const [locationId, setLocationId] = useState('');
     const [activeFilter, setActiveFilter] = useState('all');
+    const [syncState, setSyncState] = useState(null as any);
+    const [latestRun, setLatestRun] = useState(null as any);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null as string | null);
     const [selectedId, setSelectedId] = useState(null as string | null);
@@ -106,13 +108,16 @@ import { api, boolLabel, fieldValue, formatDateTime, modal, t, useEscapeToClose 
         if (activeFilter === 'active') query.push('active=true');
         else if (activeFilter === 'inactive') query.push('active=false');
 
-        const [servicesRes, locationsRes] = await Promise.all([
+        const [servicesRes, locationsRes, meta] = await Promise.all([
           api('yot', teamId, `/services?${query.join('&')}`) as Promise<{ data: Row[] }>,
           api('yot', teamId, '/locations?limit=500') as Promise<{ data: LocationOption[] }>,
+          loadCacheMeta(teamId, 'services'),
         ]);
 
         setRows(Array.isArray(servicesRes?.data) ? servicesRes.data : []);
         setLocations(Array.isArray(locationsRes?.data) ? locationsRes.data : []);
+        setSyncState(meta.syncState);
+        setLatestRun(meta.latestRun);
       } catch (e: any) {
         setError(e?.message || 'Failed to load services');
       } finally {
@@ -162,6 +167,7 @@ import { api, boolLabel, fieldValue, formatDateTime, modal, t, useEscapeToClose 
           h('button', { type: 'button', onClick: () => void load(), style: t.btnGhost, disabled: loading }, loading ? 'Loading…' : '↻ Refresh')
         ),
         error && h('div', { className: 'mt-3 text-xs', style: t.danger }, error),
+        renderCacheSummaryCards(h, { syncState, latestRun, emptyLatestRunText: 'No service sync runs recorded yet.' }),
         h('div', { className: 'mt-3 flex gap-2' },
           h('input', {
             value: searchInput,
