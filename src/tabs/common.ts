@@ -356,6 +356,13 @@ export function resolveRevenueDatePreset(preset: RevenueDatePreset, today = toLo
   return { startDate: startOfLocalYear(today), endDate: today };
 }
 
+export function resolveDefaultRevenueRange(today = toLocalDateOnly(new Date())): { startDate: string; endDate: string } {
+  return {
+    startDate: addLocalDays(today, -1),
+    endDate: today,
+  };
+}
+
 export function detectRevenueDatePreset(startDate: string, endDate: string, today = toLocalDateOnly(new Date())): RevenueDatePreset {
   for (const option of REVENUE_DATE_PRESET_OPTIONS) {
     if (option.value === 'custom') continue;
