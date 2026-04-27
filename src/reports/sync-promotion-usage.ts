@@ -56,6 +56,12 @@ function normalizeLocationName(value: unknown): string | null {
   return text ? text.toLowerCase().replace(/[^a-z0-9]+/g, '') : null;
 }
 
+function isGenericPromotionCode(value: unknown): boolean {
+  const text = cleanString(value);
+  if (!text) return false;
+  return text.toLowerCase().replace(/[^a-z0-9]+/g, '') === 'nocode';
+}
+
 function isoDateOnly(value: string): string {
   return value.slice(0, 10);
 }
@@ -208,6 +214,8 @@ async function syncPromotionUsage(startDateIso: string, endDateIso: string, opti
     await client.waitForDocument(instanceId, document.documentId);
     const file = await client.fetchDocument(instanceId, document.documentId);
     const parsed = reportRegistry.promotionUsage.parseDocument(file.buffer, parameterDefinitions);
+    const requestedUsageIso = `${isoDateOnly(startDateIso)}T00:00:00.000Z`;
+    sqlite.prepare('DELETE FROM promotion_usage WHERE team_id = ? AND used_at = ?').run(options.teamId, requestedUsageIso);
     const locationLookup = buildLocationLookup(sqlite, options.teamId);
     const unmatchedLocationNames = new Set<string>();
     const matchedLocationIds = new Set<string>();
@@ -280,7 +288,9 @@ async function syncPromotionUsage(startDateIso: string, endDateIso: string, opti
         continue;
       }
 
-      const keySource = row.promotionCode || row.promotionName;
+      const normalizedPromotionCode = normalizeKey(row.promotionCode);
+      const usablePromotionCode = normalizedPromotionCode && !isGenericPromotionCode(row.promotionCode) ? row.promotionCode : null;
+      const keySource = usablePromotionCode || row.promotionName;
       const promotionKey = normalizeKey(keySource);
       if (!promotionKey) continue;
 
@@ -294,7 +304,7 @@ async function syncPromotionUsage(startDateIso: string, endDateIso: string, opti
         locationId,
         date: rowDate,
         promotionName: row.promotionName,
-        promotionCode: row.promotionCode,
+        promotionCode: usablePromotionCode,
         locationName: row.locationName,
         usageCount: 0,
         discountAmount: 0,
@@ -304,7 +314,7 @@ async function syncPromotionUsage(startDateIso: string, endDateIso: string, opti
       aggregate.discountAmount = (aggregate.discountAmount || 0) + (row.discountAmount || 0);
       aggregate.rawRows.push(row.raw);
       if (!aggregate.promotionName && row.promotionName) aggregate.promotionName = row.promotionName;
-      if (!aggregate.promotionCode && row.promotionCode) aggregate.promotionCode = row.promotionCode;
+      if (!aggregate.promotionCode && usablePromotionCode) aggregate.promotionCode = usablePromotionCode;
       aggregates.set(aggregateKey, aggregate);
     }
 

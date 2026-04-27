@@ -168,9 +168,20 @@ export function parsePromotionUsageWorkbook(
   for (const rawRow of sheet.rows.slice(headerIndex + 1)) {
     if (!rowHasAnyData(rawRow)) continue;
 
+    const firstCell = cleanCell(rawRow[0]);
     const explicitLocation = locationIndex == null ? null : cleanCell(rawRow[locationIndex]);
     const promotionName = promotionNameIndex == null ? null : cleanCell(rawRow[promotionNameIndex]);
     const promotionCode = promotionCodeIndex == null ? null : cleanCell(rawRow[promotionCodeIndex]);
+    const normalizedFirstCell = normalizeHeader(firstCell || '');
+    const normalizedPromotionName = normalizeHeader(promotionName || '');
+    const normalizedPromotionCode = normalizeHeader(promotionCode || '');
+    if (
+      normalizedFirstCell === 'promotion totals' ||
+      normalizedFirstCell === 'totals' ||
+      (normalizedPromotionName === 'name' && normalizedPromotionCode === 'code')
+    ) {
+      break;
+    }
     const usageCount = parseNumber(usageCountIndex == null ? null : cleanCell(rawRow[usageCountIndex]))
       ?? parseNumber(usedIndex == null ? null : cleanCell(rawRow[usedIndex]))
       ?? parseNumber(cleanCell(rawRow[22]))
