@@ -124,6 +124,7 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, loa
     const [limit, setLimit] = useState(25);
     const [syncState, setSyncState] = useState(null as any);
     const [latestRun, setLatestRun] = useState(null as any);
+    const [totalRows, setTotalRows] = useState(null as number | null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null as string | null);
     const [selectedId, setSelectedId] = useState(null as string | null);
@@ -240,6 +241,7 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, loa
         setOffset(Number(data?.offset || 0));
         setSyncState(meta.syncState);
         setLatestRun(meta.latestRun);
+        setTotalRows(meta.totalRows);
       } catch (e: any) {
         setError(e?.message || 'Failed to load clients');
       } finally {
@@ -362,7 +364,7 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, loa
           h('button', { type: 'button', onClick: () => void load(), style: t.btnGhost, disabled: loading }, loading ? 'Loading…' : '↻ Refresh')
         ),
         error && h('div', { className: 'mt-3 text-xs', style: t.danger }, error),
-        renderCacheSummaryCards(h, { syncState, latestRun, emptyLatestRunText: 'No client sync runs recorded yet.' }),
+        renderCacheSummaryCards(h, { syncState, latestRun, totalRows, emptyLatestRunText: 'No client sync runs recorded yet.' }),
         h('div', { className: 'mt-3 flex gap-2' },
           h('input', {
             value: searchInput,

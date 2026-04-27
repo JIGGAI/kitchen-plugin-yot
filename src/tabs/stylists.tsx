@@ -30,6 +30,7 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, loadCacheMeta, m
     const [activeFilter, setActiveFilter] = useState('all');
     const [syncState, setSyncState] = useState(null as any);
     const [latestRun, setLatestRun] = useState(null as any);
+    const [totalRows, setTotalRows] = useState(null as number | null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null as string | null);
     const [selectedId, setSelectedId] = useState(null as string | null);
@@ -78,6 +79,7 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, loadCacheMeta, m
         setLocations(Array.isArray(locationsRes?.data) ? locationsRes.data : []);
         setSyncState(meta.syncState);
         setLatestRun(meta.latestRun);
+        setTotalRows(meta.totalRows);
       } catch (e: any) { setError(e?.message || 'Failed to load stylists'); } finally { setLoading(false); }
     };
 
@@ -88,7 +90,7 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, loadCacheMeta, m
       h('div', { style: t.card },
         h('div', { className: 'flex items-start justify-between gap-2' }, h('div', null, h('div', { className: 'text-sm font-medium', style: t.text }, 'Stylists Cache'), h('div', { className: 'mt-1 text-xs', style: t.faint }, 'Cached stylists/staff records with linked locations and relationship summaries.')), h('button', { type: 'button', onClick: () => void load(), style: t.btnGhost, disabled: loading }, loading ? 'Loading…' : '↻ Refresh')),
         error && h('div', { className: 'mt-3 text-xs', style: t.danger }, error),
-        renderCacheSummaryCards(h, { syncState, latestRun, emptyLatestRunText: 'No stylist sync runs recorded yet.' }),
+        renderCacheSummaryCards(h, { syncState, latestRun, totalRows, emptyLatestRunText: 'No stylist sync runs recorded yet.' }),
         h('div', { className: 'mt-3 flex gap-2' }, h('input', { value: searchInput, onChange: (e: any) => setSearchInput(e.target.value), onKeyDown: (e: any) => { if (e.key === 'Enter') setSearch(searchInput); }, placeholder: 'Search stylist name, email, phone, or private ID', style: t.input }), h('button', { type: 'button', onClick: () => setSearch(searchInput), style: t.btnPrimary }, 'Search'), searchInput || search ? h('button', { type: 'button', onClick: () => { setSearchInput(''); setSearch(''); }, style: t.btnGhost }, 'Clear') : null),
         (locationId || stylistId || clientId) ? h('div', { className: 'mt-3 text-xs', style: t.faint }, `Linked scope • ${[locationId ? `location=${locationId}` : '', stylistId ? `stylist=${stylistId}` : '', clientId ? `client=${clientId}` : ''].filter(Boolean).join(' • ')}`) : null,
         h('div', { className: 'mt-3', style: { display: 'flex', flexWrap: 'wrap', gap: '0.5rem', alignItems: 'center' } },

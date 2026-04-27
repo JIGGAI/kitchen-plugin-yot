@@ -228,14 +228,15 @@ export function findLatestSyncRun(rows: SyncRunSummary[] | null | undefined, res
   return (Array.isArray(rows) ? rows : []).find((row) => row.resource === resource) || null;
 }
 
-export async function loadCacheMeta(teamId: string, resource: string): Promise<{ syncState: SyncStateSummary | null; latestRun: SyncRunSummary | null }> {
+export async function loadCacheMeta(teamId: string, resource: string): Promise<{ syncState: SyncStateSummary | null; latestRun: SyncRunSummary | null; totalRows: number | null }> {
   const [healthRes, runsRes] = await Promise.all([
-    api('yot', teamId, '/health') as Promise<{ syncState: SyncStateSummary[] }>,
+    api('yot', teamId, '/health') as Promise<{ syncState: SyncStateSummary[]; counts?: Record<string, number | null | undefined> }>,
     api('yot', teamId, '/sync-runs?limit=50') as Promise<{ data: SyncRunSummary[] }>,
   ]);
   return {
     syncState: findSyncState(healthRes?.syncState, resource),
     latestRun: findLatestSyncRun(runsRes?.data, resource),
+    totalRows: typeof healthRes?.counts?.[resource] === 'number' ? healthRes.counts[resource] as number : null,
   };
 }
 
@@ -244,6 +245,7 @@ export function renderCacheSummaryCards(
   options: {
     syncState: SyncStateSummary | null;
     latestRun: SyncRunSummary | null;
+    totalRows?: number | null;
     emptyLatestRunText: string;
   }
 ) {
@@ -255,8 +257,12 @@ export function renderCacheSummaryCards(
       h('div', { className: 'mt-2 text-xs', style: t.faint }, freshness.detail)
     ),
     h('div', { style: { ...t.card, padding: '0.75rem' } },
-      h('div', { className: 'text-xs', style: t.faint }, 'Cached rows'),
+      h('div', { className: 'text-xs', style: t.faint }, 'Last sync rows'),
       h('div', { className: 'mt-1 text-sm font-medium', style: t.text }, fieldValue(options.syncState?.rowCount))
+    ),
+    h('div', { style: { ...t.card, padding: '0.75rem' } },
+      h('div', { className: 'text-xs', style: t.faint }, 'Total records'),
+      h('div', { className: 'mt-1 text-sm font-medium', style: t.text }, fieldValue(options.totalRows))
     ),
     h('div', { style: { ...t.card, padding: '0.75rem' } },
       h('div', { className: 'text-xs', style: t.faint }, 'Latest run'),

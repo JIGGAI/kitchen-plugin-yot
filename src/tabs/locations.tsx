@@ -77,6 +77,7 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, loa
     const [revenueViews, setRevenueViews] = useState({ summary: null, day: null, week: null, month: null } as { summary: RevenueView | null; day: RevenueView | null; week: RevenueView | null; month: RevenueView | null });
     const [syncState, setSyncState] = useState(null as any);
     const [latestRun, setLatestRun] = useState(null as any);
+    const [totalRows, setTotalRows] = useState(null as number | null);
     const [paneLoading, setPaneLoading] = useState(false);
 
     useEscapeToClose(R, !!selectedId, () => { setSelectedId(null); setDetail(null); setDetailError(null); setPane('summary'); setRevenueViews({ summary: null, day: null, week: null, month: null }); });
@@ -109,6 +110,7 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, loa
         const meta = await loadCacheMeta(teamId, 'locations');
         setSyncState(meta.syncState);
         setLatestRun(meta.latestRun);
+        setTotalRows(meta.totalRows);
       } catch (e: any) {
         setError(e?.message || 'Failed to load locations');
       } finally { setLoading(false); }
@@ -177,7 +179,7 @@ import { api, boolLabel, fieldValue, fmtNumber, formatDateTime, joinAddress, loa
           h('button', { type: 'button', onClick: () => void load(), style: t.btnGhost, disabled: loading }, loading ? 'Loading…' : '↻ Refresh')
         ),
         error && h('div', { className: 'mt-3 text-xs', style: t.danger }, error),
-        renderCacheSummaryCards(h, { syncState, latestRun, emptyLatestRunText: 'No location sync runs recorded yet.' }),
+        renderCacheSummaryCards(h, { syncState, latestRun, totalRows, emptyLatestRunText: 'No location sync runs recorded yet.' }),
         h('div', { className: 'mt-3 flex gap-2' },
           h('input', { value: searchInput, onChange: (e: any) => setSearchInput(e.target.value), onKeyDown: (e: any) => { if (e.key === 'Enter') setSearch(searchInput); }, placeholder: 'Search by name, suburb, phone, or email', style: t.input }),
           h('button', { type: 'button', onClick: () => setSearch(searchInput), style: t.btnPrimary }, 'Search'),
