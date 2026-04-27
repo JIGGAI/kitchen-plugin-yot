@@ -1,4 +1,4 @@
-import { syncRevenueFactsFromDailyRevenueSummary } from '../src/reports/sync-revenue-facts';
+import { syncRevenueFactsRangeFromDailyRevenueSummary } from '../src/reports/sync-revenue-facts';
 
 function parseArgs(argv: string[]) {
   const args = new Map<string, string>();
@@ -29,7 +29,7 @@ async function main() {
   const staffIdRaw = args.get('staffId');
   const dayOfWeekRaw = args.get('dayOfWeek');
 
-  const result = await syncRevenueFactsFromDailyRevenueSummary({
+  const result = await syncRevenueFactsRangeFromDailyRevenueSummary({
     teamId,
     startDateIso,
     endDateIso,

@@ -34,6 +34,12 @@
         "bundle": "./dist/tabs/locations.js"
       },
       {
+        "id": "revenue",
+        "label": "Revenue",
+        "icon": "chart",
+        "bundle": "./dist/tabs/revenue.js"
+      },
+      {
         "id": "clients",
         "label": "Clients",
         "icon": "users",

@@ -9,6 +9,7 @@ import { and, eq, sql } from 'drizzle-orm';
 import { initializeDatabase } from '../db';
 import * as schema from '../db/schema';
 import { characterizeClientPaging, extractAppointmentsRangeRows, fetchAppointmentsRange, fetchBusiness, fetchClients, fetchLocationServices, fetchLocationStaff, fetchLocations, fetchStaffProfile, ping } from '../drivers/yot-client';
+import { syncRevenueFactsRangeFromDailyRevenueSummary } from '../reports/sync-revenue-facts';
 import type { KitchenPluginContext } from './types-kitchen';
 import type {
   ApiError,
@@ -80,7 +81,8 @@ function cleanString(value: unknown): string | null {
   return text ? text : null;
 }
 
-function normalizeFullName(item: Record<string, any>): string | null {
+function normalizeFullName(item: Record<string, any> | null | undefined): string | null {
+  if (!item) return null;
   const direct = cleanString(item.name);
   if (direct) return direct;
   const composed = [cleanString(item.givenName ?? item.firstName), cleanString(item.otherName), cleanString(item.surname ?? item.lastName)]
@@ -114,6 +116,37 @@ type RelationshipLinkAccumulator = { id: string; label: string; appointmentCount
 
 type RelationshipComputation = RelationshipSummary;
 
+type RevenueGrain = 'day' | 'week' | 'month';
+type RevenueFactRow = schema.RevenueFact & { locationName: string | null };
+type RevenuePeriodAccumulator = {
+  periodKey: string;
+  periodStart: string;
+  periodEnd: string;
+  label: string;
+  grossAmount: number;
+  discountAmount: number;
+  netAmount: number;
+  appointmentCount: number;
+  uniqueClientCount: number;
+  locationIds: Set<string>;
+  dayKeys: Set<string>;
+  lastUpdatedAt: string | null;
+};
+type RevenueLocationAccumulator = {
+  locationId: string;
+  locationName: string | null;
+  grossAmount: number;
+  discountAmount: number;
+  netAmount: number;
+  appointmentCount: number;
+  uniqueClientCount: number;
+  dayKeys: Set<string>;
+  lastUpdatedAt: string | null;
+};
+
+const REPORTS_TIME_ZONE = 'America/New_York';
+const DEFAULT_REVENUE_ORGANISATION_ID = 11082;
+
 function mostRecentIso(a: string | null, b: string | null): string | null {
   if (!a) return b;
   if (!b) return a;
@@ -127,6 +160,243 @@ function toRelationshipLinks(items: Map<string, RelationshipLinkAccumulator>) {
       return String(a.label || '').localeCompare(String(b.label || ''));
     })
     .slice(0, 8);
+}
+
+function asNumber(value: number | null | undefined): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+function toDateOnlyInput(value: unknown): string | null {
+  const text = cleanString(value);
+  if (!text) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) return text;
+  if (/^\d{4}-\d{2}-\d{2}T/.test(text)) return text.slice(0, 10);
+  return null;
+}
+
+function parseDateOnlyToUtc(value: string): Date {
+  const [year, month, day] = value.split('-').map((part) => Number(part));
+  return new Date(Date.UTC(year || 0, (month || 1) - 1, day || 1));
+}
+
+function formatUtcDateOnly(value: Date): string {
+  return `${value.getUTCFullYear()}-${String(value.getUTCMonth() + 1).padStart(2, '0')}-${String(value.getUTCDate()).padStart(2, '0')}`;
+}
+
+function addDaysToDateOnly(value: string, days: number): string {
+  const date = parseDateOnlyToUtc(value);
+  date.setUTCDate(date.getUTCDate() + days);
+  return formatUtcDateOnly(date);
+}
+
+function startOfWeekDateOnly(value: string): string {
+  const date = parseDateOnlyToUtc(value);
+  const dayOfWeek = (date.getUTCDay() + 6) % 7;
+  date.setUTCDate(date.getUTCDate() - dayOfWeek);
+  return formatUtcDateOnly(date);
+}
+
+function endOfWeekDateOnly(value: string): string {
+  return addDaysToDateOnly(startOfWeekDateOnly(value), 6);
+}
+
+function startOfMonthDateOnly(value: string): string {
+  return `${value.slice(0, 7)}-01`;
+}
+
+function endOfMonthDateOnly(value: string): string {
+  const date = parseDateOnlyToUtc(startOfMonthDateOnly(value));
+  date.setUTCMonth(date.getUTCMonth() + 1, 0);
+  return formatUtcDateOnly(date);
+}
+
+function dateOnlyNow(timeZone = REPORTS_TIME_ZONE): string {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(new Date());
+  const byType = new Map(parts.map((part) => [part.type, part.value]));
+  return `${byType.get('year')}-${byType.get('month')}-${byType.get('day')}`;
+}
+
+function toIsoDayStart(value: string): string {
+  return `${value}T00:00:00.000Z`;
+}
+
+function parseRevenueGrain(value: string | undefined): RevenueGrain {
+  return value === 'week' || value === 'month' ? value : 'day';
+}
+
+function periodBoundsForDate(value: string, grain: RevenueGrain): { periodKey: string; periodStart: string; periodEnd: string; label: string } {
+  if (grain === 'week') {
+    const periodStart = startOfWeekDateOnly(value);
+    const periodEnd = endOfWeekDateOnly(value);
+    return { periodKey: periodStart, periodStart, periodEnd, label: `${periodStart} → ${periodEnd}` };
+  }
+  if (grain === 'month') {
+    const periodStart = startOfMonthDateOnly(value);
+    const periodEnd = endOfMonthDateOnly(value);
+    return { periodKey: periodStart.slice(0, 7), periodStart, periodEnd, label: periodStart.slice(0, 7) };
+  }
+  return { periodKey: value, periodStart: value, periodEnd: value, label: value };
+}
+
+function clampDays(value: number, fallback: number, max = 366): number {
+  if (!Number.isFinite(value)) return fallback;
+  return Math.max(1, Math.min(Math.trunc(value), max));
+}
+
+function resolveRevenueDateRange(rows: RevenueFactRow[], requestedStart: string | null, requestedEnd: string | null) {
+  const dates = rows.map((row) => row.date).filter(Boolean).sort();
+  const minDate = dates[0] || null;
+  const maxDate = dates[dates.length - 1] || null;
+  if (!minDate || !maxDate) {
+    return { minDate, maxDate, startDate: requestedStart, endDate: requestedEnd };
+  }
+
+  let startDate = requestedStart;
+  let endDate = requestedEnd;
+  const defaultEndDate = maxDate > addDaysToDateOnly(dateOnlyNow(), -1) ? addDaysToDateOnly(dateOnlyNow(), -1) : maxDate;
+  if (!endDate) endDate = defaultEndDate;
+  if (!startDate) startDate = minDate > addDaysToDateOnly(endDate, -89) ? minDate : addDaysToDateOnly(endDate, -89);
+  if (startDate > endDate) {
+    const tmp = startDate;
+    startDate = endDate;
+    endDate = tmp;
+  }
+  return { minDate, maxDate, startDate, endDate };
+}
+
+function listRevenueFacts(db: ReturnType<typeof initializeDatabase>['db'], teamId: string, filters: { locationId?: string | null; startDate?: string | null; endDate?: string | null } = {}): RevenueFactRow[] {
+  const nameByLocationId = new Map<string, string | null>();
+  const locations = db.select().from(schema.locations).where(eq(schema.locations.teamId, teamId)).all() as schema.Location[];
+  for (const row of locations) nameByLocationId.set(row.id, row.name ?? null);
+
+  let rows = db.select().from(schema.revenueFacts).where(eq(schema.revenueFacts.teamId, teamId)).all() as schema.RevenueFact[];
+  if (filters.locationId) rows = rows.filter((row) => row.locationId === filters.locationId);
+  if (filters.startDate) rows = rows.filter((row) => row.date >= filters.startDate!);
+  if (filters.endDate) rows = rows.filter((row) => row.date <= filters.endDate!);
+  return rows.map((row) => ({ ...row, locationName: nameByLocationId.get(row.locationId) ?? null }));
+}
+
+function computeRevenueTotals(rows: RevenueFactRow[]) {
+  let grossAmount = 0;
+  let discountAmount = 0;
+  let netAmount = 0;
+  let appointmentCount = 0;
+  let uniqueClientCount = 0;
+  let lastUpdatedAt: string | null = null;
+  const locationIds = new Set<string>();
+  for (const row of rows) {
+    grossAmount += asNumber(row.grossAmount);
+    discountAmount += asNumber(row.discountAmount);
+    netAmount += asNumber(row.netAmount);
+    appointmentCount += asNumber(row.appointmentCount);
+    uniqueClientCount += asNumber(row.uniqueClientCount);
+    if (row.locationId) locationIds.add(row.locationId);
+    lastUpdatedAt = mostRecentIso(lastUpdatedAt, row.lastUpdatedAt || null);
+  }
+  return {
+    grossAmount,
+    discountAmount,
+    netAmount,
+    appointmentCount,
+    uniqueClientCount,
+    rowCount: rows.length,
+    locationCount: locationIds.size,
+    lastUpdatedAt,
+  };
+}
+
+function buildRevenueByPeriod(rows: RevenueFactRow[], grain: RevenueGrain) {
+  const buckets = new Map<string, RevenuePeriodAccumulator>();
+  for (const row of rows) {
+    const bounds = periodBoundsForDate(row.date, grain);
+    const bucket = buckets.get(bounds.periodKey) || {
+      periodKey: bounds.periodKey,
+      periodStart: bounds.periodStart,
+      periodEnd: bounds.periodEnd,
+      label: bounds.label,
+      grossAmount: 0,
+      discountAmount: 0,
+      netAmount: 0,
+      appointmentCount: 0,
+      uniqueClientCount: 0,
+      locationIds: new Set<string>(),
+      dayKeys: new Set<string>(),
+      lastUpdatedAt: null,
+    };
+    bucket.grossAmount += asNumber(row.grossAmount);
+    bucket.discountAmount += asNumber(row.discountAmount);
+    bucket.netAmount += asNumber(row.netAmount);
+    bucket.appointmentCount += asNumber(row.appointmentCount);
+    bucket.uniqueClientCount += asNumber(row.uniqueClientCount);
+    bucket.locationIds.add(row.locationId);
+    bucket.dayKeys.add(row.date);
+    bucket.lastUpdatedAt = mostRecentIso(bucket.lastUpdatedAt, row.lastUpdatedAt || null);
+    buckets.set(bounds.periodKey, bucket);
+  }
+  return Array.from(buckets.values())
+    .sort((a, b) => a.periodStart === b.periodStart ? String(a.label).localeCompare(String(b.label)) : String(b.periodStart).localeCompare(String(a.periodStart)))
+    .map((bucket) => ({
+      periodKey: bucket.periodKey,
+      periodStart: bucket.periodStart,
+      periodEnd: bucket.periodEnd,
+      label: bucket.label,
+      grossAmount: bucket.grossAmount,
+      discountAmount: bucket.discountAmount,
+      netAmount: bucket.netAmount,
+      appointmentCount: bucket.appointmentCount,
+      uniqueClientCount: bucket.uniqueClientCount,
+      locationCount: bucket.locationIds.size,
+      dayCount: bucket.dayKeys.size,
+      lastUpdatedAt: bucket.lastUpdatedAt,
+    }));
+}
+
+function buildRevenueByLocation(rows: RevenueFactRow[]) {
+  const buckets = new Map<string, RevenueLocationAccumulator>();
+  for (const row of rows) {
+    const key = row.locationId;
+    const bucket = buckets.get(key) || {
+      locationId: row.locationId,
+      locationName: row.locationName ?? row.locationId,
+      grossAmount: 0,
+      discountAmount: 0,
+      netAmount: 0,
+      appointmentCount: 0,
+      uniqueClientCount: 0,
+      dayKeys: new Set<string>(),
+      lastUpdatedAt: null,
+    };
+    bucket.grossAmount += asNumber(row.grossAmount);
+    bucket.discountAmount += asNumber(row.discountAmount);
+    bucket.netAmount += asNumber(row.netAmount);
+    bucket.appointmentCount += asNumber(row.appointmentCount);
+    bucket.uniqueClientCount += asNumber(row.uniqueClientCount);
+    bucket.dayKeys.add(row.date);
+    bucket.lastUpdatedAt = mostRecentIso(bucket.lastUpdatedAt, row.lastUpdatedAt || null);
+    if (!bucket.locationName && row.locationName) bucket.locationName = row.locationName;
+    buckets.set(key, bucket);
+  }
+  return Array.from(buckets.values())
+    .sort((a, b) => {
+      if (b.grossAmount !== a.grossAmount) return b.grossAmount - a.grossAmount;
+      return String(a.locationName || a.locationId).localeCompare(String(b.locationName || b.locationId));
+    })
+    .map((bucket) => ({
+      locationId: bucket.locationId,
+      locationName: bucket.locationName,
+      grossAmount: bucket.grossAmount,
+      discountAmount: bucket.discountAmount,
+      netAmount: bucket.netAmount,
+      appointmentCount: bucket.appointmentCount,
+      uniqueClientCount: bucket.uniqueClientCount,
+      dayCount: bucket.dayKeys.size,
+      lastUpdatedAt: bucket.lastUpdatedAt,
+    }));
 }
 
 function computeRevenueSummary(db: ReturnType<typeof initializeDatabase>['db'], teamId: string, locationId: string | null) {
@@ -777,6 +1047,75 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       return { status: 200, data };
     } catch (error: any) {
       return apiError(502, 'YOT_ERROR', error?.message || String(error));
+    }
+  }
+
+  if (req.path === '/revenue' && req.method === 'GET') {
+    try {
+      const { db } = initializeDatabase(teamId);
+      const grain = parseRevenueGrain(req.query.grain);
+      const locationId = cleanString(req.query.locationId || req.query.location);
+      const allRows = listRevenueFacts(db, teamId, { locationId });
+      const requestedStart = toDateOnlyInput(req.query.startDate || req.query.dateFrom || req.query.start);
+      const requestedEnd = toDateOnlyInput(req.query.endDate || req.query.dateTo || req.query.end);
+      const range = resolveRevenueDateRange(allRows, requestedStart, requestedEnd);
+      const rows = allRows.filter((row) => (!range.startDate || row.date >= range.startDate) && (!range.endDate || row.date <= range.endDate));
+      return {
+        status: 200,
+        data: {
+          grain,
+          locationId,
+          startDate: range.startDate,
+          endDate: range.endDate,
+          availableRange: {
+            minDate: range.minDate,
+            maxDate: range.maxDate,
+          },
+          totals: computeRevenueTotals(rows),
+          byPeriod: buildRevenueByPeriod(rows, grain),
+          byLocation: buildRevenueByLocation(rows),
+        },
+      };
+    } catch (error: any) {
+      return apiError(500, 'DATABASE_ERROR', error?.message || 'Failed to read revenue facts');
+    }
+  }
+
+  if (req.path === '/revenue/sync' && req.method === 'POST') {
+    const config = readYotConfig(teamId);
+    if (!config) return apiError(400, 'NOT_CONFIGURED', 'YOT apiKey not set for this team. POST /config first.');
+    try {
+      const requestedStart = toDateOnlyInput(req.query.startDate || req.query.dateFrom || req.query.start);
+      const requestedEnd = toDateOnlyInput(req.query.endDate || req.query.dateTo || req.query.end);
+      const days = clampDays(parseInt(req.query.days || '1', 10), 1);
+      const includeToday = parseBooleanFilter(req.query.includeToday) === true;
+      const anchorEnd = includeToday ? dateOnlyNow() : addDaysToDateOnly(dateOnlyNow(), -1);
+      const endDate = requestedEnd || anchorEnd;
+      const startDate = requestedStart || addDaysToDateOnly(endDate, -(days - 1));
+      const organisationId = Number(cleanString(req.query.organisationId || req.query.org) || String(DEFAULT_REVENUE_ORGANISATION_ID));
+      if (!Number.isFinite(organisationId)) return apiError(400, 'BAD_REQUEST', 'organisationId must be a number');
+      const locationIdText = cleanString(req.query.locationId || req.query.location);
+      const staffIdText = cleanString(req.query.staffId || req.query.staff);
+      const dayOfWeekText = cleanString(req.query.dayOfWeek);
+      const locationId = locationIdText ? Number(locationIdText) : null;
+      const staffId = staffIdText ? Number(staffIdText) : null;
+      const dayOfWeek = dayOfWeekText ? Number(dayOfWeekText) : null;
+      if (locationIdText && !Number.isFinite(locationId)) return apiError(400, 'BAD_REQUEST', 'locationId must be numeric');
+      if (staffIdText && !Number.isFinite(staffId)) return apiError(400, 'BAD_REQUEST', 'staffId must be numeric');
+      if (dayOfWeekText && !Number.isFinite(dayOfWeek)) return apiError(400, 'BAD_REQUEST', 'dayOfWeek must be numeric');
+
+      const result = await syncRevenueFactsRangeFromDailyRevenueSummary({
+        teamId,
+        startDateIso: toIsoDayStart(startDate),
+        endDateIso: toIsoDayStart(endDate),
+        organisationId,
+        locationId,
+        staffId,
+        dayOfWeek,
+      });
+      return { status: 200, data: { ok: true, ...result } };
+    } catch (error: any) {
+      return apiError(502, 'YOT_ERROR', error?.message || 'Failed to sync revenue facts');
     }
   }
 

@@ -45,6 +45,23 @@ export type SyncRevenueFactsResult = {
   requestLog: ReturnType<typeof createReportClient>['requestLog'];
 };
 
+export type SyncRevenueFactsBatchResult = {
+  teamId: string;
+  startDateIso: string;
+  endDateIso: string;
+  startedAt: string;
+  completedAt: string;
+  detailRowCount: number;
+  totalRowCount: number;
+  averageRowCount: number;
+  rowsWritten: number;
+  matchedLocationCount: number;
+  unmatchedLocationNames: string[];
+  requestLog: ReturnType<typeof createReportClient>['requestLog'];
+  chunkCount: number;
+  chunks: SyncRevenueFactsResult[];
+};
+
 function cleanString(value: unknown): string | null {
   if (value == null) return null;
   const text = String(value).trim();
@@ -58,6 +75,25 @@ function normalizeLocationName(value: unknown): string | null {
 
 function isoDateOnly(value: string): string {
   return value.slice(0, 10);
+}
+
+function parseDateOnlyUtc(value: string): Date {
+  const [year, month, day] = value.split('-').map((part) => Number(part));
+  return new Date(Date.UTC(year || 0, (month || 1) - 1, day || 1));
+}
+
+function formatDateOnlyUtc(value: Date): string {
+  return `${value.getUTCFullYear()}-${String(value.getUTCMonth() + 1).padStart(2, '0')}-${String(value.getUTCDate()).padStart(2, '0')}`;
+}
+
+function addDaysToDateOnly(value: string, days: number): string {
+  const date = parseDateOnlyUtc(value);
+  date.setUTCDate(date.getUTCDate() + days);
+  return formatDateOnlyUtc(date);
+}
+
+function minDateOnly(a: string, b: string): string {
+  return a <= b ? a : b;
 }
 
 function parseReportDate(value: string | null): string | null {
@@ -143,6 +179,74 @@ function upsertSyncState(sqlite: SqliteDb, teamId: string, values: { lastSyncedA
       last_error = excluded.last_error,
       row_count = COALESCE(excluded.row_count, sync_state.row_count)
   `).run(teamId, values.lastSyncedAt ?? null, values.lastSuccessAt ?? null, values.lastError ?? null, values.rowCount ?? null);
+}
+
+function splitRevenueSyncWindows(startDateIso: string, endDateIso: string, chunkDays: number): Array<{ startDateIso: string; endDateIso: string }> {
+  const startDate = isoDateOnly(startDateIso);
+  const endDate = isoDateOnly(endDateIso);
+  const windows: Array<{ startDateIso: string; endDateIso: string }> = [];
+  let cursor = startDate;
+  while (cursor <= endDate) {
+    const chunkEndDate = minDateOnly(addDaysToDateOnly(cursor, chunkDays - 1), endDate);
+    windows.push({ startDateIso: `${cursor}T00:00:00.000Z`, endDateIso: `${chunkEndDate}T00:00:00.000Z` });
+    cursor = addDaysToDateOnly(chunkEndDate, 1);
+  }
+  return windows;
+}
+
+export async function syncRevenueFactsRangeFromDailyRevenueSummary(options: SyncRevenueFactsOptions & { chunkDays?: number | null }): Promise<SyncRevenueFactsBatchResult> {
+  const chunkDays = Math.max(1, Math.min(Math.trunc(options.chunkDays ?? 28), 31));
+  const windows = splitRevenueSyncWindows(options.startDateIso, options.endDateIso, chunkDays);
+  const startedAt = new Date().toISOString();
+  const chunks: SyncRevenueFactsResult[] = [];
+  const unmatchedLocationNames = new Set<string>();
+  let detailRowCount = 0;
+  let totalRowCount = 0;
+  let averageRowCount = 0;
+  let rowsWritten = 0;
+  const requestLog: ReturnType<typeof createReportClient>['requestLog'] = [];
+
+  for (const window of windows) {
+    const chunk = await syncRevenueFactsFromDailyRevenueSummary({
+      ...options,
+      startDateIso: window.startDateIso,
+      endDateIso: window.endDateIso,
+    });
+    chunks.push(chunk);
+    detailRowCount += chunk.detailRowCount;
+    totalRowCount += chunk.totalRowCount;
+    averageRowCount += chunk.averageRowCount;
+    rowsWritten += chunk.rowsWritten;
+    requestLog.push(...chunk.requestLog);
+    for (const name of chunk.unmatchedLocationNames) unmatchedLocationNames.add(name);
+  }
+
+  const { sqlite } = initializeDatabase(options.teamId);
+  const startDate = isoDateOnly(options.startDateIso);
+  const endDate = isoDateOnly(options.endDateIso);
+  const matchedLocationCountQuery = options.locationId == null
+    ? sqlite.prepare('SELECT COUNT(DISTINCT location_id) AS c FROM revenue_facts WHERE team_id = ? AND date >= ? AND date <= ?')
+    : sqlite.prepare('SELECT COUNT(DISTINCT location_id) AS c FROM revenue_facts WHERE team_id = ? AND location_id = ? AND date >= ? AND date <= ?');
+  const row = (options.locationId == null
+    ? matchedLocationCountQuery.get(options.teamId, startDate, endDate)
+    : matchedLocationCountQuery.get(options.teamId, String(options.locationId), startDate, endDate)) as { c?: number } | undefined;
+
+  return {
+    teamId: options.teamId,
+    startDateIso: options.startDateIso,
+    endDateIso: options.endDateIso,
+    startedAt,
+    completedAt: new Date().toISOString(),
+    detailRowCount,
+    totalRowCount,
+    averageRowCount,
+    rowsWritten,
+    matchedLocationCount: Number(row?.c || 0),
+    unmatchedLocationNames: Array.from(unmatchedLocationNames).sort(),
+    requestLog,
+    chunkCount: chunks.length,
+    chunks,
+  };
 }
 
 export async function syncRevenueFactsFromDailyRevenueSummary(options: SyncRevenueFactsOptions): Promise<SyncRevenueFactsResult> {

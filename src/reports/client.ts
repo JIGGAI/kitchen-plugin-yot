@@ -3,7 +3,7 @@ import type { YotConfig } from '../types';
 const REPORTS_BASE_URL = 'https://youreontime-reports.azurewebsites.net';
 const REQUEST_DELAY_MS = 500;
 const DEFAULT_POLL_DELAY_MS = 1500;
-const DEFAULT_MAX_POLLS = 10;
+const DEFAULT_MAX_POLLS = 60;
 
 let lastRequestStartedAt = 0;
 
