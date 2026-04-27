@@ -7,6 +7,14 @@ import {
   buildDailyRevenueSummaryParameterDiscovery,
   parseDailyRevenueSummaryWorkbook,
 } from './reports/daily-revenue-summary';
+import {
+  PROMOTION_USAGE_REPORT,
+  type PromotionUsageParams,
+  type PromotionUsageResult,
+  buildPromotionUsageInstanceParams,
+  buildPromotionUsageParameterDiscovery,
+  parsePromotionUsageWorkbook,
+} from './reports/promotion-usage';
 
 export type YotReportDefinition<TParams, TResult> = {
   key: string;
@@ -28,6 +36,15 @@ export const reportRegistry = {
     buildInstanceParams: buildDailyRevenueSummaryInstanceParams,
     parseDocument: parseDailyRevenueSummaryWorkbook,
   } satisfies YotReportDefinition<DailyRevenueSummaryParams, DailyRevenueSummaryResult>,
+  promotionUsage: {
+    key: PROMOTION_USAGE_REPORT.key,
+    reportName: PROMOTION_USAGE_REPORT.reportName,
+    reportType: PROMOTION_USAGE_REPORT.reportType,
+    preferredFormat: PROMOTION_USAGE_REPORT.preferredFormat,
+    buildParameterDiscovery: buildPromotionUsageParameterDiscovery,
+    buildInstanceParams: buildPromotionUsageInstanceParams,
+    parseDocument: parsePromotionUsageWorkbook,
+  } satisfies YotReportDefinition<PromotionUsageParams, PromotionUsageResult>,
 };
 
 export type ReportRegistry = typeof reportRegistry;

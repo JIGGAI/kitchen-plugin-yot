@@ -9,6 +9,7 @@ import { and, eq, sql } from 'drizzle-orm';
 import { initializeDatabase } from '../db';
 import * as schema from '../db/schema';
 import { characterizeClientPaging, extractAppointmentsRangeRows, fetchAppointmentsRange, fetchBusiness, fetchClients, fetchLocationServices, fetchLocationStaff, fetchLocations, fetchStaffProfile, ping } from '../drivers/yot-client';
+import { syncPromotionUsageRange } from '../reports/sync-promotion-usage';
 import { syncRevenueFactsRangeFromDailyRevenueSummary } from '../reports/sync-revenue-facts';
 import type { KitchenPluginContext } from './types-kitchen';
 import type {
@@ -20,6 +21,7 @@ import type {
   ExportManifestRecord,
   LocationDetailRecord,
   LocationRecord,
+  PromotionUsageQueryResponse,
   RelationshipSummary,
   ServiceDetailRecord,
   ServiceRecord,
@@ -142,6 +144,30 @@ type RevenueLocationAccumulator = {
   uniqueClientCount: number;
   dayKeys: Set<string>;
   lastUpdatedAt: string | null;
+};
+type PromotionUsageRow = schema.PromotionUsage & {
+  locationName: string | null;
+  promotionName: string | null;
+  promotionCode: string | null;
+  date: string | null;
+  usageCount: number;
+};
+type PromotionSummaryAccumulator = {
+  promotionId: string;
+  promotionName: string | null;
+  promotionCode: string | null;
+  usageCount: number;
+  locationIds: Set<string>;
+  dayKeys: Set<string>;
+  lastUsedAt: string | null;
+};
+type PromotionMatrixAccumulator = {
+  rowKey: string;
+  date: string;
+  locationId: string;
+  locationName: string | null;
+  totalUsageCount: number;
+  promotionCounts: Record<string, number>;
 };
 
 const REPORTS_TIME_ZONE = 'America/New_York';
@@ -397,6 +423,146 @@ function buildRevenueByLocation(rows: RevenueFactRow[]) {
       dayCount: bucket.dayKeys.size,
       lastUpdatedAt: bucket.lastUpdatedAt,
     }));
+}
+
+function listPromotionUsageRows(db: ReturnType<typeof initializeDatabase>['db'], teamId: string, filters: { locationId?: string | null; startDate?: string | null; endDate?: string | null } = {}): PromotionUsageRow[] {
+  const locations = db.select().from(schema.locations).where(eq(schema.locations.teamId, teamId)).all() as schema.Location[];
+  const promotions = db.select().from(schema.promotions).where(eq(schema.promotions.teamId, teamId)).all() as schema.Promotion[];
+  const locationNameById = new Map<string, string | null>(locations.map((row) => [row.id, row.name ?? null]));
+  const promotionById = new Map<string, schema.Promotion>(promotions.map((row) => [row.id, row]));
+
+  let rows = db.select().from(schema.promotionUsage).where(eq(schema.promotionUsage.teamId, teamId)).all() as schema.PromotionUsage[];
+  if (filters.locationId) rows = rows.filter((row) => row.locationId === filters.locationId);
+
+  return rows
+    .map((row) => {
+      const raw = safeJsonParse(row.raw) as Record<string, unknown> | null;
+      const promotion = promotionById.get(row.promotionId);
+      const date = toDateOnlyInput(raw?.date || row.usedAt);
+      const usageCount = Number(raw?.usageCount);
+      return {
+        ...row,
+        locationName: row.locationId ? (locationNameById.get(row.locationId) ?? null) : null,
+        promotionName: cleanString(raw?.promotionName) || promotion?.name || null,
+        promotionCode: cleanString(raw?.promotionCode) || promotion?.code || null,
+        date,
+        usageCount: Number.isFinite(usageCount) ? usageCount : 1,
+      };
+    })
+    .filter((row) => Boolean(row.date))
+    .filter((row) => (!filters.startDate || row.date! >= filters.startDate) && (!filters.endDate || row.date! <= filters.endDate));
+}
+
+function resolvePromotionDateRange(rows: PromotionUsageRow[], requestedStart: string | null, requestedEnd: string | null) {
+  const dates = rows.map((row) => row.date).filter(Boolean).sort() as string[];
+  const minDate = dates[0] || null;
+  const maxDate = dates[dates.length - 1] || null;
+  if (!minDate || !maxDate) {
+    return { minDate, maxDate, startDate: requestedStart, endDate: requestedEnd };
+  }
+
+  let startDate = requestedStart;
+  let endDate = requestedEnd;
+  const defaultEndDate = maxDate > addDaysToDateOnly(dateOnlyNow(), -1) ? addDaysToDateOnly(dateOnlyNow(), -1) : maxDate;
+  if (!endDate) endDate = defaultEndDate;
+  if (!startDate) startDate = minDate > addDaysToDateOnly(endDate, -89) ? minDate : addDaysToDateOnly(endDate, -89);
+  if (startDate > endDate) {
+    const tmp = startDate;
+    startDate = endDate;
+    endDate = tmp;
+  }
+  return { minDate, maxDate, startDate, endDate };
+}
+
+function computePromotionTotals(rows: PromotionUsageRow[]) {
+  let usageCount = 0;
+  let lastUpdatedAt: string | null = null;
+  const promotionIds = new Set<string>();
+  const locationIds = new Set<string>();
+  const dayKeys = new Set<string>();
+  for (const row of rows) {
+    usageCount += row.usageCount;
+    promotionIds.add(row.promotionId);
+    if (row.locationId) locationIds.add(row.locationId);
+    if (row.date) dayKeys.add(row.date);
+    lastUpdatedAt = mostRecentIso(lastUpdatedAt, row.syncedAt || null);
+  }
+  return {
+    usageCount,
+    promotionCount: promotionIds.size,
+    locationCount: locationIds.size,
+    dayCount: dayKeys.size,
+    rowCount: rows.length,
+    lastUpdatedAt,
+  };
+}
+
+function buildPromotionSummaries(rows: PromotionUsageRow[]) {
+  const buckets = new Map<string, PromotionSummaryAccumulator>();
+  for (const row of rows) {
+    const bucket = buckets.get(row.promotionId) || {
+      promotionId: row.promotionId,
+      promotionName: row.promotionName,
+      promotionCode: row.promotionCode,
+      usageCount: 0,
+      locationIds: new Set<string>(),
+      dayKeys: new Set<string>(),
+      lastUsedAt: null,
+    };
+    bucket.usageCount += row.usageCount;
+    if (row.locationId) bucket.locationIds.add(row.locationId);
+    if (row.date) bucket.dayKeys.add(row.date);
+    if (!bucket.promotionName && row.promotionName) bucket.promotionName = row.promotionName;
+    if (!bucket.promotionCode && row.promotionCode) bucket.promotionCode = row.promotionCode;
+    bucket.lastUsedAt = mostRecentIso(bucket.lastUsedAt, row.usedAt || null);
+    buckets.set(row.promotionId, bucket);
+  }
+
+  return Array.from(buckets.values())
+    .sort((a, b) => {
+      if (b.usageCount !== a.usageCount) return b.usageCount - a.usageCount;
+      return String(a.promotionName || a.promotionCode || a.promotionId).localeCompare(String(b.promotionName || b.promotionCode || b.promotionId));
+    })
+    .map((bucket) => ({
+      promotionId: bucket.promotionId,
+      promotionName: bucket.promotionName,
+      promotionCode: bucket.promotionCode,
+      usageCount: bucket.usageCount,
+      locationCount: bucket.locationIds.size,
+      dayCount: bucket.dayKeys.size,
+      lastUsedAt: bucket.lastUsedAt,
+    }));
+}
+
+function buildPromotionMatrix(rows: PromotionUsageRow[], summaries: ReturnType<typeof buildPromotionSummaries>) {
+  const matrix = new Map<string, PromotionMatrixAccumulator>();
+  for (const row of rows) {
+    if (!row.date || !row.locationId) continue;
+    const rowKey = `${row.date}::${row.locationId}`;
+    const bucket = matrix.get(rowKey) || {
+      rowKey,
+      date: row.date,
+      locationId: row.locationId,
+      locationName: row.locationName,
+      totalUsageCount: 0,
+      promotionCounts: {},
+    };
+    bucket.totalUsageCount += row.usageCount;
+    bucket.promotionCounts[row.promotionId] = (bucket.promotionCounts[row.promotionId] || 0) + row.usageCount;
+    matrix.set(rowKey, bucket);
+  }
+
+  return {
+    matrixColumns: summaries.map((row) => ({
+      promotionId: row.promotionId,
+      promotionName: row.promotionName,
+      promotionCode: row.promotionCode,
+    })),
+    matrixRows: Array.from(matrix.values()).sort((a, b) => {
+      if (a.date !== b.date) return String(b.date).localeCompare(String(a.date));
+      return String(a.locationName || a.locationId).localeCompare(String(b.locationName || b.locationId));
+    }),
+  };
 }
 
 function computeRevenueSummary(db: ReturnType<typeof initializeDatabase>['db'], teamId: string, locationId: string | null) {
@@ -1116,6 +1282,71 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       return { status: 200, data: { ok: true, ...result } };
     } catch (error: any) {
       return apiError(502, 'YOT_ERROR', error?.message || 'Failed to sync revenue facts');
+    }
+  }
+
+  if (req.path === '/promotion-usage' && req.method === 'GET') {
+    try {
+      const { db } = initializeDatabase(teamId);
+      const locationId = cleanString(req.query.locationId || req.query.location);
+      const allRows = listPromotionUsageRows(db, teamId, { locationId });
+      const requestedStart = toDateOnlyInput(req.query.startDate || req.query.dateFrom || req.query.start);
+      const requestedEnd = toDateOnlyInput(req.query.endDate || req.query.dateTo || req.query.end);
+      const range = resolvePromotionDateRange(allRows, requestedStart, requestedEnd);
+      const rows = allRows.filter((row) => (!range.startDate || row.date! >= range.startDate) && (!range.endDate || row.date! <= range.endDate));
+      const promotions = buildPromotionSummaries(rows);
+      const matrix = buildPromotionMatrix(rows, promotions);
+      const data: PromotionUsageQueryResponse = {
+        locationId,
+        startDate: range.startDate,
+        endDate: range.endDate,
+        availableRange: {
+          minDate: range.minDate,
+          maxDate: range.maxDate,
+        },
+        totals: computePromotionTotals(rows),
+        promotions,
+        matrixColumns: matrix.matrixColumns,
+        matrixRows: matrix.matrixRows,
+      };
+      return { status: 200, data };
+    } catch (error: any) {
+      return apiError(500, 'DATABASE_ERROR', error?.message || 'Failed to read promotion usage');
+    }
+  }
+
+  if (req.path === '/promotion-usage/sync' && req.method === 'POST') {
+    const config = readYotConfig(teamId);
+    if (!config) return apiError(400, 'NOT_CONFIGURED', 'YOT apiKey not set for this team. POST /config first.');
+    try {
+      const requestedStart = toDateOnlyInput(req.query.startDate || req.query.dateFrom || req.query.start);
+      const requestedEnd = toDateOnlyInput(req.query.endDate || req.query.dateTo || req.query.end);
+      const days = clampDays(parseInt(req.query.days || '1', 10), 1);
+      const includeToday = parseBooleanFilter(req.query.includeToday) === true;
+      const anchorEnd = includeToday ? dateOnlyNow() : addDaysToDateOnly(dateOnlyNow(), -1);
+      const endDate = requestedEnd || anchorEnd;
+      const startDate = requestedStart || addDaysToDateOnly(endDate, -(days - 1));
+      const locationIdText = cleanString(req.query.locationId || req.query.location);
+      const staffIdText = cleanString(req.query.staffId || req.query.staff);
+      const locationId = locationIdText ? Number(locationIdText) : null;
+      const staffId = staffIdText ? Number(staffIdText) : null;
+      if (locationIdText && !Number.isFinite(locationId)) return apiError(400, 'BAD_REQUEST', 'locationId must be numeric');
+      if (staffIdText && !Number.isFinite(staffId)) return apiError(400, 'BAD_REQUEST', 'staffId must be numeric');
+
+      const organisationId = Number(cleanString(req.query.organisationId || req.query.org) || String(DEFAULT_REVENUE_ORGANISATION_ID));
+      if (!Number.isFinite(organisationId)) return apiError(400, 'BAD_REQUEST', 'organisationId must be a number');
+
+      const result = await syncPromotionUsageRange({
+        teamId,
+        startDateIso: toIsoDayStart(startDate),
+        endDateIso: toIsoDayStart(endDate),
+        organisationId,
+        locationId,
+        staffId,
+      });
+      return { status: 200, data: { ok: true, ...result } };
+    } catch (error: any) {
+      return apiError(502, 'YOT_ERROR', error?.message || 'Failed to sync promotion usage');
     }
   }
 

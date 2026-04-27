@@ -43,6 +43,12 @@
         "bundle": "./dist/tabs/revenue.js"
       },
       {
+        "id": "promotion",
+        "label": "Promotion",
+        "icon": "ticket",
+        "bundle": "./dist/tabs/promotion.js"
+      },
+      {
         "id": "clients",
         "label": "Clients",
         "icon": "users",
