@@ -56,8 +56,8 @@ import { api, detectRevenueDatePreset, fmtNumber, formatDateTime, loadCacheMeta,
     const incomingHasRange = Boolean(incoming.startDate && incoming.endDate);
     const defaultRange = incomingHasRange
       ? { startDate: incoming.startDate, endDate: incoming.endDate }
-      : (resolveRevenueDatePreset('this-week') || { startDate: '', endDate: '' });
-    const defaultPreset = incomingHasRange ? detectRevenueDatePreset(defaultRange.startDate, defaultRange.endDate) : 'this-week';
+      : (resolveRevenueDatePreset('this-month') || { startDate: '', endDate: '' });
+    const defaultPreset = incomingHasRange ? detectRevenueDatePreset(defaultRange.startDate, defaultRange.endDate) : 'this-month';
     const [locations, setLocations] = useState([] as LocationRow[]);
     const [data, setData] = useState(null as PromotionResponse | null);
     const [locationId, setLocationId] = useState(incoming.locationId || '');
@@ -78,6 +78,35 @@ import { api, detectRevenueDatePreset, fmtNumber, formatDateTime, loadCacheMeta,
       h('div', { style: { ...detailValue, fontSize: '1rem', fontWeight: 700 } }, value),
       subtext ? h('div', { className: 'mt-1 text-xs', style: t.faint }, subtext) : null
     );
+
+    const monthlyLocationColumns = (() => {
+      const columns = new Map<string, { locationId: string; locationName: string | null }>();
+      for (const row of data?.matrixRows || []) {
+        if (!row.locationId) continue;
+        if (!columns.has(row.locationId)) columns.set(row.locationId, { locationId: row.locationId, locationName: row.locationName || null });
+      }
+      return Array.from(columns.values()).sort((a, b) => String(a.locationName || a.locationId).localeCompare(String(b.locationName || b.locationId)));
+    })();
+
+    const monthlyPromotionRows = (() => {
+      const usageByPromotionAndLocation = new Map<string, Map<string, number>>();
+      for (const row of data?.matrixRows || []) {
+        for (const [promotionId, count] of Object.entries(row.promotionCounts || {})) {
+          const byLocation = usageByPromotionAndLocation.get(promotionId) || new Map<string, number>();
+          byLocation.set(row.locationId, (byLocation.get(row.locationId) || 0) + Number(count || 0));
+          usageByPromotionAndLocation.set(promotionId, byLocation);
+        }
+      }
+
+      return (data?.promotions || []).map((promotion: PromotionSummaryRow) => {
+        const byLocation = usageByPromotionAndLocation.get(promotion.promotionId) || new Map<string, number>();
+        const locationCounts = Object.fromEntries(monthlyLocationColumns.map((column) => [column.locationId, byLocation.get(column.locationId) || 0]));
+        return {
+          ...promotion,
+          locationCounts,
+        };
+      });
+    })();
 
     const loadLocations = async () => {
       if (!teamId) return;
@@ -157,7 +186,7 @@ import { api, detectRevenueDatePreset, fmtNumber, formatDateTime, loadCacheMeta,
         h('div', { className: 'flex items-start justify-between gap-2' },
           h('div', null,
             h('div', { className: 'text-sm font-medium', style: t.text }, 'Promotion'),
-            h('div', { className: 'mt-1 text-xs', style: t.faint }, 'Promotion usage by day and location from the cached YOT report feed.')
+            h('div', { className: 'mt-1 text-xs', style: t.faint }, 'Promotion usage from the cached YOT report feed, summarized for month-style location comparisons.')
           ),
           h('button', { type: 'button', onClick: () => void refreshAll(), style: t.btnGhost, disabled: loading || !!busy }, loading ? 'Loading…' : '↻ Refresh')
         ),
@@ -172,7 +201,7 @@ import { api, detectRevenueDatePreset, fmtNumber, formatDateTime, loadCacheMeta,
         ),
         h('div', { className: 'mt-3 flex flex-wrap gap-2' },
           h('button', { type: 'button', style: t.btnPrimary, onClick: () => { setStartDate(startDateInput); setEndDate(endDateInput); } }, 'Apply filters'),
-          h('button', { type: 'button', style: t.btnGhost, onClick: () => { const range = resolveRevenueDatePreset('this-week') || { startDate: '', endDate: '' }; setPreset('this-week'); setLocationId(''); setStartDateInput(range.startDate); setEndDateInput(range.endDate); setStartDate(range.startDate); setEndDate(range.endDate); } }, 'Reset'),
+          h('button', { type: 'button', style: t.btnGhost, onClick: () => { const range = resolveRevenueDatePreset('this-month') || { startDate: '', endDate: '' }; setPreset('this-month'); setLocationId(''); setStartDateInput(range.startDate); setEndDateInput(range.endDate); setStartDate(range.startDate); setEndDate(range.endDate); } }, 'Reset'),
           h('button', { type: 'button', style: t.btnGhost, disabled: !!busy || !startDate || !endDate, onClick: () => void runSync() }, busy === 'sync' ? 'Syncing…' : 'Sync filtered range')
         ),
         data?.availableRange?.minDate || data?.availableRange?.maxDate ? h('div', { className: 'mt-3 text-xs', style: t.faint }, `Available cache window: ${data?.availableRange?.minDate || '—'} → ${data?.availableRange?.maxDate || '—'}`) : null
@@ -212,25 +241,25 @@ import { api, detectRevenueDatePreset, fmtNumber, formatDateTime, loadCacheMeta,
         )
       ),
       h('div', { style: t.card },
-        h('div', { className: 'text-sm font-medium mb-1', style: t.text }, 'Daily usage by location'),
-        h('div', { className: 'text-xs mb-3', style: t.faint }, 'Rows are day/location combinations. Columns show how many times each promotion was used so operators can compare locations without drilling in.'),
+        h('div', { className: 'text-sm font-medium mb-1', style: t.text }, 'Monthly usage by location'),
+        h('div', { className: 'text-xs mb-3', style: t.faint }, 'Rows are promotions. Columns show how many times each promotion was used at each location across the selected date range.'),
         h('div', { style: t.tableWrap },
           h('table', { style: t.table },
             h('thead', null, h('tr', null,
-              h('th', { style: t.th }, 'Date'),
-              h('th', { style: t.th }, 'Location'),
+              h('th', { style: t.th }, 'Promotion'),
+              h('th', { style: t.th }, 'Code'),
               h('th', { style: t.th }, 'Total uses'),
-              ...(data?.matrixColumns || []).map((column: PromotionResponse['matrixColumns'][number]) => h('th', { key: column.promotionId, style: t.th }, column.promotionCode || column.promotionName || 'Promotion'))
+              ...monthlyLocationColumns.map((column) => h('th', { key: column.locationId, style: t.th }, h('div', { className: 'text-sm font-medium', style: t.text }, column.locationName || column.locationId), h('div', { className: 'text-xs', style: t.faint }, column.locationId)))
             )),
             h('tbody', null,
-              data?.matrixRows?.length
-                ? data.matrixRows.map((row: PromotionResponse['matrixRows'][number]) => h('tr', { key: row.rowKey },
-                    h('td', { style: t.td }, row.date),
-                    h('td', { style: t.td }, h('div', { className: 'text-sm font-medium', style: t.text }, row.locationName || row.locationId), h('div', { className: 'text-xs', style: t.faint }, row.locationId)),
-                    h('td', { style: t.td }, fmtNumber(row.totalUsageCount)),
-                    ...(data?.matrixColumns || []).map((column: PromotionResponse['matrixColumns'][number]) => h('td', { key: `${row.rowKey}::${column.promotionId}`, style: t.td }, fmtNumber(row.promotionCounts[column.promotionId] || 0)))
+              monthlyPromotionRows.length
+                ? monthlyPromotionRows.map((row: PromotionSummaryRow & { locationCounts: Record<string, number> }) => h('tr', { key: row.promotionId },
+                    h('td', { style: t.td }, h('div', { className: 'text-sm font-medium', style: t.text }, row.promotionName || row.promotionCode || row.promotionId), h('div', { className: 'text-xs', style: t.faint }, row.promotionId)),
+                    h('td', { style: t.td }, row.promotionCode || '—'),
+                    h('td', { style: t.td }, fmtNumber(row.usageCount)),
+                    ...monthlyLocationColumns.map((column) => h('td', { key: `${row.promotionId}::${column.locationId}`, style: t.td }, fmtNumber(row.locationCounts[column.locationId] || 0)))
                   ))
-                : h('tr', null, h('td', { style: t.td, colSpan: 3 + (data?.matrixColumns?.length || 0) }, loading ? 'Loading promotion usage…' : 'No daily promotion usage rows found for this filter.'))
+                : h('tr', null, h('td', { style: t.td, colSpan: 3 + monthlyLocationColumns.length }, loading ? 'Loading promotion usage…' : 'No promotion usage rows found for this filter.'))
             )
           )
         )
