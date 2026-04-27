@@ -8,6 +8,7 @@ import { randomUUID } from 'crypto';
 import { and, eq, sql } from 'drizzle-orm';
 import { initializeDatabase } from '../db';
 import * as schema from '../db/schema';
+import { listAppointmentsForRequest } from './list-appointments';
 import { characterizeClientPaging, extractAppointmentsRangeRows, fetchAppointmentsRange, fetchBusiness, fetchClients, fetchLocationServices, fetchLocationStaff, fetchLocations, fetchStaffProfile, ping } from '../drivers/yot-client';
 import { syncPromotionUsageRange } from '../reports/sync-promotion-usage';
 import { syncRevenueFactsRangeFromDailyRevenueSummary } from '../reports/sync-revenue-facts';
@@ -1777,54 +1778,60 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     try {
       const { db } = initializeDatabase(teamId);
       const { limit, offset } = parsePagination(req.query);
-      const locationFilter = cleanString(req.query.locationId || req.query.location);
-      const stylistFilter = cleanString(req.query.stylistId || req.query.stylist || req.query.staffId);
-      const clientFilter = cleanString(req.query.clientId || req.query.client);
-      const appointmentFilter = cleanString(req.query.appointmentId || req.query.appointment);
-      const statusFilter = cleanString(req.query.statusCode || req.query.status);
-      const categoryFilter = cleanString(req.query.categoryId || req.query.category);
       const search = cleanString(req.query.search || req.query.q);
-      const startsAfter = cleanString(req.query.startsAfter || req.query.startAtGte || req.query.dateFrom);
-      const startsBefore = cleanString(req.query.startsBefore || req.query.startAtLte || req.query.dateTo);
-      let rows = db.select().from(schema.appointments).where(eq(schema.appointments.teamId, teamId)).all() as schema.Appointment[];
-      if (locationFilter) rows = rows.filter((row) => row.locationId === locationFilter);
-      if (stylistFilter) rows = rows.filter((row) => row.stylistId === stylistFilter || row.staffId === stylistFilter);
-      if (clientFilter) rows = rows.filter((row) => row.clientId === clientFilter);
-      if (appointmentFilter) rows = rows.filter((row) => row.id === appointmentFilter || row.appointmentId === appointmentFilter);
-      if (statusFilter) rows = rows.filter((row) => row.statusCode === statusFilter || row.status === statusFilter);
-      if (categoryFilter) rows = rows.filter((row) => row.categoryId === categoryFilter || row.categoryName === categoryFilter);
-      if (startsAfter) rows = rows.filter((row) => String(row.startAt || row.startsAt || '') >= startsAfter);
-      if (startsBefore) rows = rows.filter((row) => String(row.startAt || row.startsAt || '') <= startsBefore);
-      if (search) {
-        const term = search.toLowerCase();
-        const lookups = buildAppointmentLookups(db, teamId);
-        rows = rows
-          .map((row) => ({ row, mapped: mapAppointmentRecordWithLookups(row, lookups) }))
-          .filter(({ row, mapped }) =>
-            [
-              row.appointmentId,
-              row.internalId,
-              row.clientId,
-              mapped.clientName,
-              mapped.clientPhone,
-              mapped.locationName,
-              mapped.stylistName,
-              mapped.serviceName,
-              row.serviceNameRaw,
-              row.categoryName,
-              row.status,
-              row.statusCode,
-              row.statusDescription,
-              row.descriptionText,
-              row.clientNotes,
-            ].some((value) => String(value || '').toLowerCase().includes(term))
-          )
-          .map(({ row }) => row);
-      }
-      rows.sort((a, b) => String(b.startAt || b.startsAt || '').localeCompare(String(a.startAt || a.startsAt || '')));
-      const total = rows.length;
+      const filters = {
+        locationId: cleanString(req.query.locationId || req.query.location),
+        stylistId: cleanString(req.query.stylistId || req.query.stylist || req.query.staffId),
+        clientId: cleanString(req.query.clientId || req.query.client),
+        appointmentId: cleanString(req.query.appointmentId || req.query.appointment),
+        statusCode: cleanString(req.query.statusCode || req.query.status),
+        categoryId: cleanString(req.query.categoryId || req.query.category),
+        startsAfter: cleanString(req.query.startsAfter || req.query.startAtGte || req.query.dateFrom),
+        startsBefore: cleanString(req.query.startsBefore || req.query.startAtLte || req.query.dateTo),
+        search,
+      };
+
+      // Search filter spans joined fields (clientName, stylistName, etc.) and
+      // can't be cheaply pushed into SQL. Pass a post-filter callback that
+      // runs after the WHERE clause has narrowed the working set.
+      const searchPostFilter = search
+        ? (rows: schema.Appointment[]): schema.Appointment[] => {
+            const term = search.toLowerCase();
+            const lookups = buildAppointmentLookups(db, teamId);
+            return rows.filter((row) => {
+              const mapped = mapAppointmentRecordWithLookups(row, lookups);
+              return [
+                row.appointmentId,
+                row.internalId,
+                row.clientId,
+                mapped.clientName,
+                mapped.clientPhone,
+                mapped.locationName,
+                mapped.stylistName,
+                mapped.serviceName,
+                row.serviceNameRaw,
+                row.categoryName,
+                row.status,
+                row.statusCode,
+                row.statusDescription,
+                row.descriptionText,
+                row.clientNotes,
+              ].some((value) => String(value || '').toLowerCase().includes(term));
+            });
+          }
+        : undefined;
+
+      const { rows, total } = listAppointmentsForRequest(db, teamId, filters, { limit, offset }, searchPostFilter);
       const lookups = buildAppointmentLookups(db, teamId);
-      return { status: 200, data: { data: rows.slice(offset, offset + limit).map((row) => mapAppointmentRecordWithLookups(row, lookups)), total, limit, offset } };
+      return {
+        status: 200,
+        data: {
+          data: rows.map((row) => mapAppointmentRecordWithLookups(row, lookups)),
+          total,
+          limit,
+          offset,
+        },
+      };
     } catch (error: any) {
       return apiError(500, 'DATABASE_ERROR', error?.message || 'Failed to read appointments');
     }
