@@ -159,6 +159,52 @@ export interface RevenueQueryResponse {
   byLocation: RevenueLocationRollupRecord[];
 }
 
+export interface PromotionTotalsRecord {
+  usageCount: number;
+  promotionCount: number;
+  locationCount: number;
+  dayCount: number;
+  rowCount: number;
+  lastUpdatedAt: string | null;
+}
+
+export interface PromotionSummaryRecord {
+  promotionId: string;
+  promotionName: string | null;
+  promotionCode: string | null;
+  usageCount: number;
+  locationCount: number;
+  dayCount: number;
+  lastUsedAt: string | null;
+}
+
+export interface PromotionMatrixRowRecord {
+  rowKey: string;
+  date: string;
+  locationId: string;
+  locationName: string | null;
+  totalUsageCount: number;
+  promotionCounts: Record<string, number>;
+}
+
+export interface PromotionUsageQueryResponse {
+  locationId: string | null;
+  startDate: string | null;
+  endDate: string | null;
+  availableRange: {
+    minDate: string | null;
+    maxDate: string | null;
+  };
+  totals: PromotionTotalsRecord;
+  promotions: PromotionSummaryRecord[];
+  matrixColumns: Array<{
+    promotionId: string;
+    promotionName: string | null;
+    promotionCode: string | null;
+  }>;
+  matrixRows: PromotionMatrixRowRecord[];
+}
+
 export interface RelationshipSummary {
   appointmentCount: number;
   uniqueClientCount: number;
