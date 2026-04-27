@@ -78,6 +78,7 @@ import { api, boolLabel, detectRevenueDatePreset, fmtNumber, formatDateTime, joi
     const [endDate, setEndDate] = useState(defaultRange.endDate);
     const [syncState, setSyncState] = useState(null as any);
     const [latestRun, setLatestRun] = useState(null as any);
+    const [totalRows, setTotalRows] = useState(null as number | null);
     const [linkedLocation, setLinkedLocation] = useState(null as LocationDetail | null);
     const [loading, setLoading] = useState(true);
     const [busy, setBusy] = useState(null as string | null);
@@ -106,6 +107,7 @@ import { api, boolLabel, detectRevenueDatePreset, fmtNumber, formatDateTime, joi
         const meta = await loadCacheMeta(teamId, 'revenue_facts');
         setSyncState(meta.syncState);
         setLatestRun(meta.latestRun);
+        setTotalRows(meta.totalRows);
       } catch {}
     };
 
@@ -180,7 +182,7 @@ import { api, boolLabel, detectRevenueDatePreset, fmtNumber, formatDateTime, joi
         ),
         error && h('div', { className: 'mt-3 text-xs', style: t.danger }, error),
         message && h('div', { className: 'mt-3 text-xs', style: t.success }, message),
-        renderCacheSummaryCards(h, { syncState, latestRun, emptyLatestRunText: 'No revenue sync runs recorded yet.' }),
+        renderCacheSummaryCards(h, { syncState, latestRun, totalRows, emptyLatestRunText: 'No revenue sync runs recorded yet.' }),
         h('div', { className: 'mt-3', style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '0.75rem' } },
           h('label', { style: { ...detailLabel, display: 'block' } }, 'Grain', h('select', { value: grain, onChange: (e: any) => setGrain(e.target.value), style: { ...t.input, marginTop: '0.35rem' } }, h('option', { value: 'day' }, 'Day'), h('option', { value: 'week' }, 'Week'), h('option', { value: 'month' }, 'Month'))),
           h('label', { style: { ...detailLabel, display: 'block' } }, 'Preset', h('select', { value: preset, onChange: (e: any) => onPresetChange(e.target.value), style: { ...t.input, marginTop: '0.35rem' } }, ...REVENUE_DATE_PRESET_OPTIONS.map((option) => h('option', { key: option.value, value: option.value }, option.label)))),

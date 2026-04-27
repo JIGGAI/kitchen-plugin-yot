@@ -68,6 +68,7 @@ import { api, detectRevenueDatePreset, fmtNumber, formatDateTime, loadCacheMeta,
     const [endDate, setEndDate] = useState(defaultRange.endDate);
     const [syncState, setSyncState] = useState(null as any);
     const [latestRun, setLatestRun] = useState(null as any);
+    const [totalRows, setTotalRows] = useState(null as number | null);
     const [loading, setLoading] = useState(true);
     const [busy, setBusy] = useState(null as string | null);
     const [message, setMessage] = useState(null as string | null);
@@ -94,6 +95,7 @@ import { api, detectRevenueDatePreset, fmtNumber, formatDateTime, loadCacheMeta,
         const meta = await loadCacheMeta(teamId, 'promotion_usage');
         setSyncState(meta.syncState);
         setLatestRun(meta.latestRun);
+        setTotalRows(meta.totalRows);
       } catch {}
     };
 
@@ -163,7 +165,7 @@ import { api, detectRevenueDatePreset, fmtNumber, formatDateTime, loadCacheMeta,
         ),
         error && h('div', { className: 'mt-3 text-xs', style: t.danger }, error),
         message && h('div', { className: 'mt-3 text-xs', style: t.success }, message),
-        renderCacheSummaryCards(h, { syncState, latestRun, emptyLatestRunText: 'No promotion sync runs recorded yet.' }),
+        renderCacheSummaryCards(h, { syncState, latestRun, totalRows, emptyLatestRunText: 'No promotion sync runs recorded yet.' }),
         h('div', { className: 'mt-3', style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '0.75rem' } },
           h('label', { style: { ...detailLabel, display: 'block' } }, 'Preset', h('select', { value: preset, onChange: (e: any) => onPresetChange(e.target.value), style: { ...t.input, marginTop: '0.35rem' } }, ...presetOptions.map((option) => h('option', { key: option.value, value: option.value }, option.label)))),
           h('label', { style: { ...detailLabel, display: 'block' } }, 'Location', h('select', { value: locationId, onChange: (e: any) => setLocationId(e.target.value), style: { ...t.input, marginTop: '0.35rem' } }, h('option', { value: '' }, 'All locations'), ...locations.map((row: LocationRow) => h('option', { key: row.id, value: row.id }, row.name || row.id)))),
