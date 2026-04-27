@@ -9,6 +9,7 @@ import { and, eq, sql } from 'drizzle-orm';
 import { initializeDatabase } from '../db';
 import * as schema from '../db/schema';
 import { listAppointmentsForRequest } from './list-appointments';
+import { buildAppointmentLookupsForRows } from './appointment-lookups';
 import { characterizeClientPaging, extractAppointmentsRangeRows, fetchAppointmentsRange, fetchBusiness, fetchClients, fetchLocationServices, fetchLocationStaff, fetchLocations, fetchStaffProfile, ping } from '../drivers/yot-client';
 import { syncPromotionUsageRange } from '../reports/sync-promotion-usage';
 import { syncRevenueFactsRangeFromDailyRevenueSummary } from '../reports/sync-revenue-facts';
@@ -1797,7 +1798,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       const searchPostFilter = search
         ? (rows: schema.Appointment[]): schema.Appointment[] => {
             const term = search.toLowerCase();
-            const lookups = buildAppointmentLookups(db, teamId);
+            const lookups = buildAppointmentLookupsForRows(db, teamId, rows);
             return rows.filter((row) => {
               const mapped = mapAppointmentRecordWithLookups(row, lookups);
               return [
@@ -1822,7 +1823,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         : undefined;
 
       const { rows, total } = listAppointmentsForRequest(db, teamId, filters, { limit, offset }, searchPostFilter);
-      const lookups = buildAppointmentLookups(db, teamId);
+      const lookups = buildAppointmentLookupsForRows(db, teamId, rows);
       return {
         status: 200,
         data: {
@@ -1848,7 +1849,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       }
       if (!rows.length) return apiError(404, 'NOT_FOUND', 'Appointment not found');
       rows.sort((a, b) => String(b.startAt || b.startsAt || '').localeCompare(String(a.startAt || a.startsAt || '')));
-      const lookups = buildAppointmentLookups(db, teamId);
+      const lookups = buildAppointmentLookupsForRows(db, teamId, rows.slice(0, 1));
       return { status: 200, data: mapAppointmentDetailRecord(rows[0], lookups) };
     } catch (error: any) {
       return apiError(500, 'DATABASE_ERROR', error?.message || 'Failed to read appointment');
