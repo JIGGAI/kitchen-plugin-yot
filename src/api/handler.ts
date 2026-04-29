@@ -11,6 +11,8 @@ import * as schema from '../db/schema';
 import { listAppointmentsForRequest } from './list-appointments';
 import { buildAppointmentLookupsForRows } from './appointment-lookups';
 import { characterizeClientPaging, extractAppointmentsRangeRows, fetchAppointmentsRange, fetchBusiness, fetchClients, fetchLocationServices, fetchLocationStaff, fetchLocations, fetchStaffProfile, ping } from '../drivers/yot-client';
+import { runStaffCashoutReport } from '../reports/run-staff-cashout';
+import { listStaffCashoutFacts, syncStaffCashoutFromReport } from '../reports/sync-staff-cashout';
 import { syncPromotionUsageRange } from '../reports/sync-promotion-usage';
 import { syncRevenueFactsRangeFromDailyRevenueSummary } from '../reports/sync-revenue-facts';
 import type { KitchenPluginContext } from './types-kitchen';
@@ -1349,6 +1351,91 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       return { status: 200, data: { ok: true, ...result } };
     } catch (error: any) {
       return apiError(502, 'YOT_ERROR', error?.message || 'Failed to sync promotion usage');
+    }
+  }
+
+  if (req.path === '/staff-cashout' && req.method === 'GET') {
+    try {
+      const { sqlite } = initializeDatabase(teamId);
+      const requestedStart = toDateOnlyInput(req.query.startDate || req.query.dateFrom || req.query.start || req.query.date);
+      const requestedEnd = toDateOnlyInput(req.query.endDate || req.query.dateTo || req.query.end || req.query.date);
+      const anchorEnd = addDaysToDateOnly(dateOnlyNow(), -1);
+      const endDate = requestedEnd || anchorEnd;
+      const startDate = requestedStart || endDate;
+      const locationName = cleanString(req.query.location || req.query.locationName);
+      const rows = listStaffCashoutFacts(sqlite, teamId, { startDate, endDate, locationName });
+      const lastSyncedAt = (sqlite
+        .prepare("SELECT last_synced_at AS lastSyncedAt FROM sync_state WHERE team_id = ? AND resource = 'staff_cashout_facts'")
+        .get(teamId) as { lastSyncedAt?: string } | undefined)?.lastSyncedAt || null;
+      return { status: 200, data: { startDate, endDate, locationName: locationName || null, rows, lastSyncedAt } };
+    } catch (error: any) {
+      return apiError(500, 'DATABASE_ERROR', error?.message || 'Failed to read staff cashout facts');
+    }
+  }
+
+  if (req.path === '/staff-cashout/sync' && req.method === 'POST') {
+    const config = readYotConfig(teamId);
+    if (!config) return apiError(400, 'NOT_CONFIGURED', 'YOT apiKey not set for this team. POST /config first.');
+    try {
+      const requestedStart = toDateOnlyInput(req.query.startDate || req.query.dateFrom || req.query.start || req.query.date);
+      const requestedEnd = toDateOnlyInput(req.query.endDate || req.query.dateTo || req.query.end || req.query.date);
+      const anchorEnd = addDaysToDateOnly(dateOnlyNow(), -1);
+      const endDate = requestedEnd || anchorEnd;
+      const startDate = requestedStart || endDate;
+      const locationIdText = cleanString(req.query.locationId || req.query.location);
+      const staffIdText = cleanString(req.query.staffId || req.query.staff);
+      const locationId = locationIdText ? Number(locationIdText) : null;
+      const staffId = staffIdText ? Number(staffIdText) : null;
+      if (locationIdText && !Number.isFinite(locationId)) return apiError(400, 'BAD_REQUEST', 'locationId must be numeric');
+      if (staffIdText && !Number.isFinite(staffId)) return apiError(400, 'BAD_REQUEST', 'staffId must be numeric');
+      const organisationId = Number(cleanString(req.query.organisationId || req.query.org) || String(DEFAULT_REVENUE_ORGANISATION_ID));
+      if (!Number.isFinite(organisationId)) return apiError(400, 'BAD_REQUEST', 'organisationId must be a number');
+
+      const result = await syncStaffCashoutFromReport({
+        teamId,
+        startDateIso: toIsoDayStart(startDate),
+        endDateIso: toIsoDayStart(endDate),
+        organisationId,
+        locationId,
+        staffId,
+      });
+      return { status: 200, data: { ok: true, startDate: result.startDate, endDate: result.endDate, rowsSeen: result.rowsSeen, rowsWritten: result.rowsWritten } };
+    } catch (error: any) {
+      return apiError(502, 'YOT_ERROR', error?.message || 'Failed to sync staff cashout');
+    }
+  }
+
+  if (req.path === '/staff-cashout/run' && req.method === 'POST') {
+    const config = readYotConfig(teamId);
+    if (!config) return apiError(400, 'NOT_CONFIGURED', 'YOT apiKey not set for this team. POST /config first.');
+    try {
+      const requestedStart = toDateOnlyInput(req.query.startDate || req.query.dateFrom || req.query.start);
+      const requestedEnd = toDateOnlyInput(req.query.endDate || req.query.dateTo || req.query.end);
+      const anchorEnd = addDaysToDateOnly(dateOnlyNow(), -1);
+      const endDate = requestedEnd || anchorEnd;
+      const startDate = requestedStart || endDate;
+      const locationIdText = cleanString(req.query.locationId || req.query.location);
+      const staffIdText = cleanString(req.query.staffId || req.query.staff);
+      const locationId = locationIdText ? Number(locationIdText) : null;
+      const staffId = staffIdText ? Number(staffIdText) : null;
+      if (locationIdText && !Number.isFinite(locationId)) return apiError(400, 'BAD_REQUEST', 'locationId must be numeric');
+      if (staffIdText && !Number.isFinite(staffId)) return apiError(400, 'BAD_REQUEST', 'staffId must be numeric');
+      const organisationId = Number(cleanString(req.query.organisationId || req.query.org) || String(DEFAULT_REVENUE_ORGANISATION_ID));
+      if (!Number.isFinite(organisationId)) return apiError(400, 'BAD_REQUEST', 'organisationId must be a number');
+
+      const includeDebugRows = parseBooleanFilter(req.query.debug) === true;
+      const result = await runStaffCashoutReport({
+        teamId,
+        startDateIso: toIsoDayStart(startDate),
+        endDateIso: toIsoDayStart(endDate),
+        organisationId,
+        locationId,
+        staffId,
+        includeDebugRows,
+      });
+      return { status: 200, data: { ok: true, startDate, endDate, ...result } };
+    } catch (error: any) {
+      return apiError(502, 'YOT_ERROR', error?.message || 'Failed to run staff cashout report');
     }
   }
 
