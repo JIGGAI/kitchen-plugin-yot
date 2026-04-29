@@ -11,6 +11,7 @@ import * as schema from '../db/schema';
 import { listAppointmentsForRequest } from './list-appointments';
 import { buildAppointmentLookupsForRows } from './appointment-lookups';
 import { characterizeClientPaging, extractAppointmentsRangeRows, fetchAppointmentsRange, fetchBusiness, fetchClients, fetchLocationServices, fetchLocationStaff, fetchLocations, fetchStaffProfile, ping } from '../drivers/yot-client';
+import { runStaffCashoutReport } from '../reports/run-staff-cashout';
 import { syncPromotionUsageRange } from '../reports/sync-promotion-usage';
 import { syncRevenueFactsRangeFromDailyRevenueSummary } from '../reports/sync-revenue-facts';
 import type { KitchenPluginContext } from './types-kitchen';
@@ -1349,6 +1350,40 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       return { status: 200, data: { ok: true, ...result } };
     } catch (error: any) {
       return apiError(502, 'YOT_ERROR', error?.message || 'Failed to sync promotion usage');
+    }
+  }
+
+  if (req.path === '/staff-cashout/run' && req.method === 'POST') {
+    const config = readYotConfig(teamId);
+    if (!config) return apiError(400, 'NOT_CONFIGURED', 'YOT apiKey not set for this team. POST /config first.');
+    try {
+      const requestedStart = toDateOnlyInput(req.query.startDate || req.query.dateFrom || req.query.start);
+      const requestedEnd = toDateOnlyInput(req.query.endDate || req.query.dateTo || req.query.end);
+      const anchorEnd = addDaysToDateOnly(dateOnlyNow(), -1);
+      const endDate = requestedEnd || anchorEnd;
+      const startDate = requestedStart || endDate;
+      const locationIdText = cleanString(req.query.locationId || req.query.location);
+      const staffIdText = cleanString(req.query.staffId || req.query.staff);
+      const locationId = locationIdText ? Number(locationIdText) : null;
+      const staffId = staffIdText ? Number(staffIdText) : null;
+      if (locationIdText && !Number.isFinite(locationId)) return apiError(400, 'BAD_REQUEST', 'locationId must be numeric');
+      if (staffIdText && !Number.isFinite(staffId)) return apiError(400, 'BAD_REQUEST', 'staffId must be numeric');
+      const organisationId = Number(cleanString(req.query.organisationId || req.query.org) || String(DEFAULT_REVENUE_ORGANISATION_ID));
+      if (!Number.isFinite(organisationId)) return apiError(400, 'BAD_REQUEST', 'organisationId must be a number');
+
+      const includeDebugRows = parseBooleanFilter(req.query.debug) === true;
+      const result = await runStaffCashoutReport({
+        teamId,
+        startDateIso: toIsoDayStart(startDate),
+        endDateIso: toIsoDayStart(endDate),
+        organisationId,
+        locationId,
+        staffId,
+        includeDebugRows,
+      });
+      return { status: 200, data: { ok: true, startDate, endDate, ...result } };
+    } catch (error: any) {
+      return apiError(502, 'YOT_ERROR', error?.message || 'Failed to run staff cashout report');
     }
   }
 
