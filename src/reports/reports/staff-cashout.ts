@@ -176,7 +176,11 @@ export function parseStaffCashoutWorkbook(
     const normalizedFirst = normalizeHeader(firstCell || '');
     const normalizedName = normalizeHeader(staffName || '');
 
-    if (normalizedFirst === 'totals' || normalizedName === 'average' || normalizedName === 'name') {
+    if (rawRow.some((cell) => normalizeHeader(cell) === 'sales list')) {
+      break;
+    }
+
+    if (normalizedFirst === 'totals' || normalizedName === 'average' || normalizedName === 'name' || normalizedName === 'staff total') {
       continue;
     }
 
