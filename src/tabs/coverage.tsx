@@ -24,7 +24,27 @@ import { api, formatDateTime, t } from './common';
     slots: Slot[];
     error?: string | null;
     computedAt?: string | null;
+    averageDailyAppointments?: number;
+    requiredStylists?: number;
+    customersPerStylistForDay?: number;
   };
+
+  type Ratios = { weekday: number; saturday: number; sunday: number };
+  const DEFAULT_RATIOS: Ratios = { weekday: 10, saturday: 8, sunday: 6 };
+  const DEFAULT_AVERAGING_DAYS = 30;
+  const SETTINGS_KEY = 'yot.coverage.settings.v1';
+
+  function loadSettings(): { ratios: Ratios; averagingDays: number } {
+    try {
+      const raw = window.localStorage.getItem(SETTINGS_KEY);
+      if (raw) return JSON.parse(raw);
+    } catch { /* ignore */ }
+    return { ratios: DEFAULT_RATIOS, averagingDays: DEFAULT_AVERAGING_DAYS };
+  }
+
+  function saveSettings(s: { ratios: Ratios; averagingDays: number }) {
+    try { window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); } catch { /* ignore */ }
+  }
 
   type Candidate = {
     stylistId: string;
@@ -71,6 +91,12 @@ import { api, formatDateTime, t } from './common';
     const [serviceMinutes, setServiceMinutes] = useState(60);
     const [pool, setPool] = useState('cross' as 'cross' | 'same');
     const [findingCover, setFindingCover] = useState(false);
+    const [showSettings, setShowSettings] = useState(false);
+    const initialSettings = loadSettings();
+    const [ratios, setRatios] = useState(initialSettings.ratios);
+    const [averagingDays, setAveragingDays] = useState(initialSettings.averagingDays);
+
+    useEffect(() => { saveSettings({ ratios, averagingDays }); }, [ratios, averagingDays]);
 
     useEffect(() => {
       if (!teamId) return;
@@ -84,17 +110,30 @@ import { api, formatDateTime, t } from './common';
     async function loadOne(locationId: string, locationName: string, forceSync: boolean): Promise<LocationRow> {
       try {
         if (forceSync) {
-          await api('yot', teamId!, '/coverage/sync', {
+          const syncRes = await api('yot', teamId!, '/coverage/sync', {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ locationId, date }),
-          });
+            body: JSON.stringify({ locationId, date, ratios, averagingDays }),
+          }) as any;
+          // sync response includes the same shape as /slots — use it directly
+          return {
+            locationId, locationName,
+            slots: syncRes?.slots || [],
+            computedAt: syncRes?.computedAt,
+            averageDailyAppointments: syncRes?.averageDailyAppointments,
+            requiredStylists: syncRes?.requiredStylists,
+            customersPerStylistForDay: syncRes?.customersPerStylistForDay,
+          };
         }
         const slotsRes = await api('yot', teamId!, `/coverage/slots?locationId=${encodeURIComponent(locationId)}&date=${date}`) as any;
-        const slots = slotsRes?.slots || [];
-        // eslint-disable-next-line no-console
-        console.log('[coverage] loaded', locationName, 'slots=', slots.length, 'sample=', slots[0]);
-        return { locationId, locationName, slots, computedAt: slotsRes?.computedAt };
+        return {
+          locationId, locationName,
+          slots: slotsRes?.slots || [],
+          computedAt: slotsRes?.computedAt,
+          averageDailyAppointments: slotsRes?.averageDailyAppointments,
+          requiredStylists: slotsRes?.requiredStylists,
+          customersPerStylistForDay: slotsRes?.customersPerStylistForDay,
+        };
       } catch (e: any) {
         const msg = deepError(e);
         if (msg.includes('NO_COVERAGE_CACHE') && !forceSync) {
@@ -219,9 +258,35 @@ import { api, formatDateTime, t } from './common';
         }, 'Force Sync (refresh from YOT)'),
         progress ? h('span', { style: { ...t.faint, fontSize: '0.85em' } },
           `${progress.current}/${progress.total}`) : null,
+        h('button', {
+          type: 'button',
+          onClick: () => setShowSettings(!showSettings),
+          style: t.btnGhost,
+        }, showSettings ? 'Hide settings' : 'Settings'),
         h('span', { style: { ...t.faint, fontSize: '0.85em' } },
-          `[build 16:09 — counts inline] Click a red cell to find cover.`),
+          'Click a red cell to find cover.'),
       ),
+
+      // Settings panel
+      showSettings ? h('div', {
+        style: { padding: '0.75rem', border: '1px solid #444', borderRadius: '4px', display: 'flex', gap: '1rem', alignItems: 'center', flexWrap: 'wrap' },
+      },
+        h('strong', null, 'Customers per stylist:'),
+        h('label', null, 'Mon–Fri 1:',
+          h('input', { type: 'number', min: 1, value: ratios.weekday, onChange: (e: any) => setRatios({ ...ratios, weekday: Number(e.target.value) || 10 }), style: { ...t.input, width: '4rem' } }),
+        ),
+        h('label', null, 'Sat 1:',
+          h('input', { type: 'number', min: 1, value: ratios.saturday, onChange: (e: any) => setRatios({ ...ratios, saturday: Number(e.target.value) || 8 }), style: { ...t.input, width: '4rem' } }),
+        ),
+        h('label', null, 'Sun 1:',
+          h('input', { type: 'number', min: 1, value: ratios.sunday, onChange: (e: any) => setRatios({ ...ratios, sunday: Number(e.target.value) || 6 }), style: { ...t.input, width: '4rem' } }),
+        ),
+        h('label', null, 'Average over last ',
+          h('input', { type: 'number', min: 1, max: 365, value: averagingDays, onChange: (e: any) => setAveragingDays(Number(e.target.value) || 30), style: { ...t.input, width: '5rem' } }),
+          ' days',
+        ),
+        h('span', { style: { ...t.faint, fontSize: '0.85em' } }, 'Saved in browser. Click "Force Sync" to apply.'),
+      ) : null,
 
       // Error banner
       error ? h('div', {
@@ -241,8 +306,12 @@ import { api, formatDateTime, t } from './common';
             ...rows.map((row) => h('tr', { key: row.locationId },
               h('td', { style: locCellStyle },
                 row.locationName,
+                typeof row.averageDailyAppointments === 'number'
+                  ? h('div', { style: { ...t.faint, fontSize: '0.7rem', fontWeight: 400 } },
+                      `avg ${row.averageDailyAppointments.toFixed(1)}/day → need ${row.requiredStylists ?? '?'} (1:${row.customersPerStylistForDay ?? '?'})`)
+                  : null,
                 row.error
-                  ? h('div', { style: { ...t.faint, fontSize: '0.7rem', fontWeight: 400 } }, row.error.slice(0, 60))
+                  ? h('div', { style: { color: '#ff8888', fontSize: '0.7rem', fontWeight: 400 } }, row.error.slice(0, 60))
                   : null,
               ),
               ...columns.map((c) => cellFor(row, c)),

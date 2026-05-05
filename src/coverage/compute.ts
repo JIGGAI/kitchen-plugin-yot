@@ -44,11 +44,13 @@ function countAppointmentsOverlapping(list: AppointmentInterval[], slot: Interva
 export function computeCoverageSlots(input: CoverageInputs): CoverageSlot[] {
   const slots: CoverageSlot[] = [];
   let cursor = input.businessHours.startsAt;
+  // Same required for every slot — driven by the location's daily average,
+  // not by who happens to be booked in this 30-min window.
+  const requiredStylists = input.requiredStylists;
   while (cursor < input.businessHours.endsAt) {
     const next = addMinutesToIso(cursor, input.slotMinutes);
     const slot: Interval = { startsAt: cursor, endsAt: next };
     const customerCount = countAppointmentsOverlapping(input.appointments, slot);
-    const requiredStylists = Math.ceil(customerCount / input.customersPerStylist);
     const scheduledStylists = distinctStylistsOverlapping(input.scheduled, slot);
     const light = requiredStylists > 0 && scheduledStylists < requiredStylists;
     slots.push({

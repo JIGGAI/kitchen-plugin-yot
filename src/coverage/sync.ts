@@ -14,7 +14,13 @@ import { fetchLocationRosterHtml, withAutoLogin } from '../drivers/yot-mvc-clien
 import { parseRosterHtml, scheduledOnly } from './parse-roster-html';
 import { computeCoverageSlots, aggregateLightWindows } from './compute';
 import { resolveBusinessHoursForDate, type BusinessHoursSchedule } from './business-hours';
-import type { CoverageSlot } from './types';
+import {
+  DEFAULT_AVERAGING_DAYS,
+  DEFAULT_RATIOS,
+  ratioForDate,
+  type CoverageSlot,
+  type CustomerToStylistRatios,
+} from './types';
 
 type SqliteDb = ReturnType<typeof initializeDatabase>['sqlite'];
 
@@ -22,7 +28,8 @@ export type SyncCoverageOptions = {
   teamId: string;
   locationId: string;
   date: string;                        // YYYY-MM-DD; the day we want freshness for
-  customersPerStylist?: number;        // default 10
+  ratios?: CustomerToStylistRatios;    // per-day-of-week ratios; defaults below
+  averagingDays?: number;              // window for daily-average computation
   slotMinutes?: number;                // default 30
   businessHours?: BusinessHoursSchedule;
 };
@@ -31,6 +38,9 @@ export type SyncCoverageResult = {
   date: string;
   slots: CoverageSlot[];
   computedAt: string;
+  averageDailyAppointments: number;
+  customersPerStylistForDay: number;
+  requiredStylists: number;
 };
 
 function readConfig(sqlite: SqliteDb, teamId: string): YotConfig {
@@ -84,19 +94,58 @@ function readAppointmentsForDay(
 }
 
 /**
+ * Average daily booked appointment count for one location, looking back
+ * `averagingDays` calendar days from `referenceDate` (exclusive of the
+ * reference day so we don't double-count today's in-progress data).
+ *
+ * Returns the float so the caller can ceil it after applying the ratio.
+ */
+function averageDailyAppointments(
+  db: ReturnType<typeof initializeDatabase>['db'],
+  teamId: string,
+  locationId: string,
+  referenceDate: string,
+  averagingDays: number,
+): number {
+  const ref = new Date(`${referenceDate}T00:00:00`);
+  const start = new Date(ref);
+  start.setDate(ref.getDate() - averagingDays);
+  const startIso = start.toISOString().slice(0, 10);
+  const endIso = referenceDate; // exclusive end
+
+  const rows = db.select().from(schema.appointments)
+    .where(and(eq(schema.appointments.teamId, teamId), eq(schema.appointments.locationId, locationId)))
+    .all() as schema.Appointment[];
+
+  let count = 0;
+  for (const r of rows) {
+    const startsAt = r.startAt ?? r.startsAt;
+    if (!startsAt) continue;
+    const day = startsAt.slice(0, 10);
+    if (day >= startIso && day < endIso) count++;
+  }
+  return count / averagingDays;
+}
+
+/**
  * Fetch one week of roster HTML, parse, then write a day-row into
  * `location_coverage_facts` for each day in the week. Returns the slots
  * for the *requested* date (the others are cached for cheap follow-up).
  */
 export async function syncCoverageForLocationDay(opts: SyncCoverageOptions): Promise<SyncCoverageResult> {
-  const customersPerStylist = opts.customersPerStylist ?? 10;
+  const ratios = opts.ratios ?? DEFAULT_RATIOS;
+  const averagingDays = opts.averagingDays ?? DEFAULT_AVERAGING_DAYS;
   const slotMinutes = opts.slotMinutes ?? 30;
   const schedule = opts.businessHours; // undefined → DEFAULT_BUSINESS_HOURS inside resolver
 
   const { db, sqlite } = initializeDatabase(opts.teamId);
   const config = readConfig(sqlite, opts.teamId);
 
-  // 1. Fetch one week of HTML and parse. withAutoLogin re-logs in transparently
+  // 1. Daily-average appointment count for this location (lookback window).
+  // Drives the staffing target uniformly across every slot in the day.
+  const avgDaily = averageDailyAppointments(db, opts.teamId, opts.locationId, opts.date, averagingDays);
+
+  // 2. Fetch one week of HTML and parse. withAutoLogin re-logs in transparently
   // when mvcCookie is missing/expired AND mvcUserName/mvcPassword/mvcOrganisation
   // are configured, persisting the new cookie back to plugin_config.
   const weekStart = weekStartOf(opts.date);
@@ -107,7 +156,7 @@ export async function syncCoverageForLocationDay(opts: SyncCoverageOptions): Pro
   );
   const allEntries = parseRosterHtml(html);
 
-  // 2. For each day in the week, compute slots and persist
+  // 3. For each day in the week, compute slots and persist
   const computedAt = new Date().toISOString();
   const insert = sqlite.prepare(
     `INSERT OR REPLACE INTO location_coverage_facts
@@ -123,13 +172,21 @@ export async function syncCoverageForLocationDay(opts: SyncCoverageOptions): Pro
   }
 
   let requestedSlots: CoverageSlot[] = [];
+  let requestedRequired = 0;
+  let requestedRatio = ratios.weekday;
   for (const date of datesInWeek) {
+    const customersPerStylistForDay = ratioForDate(date, ratios);
+    const requiredStylists = Math.ceil(avgDaily / customersPerStylistForDay);
     const businessHours = resolveBusinessHoursForDate(date, schedule);
     if (!businessHours) {
       // Store closed: persist empty slot table so the API returns a clean 200.
-      insert.run(opts.teamId, opts.locationId, date, JSON.stringify({ slots: [] }),
-        JSON.stringify({ rows: [] }), '{}', computedAt, customersPerStylist);
-      if (date === opts.date) requestedSlots = [];
+      insert.run(opts.teamId, opts.locationId, date, JSON.stringify({ slots: [], averageDailyAppointments: avgDaily, customersPerStylistForDay, requiredStylists }),
+        JSON.stringify({ rows: [] }), '{}', computedAt, customersPerStylistForDay);
+      if (date === opts.date) {
+        requestedSlots = [];
+        requestedRequired = requiredStylists;
+        requestedRatio = customersPerStylistForDay;
+      }
       continue;
     }
 
@@ -142,24 +199,37 @@ export async function syncCoverageForLocationDay(opts: SyncCoverageOptions): Pro
       date,
       businessHours,
       slotMinutes,
-      customersPerStylist,
+      requiredStylists,
+      averageDailyAppointments: avgDaily,
+      customersPerStylistForDay,
       appointments,
       scheduled: dayScheduled,
     });
 
     insert.run(
       opts.teamId, opts.locationId, date,
-      JSON.stringify({ slots }),
+      JSON.stringify({ slots, averageDailyAppointments: avgDaily, customersPerStylistForDay, requiredStylists }),
       JSON.stringify({ rows: dayRosteredRaw }),
       '{}',                                    // unused timecard slot
       computedAt,
-      customersPerStylist,
+      customersPerStylistForDay,
     );
 
-    if (date === opts.date) requestedSlots = slots;
+    if (date === opts.date) {
+      requestedSlots = slots;
+      requestedRequired = requiredStylists;
+      requestedRatio = customersPerStylistForDay;
+    }
   }
 
-  return { date: opts.date, slots: requestedSlots, computedAt };
+  return {
+    date: opts.date,
+    slots: requestedSlots,
+    computedAt,
+    averageDailyAppointments: avgDaily,
+    customersPerStylistForDay: requestedRatio,
+    requiredStylists: requestedRequired,
+  };
 }
 
 /**
@@ -173,11 +243,25 @@ export function readCachedCoverage(
 ): SyncCoverageResult | null {
   const { sqlite } = initializeDatabase(teamId);
   const row = sqlite
-    .prepare('SELECT slot_payload, computed_at FROM location_coverage_facts WHERE team_id=? AND location_id=? AND date=?')
-    .get(teamId, locationId, date) as { slot_payload?: string; computed_at?: string } | undefined;
+    .prepare('SELECT slot_payload, computed_at, customers_per_stylist FROM location_coverage_facts WHERE team_id=? AND location_id=? AND date=?')
+    .get(teamId, locationId, date) as { slot_payload?: string; computed_at?: string; customers_per_stylist?: number } | undefined;
   if (!row?.slot_payload) return null;
-  const parsed = JSON.parse(row.slot_payload) as { slots: CoverageSlot[] };
-  return { date, slots: parsed.slots, computedAt: row.computed_at as string };
+  const parsed = JSON.parse(row.slot_payload) as {
+    slots: CoverageSlot[];
+    averageDailyAppointments?: number;
+    customersPerStylistForDay?: number;
+    requiredStylists?: number;
+  };
+  const slots = parsed.slots;
+  const customersPerStylistForDay = parsed.customersPerStylistForDay ?? row.customers_per_stylist ?? 10;
+  return {
+    date,
+    slots,
+    computedAt: row.computed_at as string,
+    averageDailyAppointments: parsed.averageDailyAppointments ?? 0,
+    customersPerStylistForDay,
+    requiredStylists: parsed.requiredStylists ?? (slots[0]?.requiredStylists ?? 0),
+  };
 }
 
 export { aggregateLightWindows };

@@ -6,7 +6,9 @@ const baseInputs = (overrides: Partial<CoverageInputs> = {}): CoverageInputs => 
   date: '2026-05-05',
   businessHours: { startsAt: '2026-05-05T09:00:00', endsAt: '2026-05-05T11:00:00' },
   slotMinutes: 30,
-  customersPerStylist: 10,
+  requiredStylists: 0,
+  averageDailyAppointments: 0,
+  customersPerStylistForDay: 10,
   appointments: [],
   scheduled: [],
   ...overrides,
@@ -36,15 +38,18 @@ describe('computeCoverageSlots', () => {
     expect(slots[3].customerCount).toBe(1); // 10:30
   });
 
-  it('computes requiredStylists as ceil(customers / customersPerStylist)', () => {
+  it('applies the precomputed requiredStylists uniformly to every slot', () => {
+    // 68 daily bookings ÷ 10 (weekday ratio) = 7 — applied to every slot.
     const slots = computeCoverageSlots(baseInputs({
-      customersPerStylist: 10,
-      appointments: Array.from({ length: 25 }, (_, i) => ({
-        startsAt: '2026-05-05T09:00:00', endsAt: '2026-05-05T09:30:00', stylistId: `c${i}`,
-      })),
+      requiredStylists: 7,
+      averageDailyAppointments: 68,
+      appointments: [
+        // a single 09:00 booking shouldn't change the required value at any slot
+        { startsAt: '2026-05-05T09:00:00', endsAt: '2026-05-05T09:30:00', stylistId: 'c1' },
+      ],
     }));
-    expect(slots[0].customerCount).toBe(25);
-    expect(slots[0].requiredStylists).toBe(3); // ceil(25/10)
+    for (const slot of slots) expect(slot.requiredStylists).toBe(7);
+    expect(slots[0].customerCount).toBe(1); // slot-level customer count is still surfaced
   });
 
   it('counts distinct scheduled stylists overlapping each slot', () => {
@@ -63,20 +68,23 @@ describe('computeCoverageSlots', () => {
 
   it('flags light=true when scheduledStylists < requiredStylists', () => {
     const slots = computeCoverageSlots(baseInputs({
-      customersPerStylist: 10,
-      appointments: Array.from({ length: 15 }, () => ({
-        startsAt: '2026-05-05T09:00:00', endsAt: '2026-05-05T09:30:00', stylistId: null,
-      })),
+      requiredStylists: 3,
       scheduled: [
         { stylistId: 's1', startsAt: '2026-05-05T09:00:00', endsAt: '2026-05-05T11:00:00' },
+        { stylistId: 's2', startsAt: '2026-05-05T10:00:00', endsAt: '2026-05-05T11:00:00' },
       ],
     }));
-    expect(slots[0].requiredStylists).toBe(2); // ceil(15/10)
+    // 09:00 slot has 1 stylist scheduled, needs 3 → light
     expect(slots[0].scheduledStylists).toBe(1);
     expect(slots[0].light).toBe(true);
-    // Empty slots aren't light (required = 0)
-    expect(slots[2].requiredStylists).toBe(0);
-    expect(slots[2].light).toBe(false);
+    // 10:00 slot has 2 → still light (still under 3)
+    expect(slots[2].scheduledStylists).toBe(2);
+    expect(slots[2].light).toBe(true);
+  });
+
+  it('does not flag light when requiredStylists is 0 (closed / no demand)', () => {
+    const slots = computeCoverageSlots(baseInputs({ requiredStylists: 0 }));
+    for (const s of slots) expect(s.light).toBe(false);
   });
 
   it('handles a slot of size other than 30 min', () => {

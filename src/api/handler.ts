@@ -2313,14 +2313,27 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
 
   if (req.path === '/coverage/sync' && req.method === 'POST') {
     try {
-      const body = (req.body || {}) as { locationId?: string; date?: string; customersPerStylist?: number };
+      const body = (req.body || {}) as {
+        locationId?: string;
+        date?: string;
+        ratios?: { weekday?: number; saturday?: number; sunday?: number };
+        averagingDays?: number;
+      };
       if (!body.locationId || !body.date) return apiError(400, 'BAD_REQUEST', 'locationId and date required');
       const { syncCoverageForLocationDay } = await import('../coverage/sync');
+      const ratios = body.ratios
+        ? {
+            weekday: Number(body.ratios.weekday) || 10,
+            saturday: Number(body.ratios.saturday) || 8,
+            sunday: Number(body.ratios.sunday) || 6,
+          }
+        : undefined;
       const result = await syncCoverageForLocationDay({
         teamId,
         locationId: body.locationId,
         date: body.date,
-        customersPerStylist: body.customersPerStylist,
+        ratios,
+        averagingDays: body.averagingDays,
       });
       return { status: 200, data: result };
     } catch (err: any) {
