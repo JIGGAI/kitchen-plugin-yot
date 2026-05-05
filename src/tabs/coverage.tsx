@@ -91,12 +91,17 @@ import { api, formatDateTime, t } from './common';
           });
         }
         const slotsRes = await api('yot', teamId!, `/coverage/slots?locationId=${encodeURIComponent(locationId)}&date=${date}`) as any;
-        return { locationId, locationName, slots: slotsRes.slots || [], computedAt: slotsRes.computedAt };
+        const slots = slotsRes?.slots || [];
+        // eslint-disable-next-line no-console
+        console.log('[coverage] loaded', locationName, 'slots=', slots.length, 'sample=', slots[0]);
+        return { locationId, locationName, slots, computedAt: slotsRes?.computedAt };
       } catch (e: any) {
         const msg = deepError(e);
         if (msg.includes('NO_COVERAGE_CACHE') && !forceSync) {
           return loadOne(locationId, locationName, true);
         }
+        // eslint-disable-next-line no-console
+        console.warn('[coverage] failed', locationName, msg);
         return { locationId, locationName, slots: [], error: msg };
       }
     }
@@ -215,7 +220,7 @@ import { api, formatDateTime, t } from './common';
         progress ? h('span', { style: { ...t.faint, fontSize: '0.85em' } },
           `${progress.current}/${progress.total}`) : null,
         h('span', { style: { ...t.faint, fontSize: '0.85em' } },
-          'Click a red cell to find cover.'),
+          `[build 16:09 — counts inline] Click a red cell to find cover.`),
       ),
 
       // Error banner
