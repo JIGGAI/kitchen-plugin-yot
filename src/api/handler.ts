@@ -1569,7 +1569,14 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
 
       let rows = db.select().from(schema.clients).where(eq(schema.clients.teamId, teamId)).all() as schema.Client[];
       if (activeFilter !== null) rows = rows.filter((row) => row.active === activeFilter);
-      if (locationFilter) rows = rows.filter((row) => row.sourceLocationId === locationFilter);
+      if (locationFilter) {
+        // Match clients with at least one appointment at this location, mirroring
+        // the popup's `relationships.uniqueClientCount`. The previous `sourceLocationId`
+        // filter under-counted because YOT's home-location field is sparsely populated.
+        const appointments = db.select().from(schema.appointments).where(eq(schema.appointments.teamId, teamId)).all() as schema.Appointment[];
+        const allowedClientIds = new Set(appointments.filter((row) => row.clientId && row.locationId === locationFilter).map((row) => row.clientId as string));
+        rows = rows.filter((row) => allowedClientIds.has(row.id));
+      }
       if (clientFilter) rows = rows.filter((row) => row.id === clientFilter || row.privateId === clientFilter);
       if (stylistFilter) {
         const appointments = db.select().from(schema.appointments).where(eq(schema.appointments.teamId, teamId)).all() as schema.Appointment[];
