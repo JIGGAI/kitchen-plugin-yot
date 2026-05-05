@@ -73,6 +73,12 @@
         "bundle": "./dist/tabs/appointments.js"
       },
       {
+        "id": "coverage",
+        "label": "Coverage",
+        "icon": "clock",
+        "bundle": "./dist/tabs/coverage.js"
+      },
+      {
         "id": "sync-runs",
         "label": "Sync Runs",
         "icon": "clock",
