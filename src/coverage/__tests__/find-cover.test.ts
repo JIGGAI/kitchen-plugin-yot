@@ -51,13 +51,18 @@ describe('findStaffAvailable', () => {
     expect(out.find((o) => o.stylistId === 's1')).toBeUndefined();
   });
 
-  it('drops a rostered-today stylist with no overlap with the requested window', () => {
+  it('includes a rostered-today stylist whose shift does NOT overlap the window (could come in)', () => {
     const out = findStaffAvailable(baseInputs({
       pool: 'cross',
       scheduled: [{ stylistId: 's1', startsAt: '2026-05-05T13:00:00', endsAt: '2026-05-05T17:00:00' }],
     }));
-    // s1's shift starts after the requested window ends; should be dropped.
-    expect(out.find((o) => o.stylistId === 's1')).toBeUndefined();
+    // s1's shift is 13:00–17:00; requested window 09:30–11:00. They have no
+    // appointment in the window so they're "available to take the shift".
+    const s1 = out.find((o) => o.stylistId === 's1');
+    expect(s1).toBeDefined();
+    expect(s1!.rosteredToday).toBe(true);
+    expect(s1!.gapStart).toBe('2026-05-05T09:30:00');
+    expect(s1!.gapEnd).toBe('2026-05-05T11:00:00');
   });
 
   it('includes non-rostered staff in the cross pool', () => {

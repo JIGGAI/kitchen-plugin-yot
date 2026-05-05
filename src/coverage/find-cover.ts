@@ -76,9 +76,9 @@ export function findStaffAvailable(input: FindCoverInputs): CoverCandidate[] {
     let gapStart: string;
     let gapEnd: string;
 
-    if (myRoster.length > 0) {
-      const overlappingShifts = myRoster.filter((r) => overlaps(r, requestedWindow));
-      if (overlappingShifts.length === 0) continue; // rostered today, but not for this window
+    const overlappingShifts = myRoster.filter((r) => overlaps(r, requestedWindow));
+    if (overlappingShifts.length > 0) {
+      // On-shift during the window — gap is roster-clipped-to-window.
       // Choose the largest overlap so a split shift doesn't accidentally exclude us.
       const seg = overlappingShifts.reduce((best, r) => {
         const candStart = maxIso(r.startsAt, input.from);
@@ -92,7 +92,9 @@ export function findStaffAvailable(input: FindCoverInputs): CoverCandidate[] {
       gapStart = maxIso(seg.startsAt, input.from);
       gapEnd = minIso(seg.endsAt, input.to);
     } else {
-      // Not rostered today — treat as fully free across the requested window.
+      // Either (a) not rostered today, or (b) rostered today but not at this
+      // time. In both cases the stylist has no appointment in the window
+      // (filtered above), so they could come in to cover. Gap = requested window.
       gapStart = input.from;
       gapEnd = input.to;
     }
