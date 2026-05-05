@@ -176,7 +176,9 @@ export async function syncCoverageForLocationDay(opts: SyncCoverageOptions): Pro
   let requestedRatio = ratios.weekday;
   for (const date of datesInWeek) {
     const customersPerStylistForDay = ratioForDate(date, ratios);
-    const requiredStylists = Math.ceil(avgDaily / customersPerStylistForDay);
+    // Round-to-nearest, not ceil. Per HMX rule: 40–44 cuts → 4 stylists,
+    // 45–54 → 5, 55–64 → 6 etc. (next stylist added at the .5 boundary).
+    const requiredStylists = Math.round(avgDaily / customersPerStylistForDay);
     const businessHours = resolveBusinessHoursForDate(date, schedule);
     if (!businessHours) {
       // Store closed: persist empty slot table so the API returns a clean 200.
