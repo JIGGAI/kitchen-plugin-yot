@@ -1,4 +1,4 @@
-import { api, formatDateTime, t } from './common';
+import { api, formatDateTime, modal, t } from './common';
 
 (function () {
   const R = (window as any).React;
@@ -89,7 +89,7 @@ import { api, formatDateTime, t } from './common';
     const [selected, setSelected] = useState(null as SelectedCell);
     const [candidates, setCandidates] = useState([] as Candidate[]);
     const [serviceMinutes, setServiceMinutes] = useState(60);
-    const [pool, setPool] = useState('cross' as 'cross' | 'same');
+    const [pool, setPool] = useState('same' as 'cross' | 'same');
     const [findingCover, setFindingCover] = useState(false);
     const [showSettings, setShowSettings] = useState(false);
     const [showInactive, setShowInactive] = useState(false);
@@ -352,65 +352,59 @@ import { api, formatDateTime, t } from './common';
         ? h('div', { style: t.faint }, 'Pick a date and click Refresh to load coverage.')
         : null),
 
-      // Find-cover panel
-      selected ? h('div', {
-        style: { padding: '0.75rem', border: '1px solid #555', borderRadius: '4px', background: 'rgba(80,80,120,0.1)' },
-      },
-        h('div', { style: { display: 'flex', alignItems: 'center', gap: '1rem', marginBottom: '0.5rem', flexWrap: 'wrap' } },
-          h('strong', null, `${selected.locationName} • ${hhmm(selected.slot.startsAt)}–${hhmm(selected.slot.endsAt)} • need ${selected.slot.requiredStylists}, have ${selected.slot.scheduledStylists}`),
-          h('label', null, 'Min minutes: ',
-            h('input', {
-              type: 'number',
-              value: serviceMinutes,
-              min: 0,
-              step: 15,
-              onChange: (e: any) => setServiceMinutes(Number(e.target.value) || 0),
-              style: { ...t.input, width: '5rem' },
-            }),
-          ),
-          h('label', null, 'Pool: ',
-            h('select', {
-              value: pool,
-              onChange: (e: any) => setPool(e.target.value),
-              style: t.input,
-            },
-              h('option', { value: 'cross' }, 'Cross-location'),
-              h('option', { value: 'same' }, 'Same location'),
+      // Find-cover modal
+      selected ? modal(h, {
+        title: `Find cover · ${selected.locationName}`,
+        subtitle: `${hhmm(selected.slot.startsAt)}–${hhmm(selected.slot.endsAt)} · need ${selected.slot.requiredStylists}, have ${selected.slot.scheduledStylists}`,
+        onClose: () => { setSelected(null); setCandidates([]); },
+        children: h('div', { style: { display: 'flex', flexDirection: 'column', gap: '1rem' } },
+          h('div', { style: { display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap' } },
+            h('label', null, 'Min minutes: ',
+              h('input', {
+                type: 'number', value: serviceMinutes, min: 0, step: 15,
+                onChange: (e: any) => setServiceMinutes(Number(e.target.value) || 0),
+                style: { ...t.input, width: '5rem' },
+              }),
             ),
+            h('label', null, 'Pool: ',
+              h('select', {
+                value: pool,
+                onChange: (e: any) => setPool(e.target.value as 'cross' | 'same'),
+                style: t.input,
+              },
+                h('option', { value: 'same' }, 'Same location'),
+                h('option', { value: 'cross' }, 'Cross-location'),
+              ),
+            ),
+            h('button', {
+              type: 'button',
+              onClick: () => void findCover({ locationId: selected.locationId, locationName: selected.locationName }, selected.slot),
+              disabled: findingCover,
+              style: t.btnPrimary,
+            }, findingCover ? 'Searching…' : 'Re-search'),
           ),
-          h('button', {
-            type: 'button',
-            onClick: () => void findCover({ locationId: selected.locationId, locationName: selected.locationName }, selected.slot),
-            disabled: findingCover,
-            style: t.btnPrimary,
-          }, findingCover ? 'Searching…' : 'Re-search'),
-          h('button', {
-            type: 'button',
-            onClick: () => { setSelected(null); setCandidates([]); },
-            style: t.btnGhost,
-          }, 'Close'),
+          candidates.length === 0 && !findingCover
+            ? h('div', { style: { ...t.faint, fontStyle: 'italic' } }, 'No candidates found for this window.')
+            : candidates.length > 0
+              ? h('table', { style: t.table },
+                  h('thead', null, h('tr', null,
+                    ['Name', 'Home', 'Free', 'Rostered', 'Qualified', 'Last worked here'].map((c) => h('th', { key: c, style: t.th }, c)),
+                  )),
+                  h('tbody', null, ...candidates.map((c) => {
+                    const homeName = locations.find((l) => l.id === c.homeLocationId)?.name || c.homeLocationId || '—';
+                    return h('tr', { key: c.stylistId },
+                      h('td', { style: t.td }, c.name),
+                      h('td', { style: t.td }, homeName),
+                      h('td', { style: t.td }, `${hhmm(c.gapStart)}–${hhmm(c.gapEnd)} (${c.gapMinutes}m)`),
+                      h('td', { style: t.td }, c.rosteredToday ? '✓' : '—'),
+                      h('td', { style: t.td }, c.qualifiedHere ? '✓' : '—'),
+                      h('td', { style: t.td }, c.lastWorkedHereAt ? formatDateTime(c.lastWorkedHereAt) : '—'),
+                    );
+                  })),
+                )
+              : null,
         ),
-        candidates.length === 0 && !findingCover
-          ? h('div', { style: { ...t.faint, fontStyle: 'italic' } }, 'No candidates found for this window.')
-          : candidates.length > 0
-            ? h('table', { style: t.table },
-                h('thead', null, h('tr', null,
-                  ['Name', 'Home', 'Free', 'Rostered', 'Qualified', 'Last worked here'].map((c) => h('th', { key: c, style: t.th }, c)),
-                )),
-                h('tbody', null, ...candidates.map((c) => {
-                  const homeName = locations.find((l) => l.id === c.homeLocationId)?.name || c.homeLocationId || '—';
-                  return h('tr', { key: c.stylistId },
-                    h('td', { style: t.td }, c.name),
-                    h('td', { style: t.td }, homeName),
-                    h('td', { style: t.td }, `${hhmm(c.gapStart)}–${hhmm(c.gapEnd)} (${c.gapMinutes}m)`),
-                    h('td', { style: t.td }, c.rosteredToday ? '✓' : '—'),
-                    h('td', { style: t.td }, c.qualifiedHere ? '✓' : '—'),
-                    h('td', { style: t.td }, c.lastWorkedHereAt ? formatDateTime(c.lastWorkedHereAt) : '—'),
-                  );
-                })),
-              )
-            : null,
-      ) : null,
+      }) : null,
     );
   }
 
