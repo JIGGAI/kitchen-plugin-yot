@@ -126,6 +126,11 @@ import { api, formatDateTime, t } from './common';
           };
         }
         const slotsRes = await api('yot', teamId!, `/coverage/slots?locationId=${encodeURIComponent(locationId)}&date=${date}`) as any;
+        // Cached row from a pre-daily-avg deploy (no averageDailyAppointments
+        // in the payload). Trigger a fresh sync so the new math takes effect.
+        if (!slotsRes || typeof slotsRes.averageDailyAppointments !== 'number') {
+          return loadOne(locationId, locationName, true);
+        }
         return {
           locationId, locationName,
           slots: slotsRes?.slots || [],
