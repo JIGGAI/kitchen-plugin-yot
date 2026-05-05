@@ -279,31 +279,65 @@ function clampDays(value: number, fallback: number, max = 366): number {
 }
 
 /**
- * Compute a self-healing date range for a date-windowed sync. Reads
- * sync_state.last_success_at for the resource, returns a window from
- * (lastSuccess + 1 buffer day) through yesterday. First-run fallback
- * uses `fallbackDays` (default 30). Caller is responsible for clamping
- * lookback to a maximum if needed.
+ * Compute a self-healing date range for a date-windowed sync. Queries the
+ * actual cache table for MAX(date_column) per resource — that's the true
+ * "data through" date, not a sync timestamp. Returns a window from that
+ * date through yesterday (inclusive on both ends; re-syncing the boundary
+ * day is safe due to upsert and catches partial-day gaps).
+ *
+ * Why not use sync_state.last_success_at? That records when a sync FINISHED,
+ * not what date range the sync COVERED. A sync at 02:00 yesterday that only
+ * pulled "yesterday's data" updates last_success_at to yesterday — but if
+ * the prior week's syncs all failed silently, the real cache gap goes back
+ * much further. Querying the data directly is the truth.
+ *
+ * First-run fallback (table empty) uses `fallbackDays` (default 30).
  */
 function autoResumeRange(teamId: string, resource: string, fallbackDays = 30) {
   const { db } = initializeDatabase(teamId);
   const yesterday = addDaysToDateOnly(dateOnlyNow(), -1);
-  const row = db.select().from(schema.syncState)
-    .where(and(eq(schema.syncState.teamId, teamId), eq(schema.syncState.resource, resource)))
-    .all()[0] as any;
-  if (row?.lastSuccessAt) {
-    const ms = Date.parse(String(row.lastSuccessAt));
-    if (Number.isFinite(ms)) {
-      const daysSince = Math.max(1, Math.ceil((Date.now() - ms) / 86400000));
-      const lookbackDays = Math.min(daysSince + 1, 365);
-      return {
-        startDate: addDaysToDateOnly(yesterday, -(lookbackDays - 1)),
-        endDate: yesterday,
-        lookbackDays,
-        mode: 'auto-resume' as const,
-      };
+  const todayEnd = `${dateOnlyNow()}T23:59:59`;
+
+  let maxDate: string | null = null;
+  try {
+    const stmt = (() => {
+      switch (resource) {
+        case 'revenue_facts':
+          return sql`SELECT MAX(date) AS d FROM revenue_facts WHERE team_id = ${teamId}`;
+        case 'staff_cashout_facts':
+          return sql`SELECT MAX(date) AS d FROM staff_cashout_facts WHERE team_id = ${teamId}`;
+        case 'promotion_usage':
+          return sql`SELECT MAX(SUBSTR(used_at, 1, 10)) AS d FROM promotion_usage WHERE team_id = ${teamId}`;
+        case 'appointments':
+          // Clamp to today's end so future bookings don't fool us into thinking we're already current
+          return sql`SELECT MAX(SUBSTR(COALESCE(start_at, starts_at), 1, 10)) AS d
+                     FROM appointments
+                     WHERE team_id = ${teamId} AND COALESCE(start_at, starts_at) <= ${todayEnd}`;
+        default:
+          return null;
+      }
+    })();
+    if (stmt) {
+      const row = db.all(stmt)[0] as any;
+      const candidate = row?.d ? String(row.d).slice(0, 10) : null;
+      if (candidate && /^\d{4}-\d{2}-\d{2}$/.test(candidate)) maxDate = candidate;
     }
+  } catch { /* fall through to first-run */ }
+
+  if (maxDate) {
+    // Already current (rare): the cache holds yesterday's data, so just re-sync yesterday as a no-op safety
+    if (maxDate >= yesterday) {
+      return { startDate: yesterday, endDate: yesterday, lookbackDays: 1, mode: 'current' as const };
+    }
+    // Resume from maxDate (re-sync the boundary day — safe due to upsert) through yesterday
+    const lookbackDays = Math.min(
+      Math.ceil((Date.parse(`${yesterday}T00:00:00Z`) - Date.parse(`${maxDate}T00:00:00Z`)) / 86400000) + 1,
+      365
+    );
+    return { startDate: maxDate, endDate: yesterday, lookbackDays, mode: 'data-resume' as const };
   }
+
+  // First run / empty table: backfill the last N days
   return {
     startDate: addDaysToDateOnly(yesterday, -(fallbackDays - 1)),
     endDate: yesterday,
