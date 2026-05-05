@@ -23,6 +23,25 @@ import { api, boolLabel, describeFreshness, fmtNumber, formatDateTime, t } from 
     syncState: SyncStateRow[];
   };
 
+  type SyncJob = { key: string; label: string; resource: string; buildPath: () => string };
+
+  const dateMinus = (n: number) => {
+    const d = new Date();
+    d.setDate(d.getDate() - n);
+    return d.toISOString().slice(0, 10);
+  };
+
+  const SYNC_JOBS: SyncJob[] = [
+    { key: 'locations', label: 'Locations', resource: 'locations', buildPath: () => '/locations/sync' },
+    { key: 'clients', label: 'Clients (full)', resource: 'clients', buildPath: () => '/clients/sync' },
+    { key: 'stylists', label: 'Stylists', resource: 'stylists', buildPath: () => '/stylists/sync' },
+    { key: 'services', label: 'Services', resource: 'services', buildPath: () => '/services/sync' },
+    { key: 'appointments', label: 'Appointments — last 24 hours', resource: 'appointments', buildPath: () => '/appointments/sync?lookbackDays=1' },
+    { key: 'revenue-yesterday', label: 'Revenue facts — yesterday', resource: 'revenue_facts', buildPath: () => '/revenue/sync?days=1' },
+    { key: 'staff-cashout-yesterday', label: 'Staff cashout — yesterday', resource: 'staff_cashout_facts', buildPath: () => `/staff-cashout/sync?startDate=${dateMinus(1)}&endDate=${dateMinus(1)}` },
+    { key: 'promotion-usage-yesterday', label: 'Promotion usage — yesterday', resource: 'promotion_usage', buildPath: () => `/promotion-usage/sync?startDate=${dateMinus(1)}&endDate=${dateMinus(1)}` }
+  ];
+
   function Overview(props: any) {
     const teamId = typeof props?.teamId === 'string' && props.teamId.trim() ? props.teamId.trim() : null;
     const [health, setHealth] = useState(null as Health | null);
@@ -30,6 +49,7 @@ import { api, boolLabel, describeFreshness, fmtNumber, formatDateTime, t } from 
     const [loading, setLoading] = useState(true);
     const [message, setMessage] = useState(null as string | null);
     const [error, setError] = useState(null as string | null);
+    const [selectedJobKey, setSelectedJobKey] = useState(SYNC_JOBS[0].key);
 
     const load = async () => {
       if (!teamId) return;
@@ -111,13 +131,23 @@ import { api, boolLabel, describeFreshness, fmtNumber, formatDateTime, t } from 
             h('div', { className: 'mt-1 text-sm font-medium', style: t.text }, String(value))
           ))
         ),
-        h('div', { className: 'mt-3 flex flex-wrap gap-2' },
-          h('button', { type: 'button', style: t.btnPrimary, disabled: !!busy || !health?.yotConfigured, onClick: () => void runAction('locations', 'Locations sync', '/locations/sync') }, busy === 'locations' ? 'Syncing…' : 'Sync locations'),
-          h('button', { type: 'button', style: t.btnGhost, disabled: !!busy || !health?.yotConfigured, onClick: () => void runAction('clients', 'Limited client sync', '/clients/sync?maxPages=5') }, busy === 'clients' ? 'Syncing…' : 'Limited client sync'),
-          h('button', { type: 'button', style: t.btnGhost, disabled: !!busy || !health?.yotConfigured, onClick: () => void runAction('stylists', 'Stylists sync', '/stylists/sync') }, busy === 'stylists' ? 'Syncing…' : 'Sync stylists'),
-          h('button', { type: 'button', style: t.btnGhost, disabled: !!busy || !health?.yotConfigured, onClick: () => void runAction('services', 'Services sync', '/services/sync') }, busy === 'services' ? 'Syncing…' : 'Sync services'),
-          h('button', { type: 'button', style: t.btnGhost, disabled: !!busy || !health?.yotConfigured, onClick: () => void runAction('appointments', 'Appointments sync', '/appointments/sync?lookbackDays=30') }, busy === 'appointments' ? 'Syncing…' : 'Sync appointments (30d)'),
-          h('button', { type: 'button', style: t.btnGhost, disabled: !!busy || !health?.yotConfigured, onClick: () => void runAction('revenue-yesterday', 'Revenue sync (yesterday)', '/revenue/sync?days=1') }, busy === 'revenue-yesterday' ? 'Syncing…' : 'Sync revenue (yesterday)'),
+        h('div', { className: 'mt-3 flex flex-wrap items-center gap-2' },
+          h('select', {
+            style: { ...t.btnGhost, padding: '0.4rem 0.6rem' },
+            value: selectedJobKey,
+            disabled: !!busy || !health?.yotConfigured,
+            onChange: (e: any) => setSelectedJobKey(e.target.value)
+          }, ...SYNC_JOBS.map((job) => h('option', { key: job.key, value: job.key }, job.label))),
+          h('button', {
+            type: 'button',
+            style: t.btnPrimary,
+            disabled: !!busy || !health?.yotConfigured,
+            onClick: () => {
+              const job = SYNC_JOBS.find((j) => j.key === selectedJobKey);
+              if (!job) return;
+              void runAction(job.key, `${job.label} sync`, job.buildPath());
+            }
+          }, busy && busy !== 'export' ? `Syncing ${(SYNC_JOBS.find((j) => j.key === busy) || {} as any).label || busy}…` : 'Sync now'),
           h('button', { type: 'button', style: t.btnGhost, disabled: !!busy, onClick: () => void runAction('export', 'Export snapshot', '/export') }, busy === 'export' ? 'Exporting…' : 'Export snapshot')
         )
       ),
@@ -137,14 +167,18 @@ import { api, boolLabel, describeFreshness, fmtNumber, formatDateTime, t } from 
                 )),
                 h('tbody', null,
                   ...summaryRows.map((row: SyncStateRow) => {
+                    const busyJob = busy ? SYNC_JOBS.find((j) => j.key === busy) : null;
+                    const isInProgress = !!busyJob && busyJob.resource === row.resource;
                     const freshness = describeFreshness(row);
                     return h('tr', { key: row.resource },
                       h('td', { style: t.td }, row.resource),
-                      h('td', { style: t.td }, h('span', { style: t.badge(freshness.color) }, freshness.label)),
+                      h('td', { style: t.td }, isInProgress
+                        ? h('span', { style: t.badge('rgba(251,191,36,0.75)') }, 'In progress')
+                        : h('span', { style: t.badge(freshness.color) }, freshness.label)),
                       h('td', { style: t.td }, fmtNumber(row.rowCount)),
                       h('td', { style: t.td }, formatDateTime(row.lastSuccessAt)),
                       h('td', { style: t.td }, formatDateTime(row.lastSyncedAt)),
-                      h('td', { style: { ...t.td, ...(freshness.tone === 'error' ? t.danger : freshness.tone === 'stale' || freshness.tone === 'aging' ? t.warning : t.faint) } }, freshness.detail)
+                      h('td', { style: { ...t.td, ...(isInProgress ? t.warning : freshness.tone === 'error' ? t.danger : freshness.tone === 'stale' || freshness.tone === 'aging' ? t.warning : t.faint) } }, isInProgress ? `Syncing ${row.resource} now…` : freshness.detail)
                     );
                   })
                 )

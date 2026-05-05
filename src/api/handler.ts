@@ -278,6 +278,74 @@ function clampDays(value: number, fallback: number, max = 366): number {
   return Math.max(1, Math.min(Math.trunc(value), max));
 }
 
+/**
+ * Compute a self-healing date range for a date-windowed sync. Queries the
+ * actual cache table for MAX(date_column) per resource — that's the true
+ * "data through" date, not a sync timestamp. Returns a window from that
+ * date through yesterday (inclusive on both ends; re-syncing the boundary
+ * day is safe due to upsert and catches partial-day gaps).
+ *
+ * Why not use sync_state.last_success_at? That records when a sync FINISHED,
+ * not what date range the sync COVERED. A sync at 02:00 yesterday that only
+ * pulled "yesterday's data" updates last_success_at to yesterday — but if
+ * the prior week's syncs all failed silently, the real cache gap goes back
+ * much further. Querying the data directly is the truth.
+ *
+ * First-run fallback (table empty) uses `fallbackDays` (default 30).
+ */
+function autoResumeRange(teamId: string, resource: string, fallbackDays = 30) {
+  const { db } = initializeDatabase(teamId);
+  const yesterday = addDaysToDateOnly(dateOnlyNow(), -1);
+  const todayEnd = `${dateOnlyNow()}T23:59:59`;
+
+  let maxDate: string | null = null;
+  try {
+    const stmt = (() => {
+      switch (resource) {
+        case 'revenue_facts':
+          return sql`SELECT MAX(date) AS d FROM revenue_facts WHERE team_id = ${teamId}`;
+        case 'staff_cashout_facts':
+          return sql`SELECT MAX(date) AS d FROM staff_cashout_facts WHERE team_id = ${teamId}`;
+        case 'promotion_usage':
+          return sql`SELECT MAX(SUBSTR(used_at, 1, 10)) AS d FROM promotion_usage WHERE team_id = ${teamId}`;
+        case 'appointments':
+          // Clamp to today's end so future bookings don't fool us into thinking we're already current
+          return sql`SELECT MAX(SUBSTR(COALESCE(start_at, starts_at), 1, 10)) AS d
+                     FROM appointments
+                     WHERE team_id = ${teamId} AND COALESCE(start_at, starts_at) <= ${todayEnd}`;
+        default:
+          return null;
+      }
+    })();
+    if (stmt) {
+      const row = db.all(stmt)[0] as any;
+      const candidate = row?.d ? String(row.d).slice(0, 10) : null;
+      if (candidate && /^\d{4}-\d{2}-\d{2}$/.test(candidate)) maxDate = candidate;
+    }
+  } catch { /* fall through to first-run */ }
+
+  if (maxDate) {
+    // Already current (rare): the cache holds yesterday's data, so just re-sync yesterday as a no-op safety
+    if (maxDate >= yesterday) {
+      return { startDate: yesterday, endDate: yesterday, lookbackDays: 1, mode: 'current' as const };
+    }
+    // Resume from maxDate (re-sync the boundary day — safe due to upsert) through yesterday
+    const lookbackDays = Math.min(
+      Math.ceil((Date.parse(`${yesterday}T00:00:00Z`) - Date.parse(`${maxDate}T00:00:00Z`)) / 86400000) + 1,
+      365
+    );
+    return { startDate: maxDate, endDate: yesterday, lookbackDays, mode: 'data-resume' as const };
+  }
+
+  // First run / empty table: backfill the last N days
+  return {
+    startDate: addDaysToDateOnly(yesterday, -(fallbackDays - 1)),
+    endDate: yesterday,
+    lookbackDays: fallbackDays,
+    mode: 'first-run' as const,
+  };
+}
+
 function resolveRevenueDateRange(rows: RevenueFactRow[], requestedStart: string | null, requestedEnd: string | null) {
   const dates = rows.map((row) => row.date).filter(Boolean).sort();
   const minDate = dates[0] || null;
@@ -1257,11 +1325,21 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     try {
       const requestedStart = toDateOnlyInput(req.query.startDate || req.query.dateFrom || req.query.start);
       const requestedEnd = toDateOnlyInput(req.query.endDate || req.query.dateTo || req.query.end);
-      const days = clampDays(parseInt(req.query.days || '1', 10), 1);
-      const includeToday = parseBooleanFilter(req.query.includeToday) === true;
-      const anchorEnd = includeToday ? dateOnlyNow() : addDaysToDateOnly(dateOnlyNow(), -1);
-      const endDate = requestedEnd || anchorEnd;
-      const startDate = requestedStart || addDaysToDateOnly(endDate, -(days - 1));
+      const explicitDays = req.query.days != null;
+      const noExplicit = !requestedStart && !requestedEnd && !explicitDays;
+      let startDate: string;
+      let endDate: string;
+      if (noExplicit) {
+        const auto = autoResumeRange(teamId, 'revenue_facts');
+        startDate = auto.startDate;
+        endDate = auto.endDate;
+      } else {
+        const days = clampDays(parseInt(req.query.days || '1', 10), 1);
+        const includeToday = parseBooleanFilter(req.query.includeToday) === true;
+        const anchorEnd = includeToday ? dateOnlyNow() : addDaysToDateOnly(dateOnlyNow(), -1);
+        endDate = requestedEnd || anchorEnd;
+        startDate = requestedStart || addDaysToDateOnly(endDate, -(days - 1));
+      }
       const organisationId = Number(cleanString(req.query.organisationId || req.query.org) || String(DEFAULT_REVENUE_ORGANISATION_ID));
       if (!Number.isFinite(organisationId)) return apiError(400, 'BAD_REQUEST', 'organisationId must be a number');
       const locationIdText = cleanString(req.query.locationId || req.query.location);
@@ -1325,11 +1403,21 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     try {
       const requestedStart = toDateOnlyInput(req.query.startDate || req.query.dateFrom || req.query.start);
       const requestedEnd = toDateOnlyInput(req.query.endDate || req.query.dateTo || req.query.end);
-      const days = clampDays(parseInt(req.query.days || '1', 10), 1);
-      const includeToday = parseBooleanFilter(req.query.includeToday) === true;
-      const anchorEnd = includeToday ? dateOnlyNow() : addDaysToDateOnly(dateOnlyNow(), -1);
-      const endDate = requestedEnd || anchorEnd;
-      const startDate = requestedStart || addDaysToDateOnly(endDate, -(days - 1));
+      const explicitDays = req.query.days != null;
+      const noExplicit = !requestedStart && !requestedEnd && !explicitDays;
+      let startDate: string;
+      let endDate: string;
+      if (noExplicit) {
+        const auto = autoResumeRange(teamId, 'promotion_usage');
+        startDate = auto.startDate;
+        endDate = auto.endDate;
+      } else {
+        const days = clampDays(parseInt(req.query.days || '1', 10), 1);
+        const includeToday = parseBooleanFilter(req.query.includeToday) === true;
+        const anchorEnd = includeToday ? dateOnlyNow() : addDaysToDateOnly(dateOnlyNow(), -1);
+        endDate = requestedEnd || anchorEnd;
+        startDate = requestedStart || addDaysToDateOnly(endDate, -(days - 1));
+      }
       const locationIdText = cleanString(req.query.locationId || req.query.location);
       const staffIdText = cleanString(req.query.staffId || req.query.staff);
       const locationId = locationIdText ? Number(locationIdText) : null;
@@ -1379,9 +1467,18 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     try {
       const requestedStart = toDateOnlyInput(req.query.startDate || req.query.dateFrom || req.query.start || req.query.date);
       const requestedEnd = toDateOnlyInput(req.query.endDate || req.query.dateTo || req.query.end || req.query.date);
-      const anchorEnd = addDaysToDateOnly(dateOnlyNow(), -1);
-      const endDate = requestedEnd || anchorEnd;
-      const startDate = requestedStart || endDate;
+      const noExplicit = !requestedStart && !requestedEnd;
+      let startDate: string;
+      let endDate: string;
+      if (noExplicit) {
+        const auto = autoResumeRange(teamId, 'staff_cashout_facts');
+        startDate = auto.startDate;
+        endDate = auto.endDate;
+      } else {
+        const anchorEnd = addDaysToDateOnly(dateOnlyNow(), -1);
+        endDate = requestedEnd || anchorEnd;
+        startDate = requestedStart || endDate;
+      }
       const locationIdText = cleanString(req.query.locationId || req.query.location);
       const staffIdText = cleanString(req.query.staffId || req.query.staff);
       const locationId = locationIdText ? Number(locationIdText) : null;
@@ -1949,10 +2046,13 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
 
     const startedAt = new Date().toISOString();
     const runId = randomUUID();
-    const lookbackDays = Math.max(1, Math.min(parseInt(req.query.lookbackDays || '30', 10) || 30, 365));
+    const explicitLookback = req.query.lookbackDays != null;
+    const lookbackDays = explicitLookback
+      ? Math.max(1, Math.min(parseInt(req.query.lookbackDays || '30', 10) || 30, 365))
+      : autoResumeRange(teamId, 'appointments').lookbackDays;
     try {
       const { db } = initializeDatabase(teamId);
-      db.insert(schema.syncRuns).values({ id: runId, teamId, resource: 'appointments', status: 'running', startedAt, notes: `lookbackDays=${lookbackDays}` }).run();
+      db.insert(schema.syncRuns).values({ id: runId, teamId, resource: 'appointments', status: 'running', startedAt, notes: `lookbackDays=${lookbackDays}${explicitLookback ? '' : ' (auto-resume)'}` }).run();
       const locations = await fetchLocations(config);
       const activeLocations = locations.filter((item) => item?.id != null && item?.active !== false);
       const now = new Date().toISOString();
