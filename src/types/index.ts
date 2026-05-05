@@ -4,6 +4,15 @@
 export interface YotConfig {
   apiKey: string;
   baseUrl?: string;  // defaults to https://api2.youreontime.com
+  /**
+   * Cookie header value for the YOT MVC web app at https://app.youreontime.com.
+   * Required for endpoints that don't accept the API key (e.g. the staff
+   * roster page). Captured from a logged-in browser session via devtools.
+   * Refreshed manually when YOT expires the session.
+   */
+  mvcCookie?: string;
+  /** Defaults to https://app.youreontime.com */
+  mvcBaseUrl?: string;
 }
 
 export interface ClientRecord {
