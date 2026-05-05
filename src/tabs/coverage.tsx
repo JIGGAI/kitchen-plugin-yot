@@ -91,7 +91,7 @@ import { api, formatDateTime, t } from './common';
           });
         }
         const slotsRes = await api('yot', teamId!, `/coverage/slots?locationId=${encodeURIComponent(locationId)}&date=${date}`) as any;
-        return { locationId, locationName, slots: slotsRes.data.slots || [], computedAt: slotsRes.data.computedAt };
+        return { locationId, locationName, slots: slotsRes.slots || [], computedAt: slotsRes.computedAt };
       } catch (e: any) {
         const msg = deepError(e);
         if (msg.includes('NO_COVERAGE_CACHE') && !forceSync) {
@@ -136,7 +136,7 @@ import { api, formatDateTime, t } from './common';
       try {
         const res = await api('yot', teamId,
           `/coverage/staff-available?locationId=${encodeURIComponent(loc.locationId)}&from=${encodeURIComponent(slot.startsAt)}&to=${encodeURIComponent(slot.endsAt)}&serviceMinutes=${serviceMinutes}&pool=${pool}`) as any;
-        setCandidates(res.data.candidates || []);
+        setCandidates(res.candidates || []);
       } catch (e: any) {
         setError(deepError(e));
       } finally {
