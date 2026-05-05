@@ -92,11 +92,23 @@ import { api, formatDateTime, t } from './common';
     const [pool, setPool] = useState('cross' as 'cross' | 'same');
     const [findingCover, setFindingCover] = useState(false);
     const [showSettings, setShowSettings] = useState(false);
+    const [showInactive, setShowInactive] = useState(false);
     const initialSettings = loadSettings();
     const [ratios, setRatios] = useState(initialSettings.ratios);
     const [averagingDays, setAveragingDays] = useState(initialSettings.averagingDays);
 
     useEffect(() => { saveSettings({ ratios, averagingDays }); }, [ratios, averagingDays]);
+
+    // A row is "inactive" when YOT has the location on its master list but
+    // there's no booking history AND nobody is rostered that day. Typical
+    // YOT data hygiene: same physical store appears 2-3 times in the master
+    // list with subtle name variations; only one record is the live one.
+    function isRowInactive(row: LocationRow): boolean {
+      if (typeof row.averageDailyAppointments !== 'number') return false; // not loaded yet
+      const hasAppointments = (row.averageDailyAppointments || 0) > 0;
+      const hasRostered = row.slots.some((s) => (s.scheduledStylists || 0) > 0);
+      return !hasAppointments && !hasRostered;
+    }
 
     useEffect(() => {
       if (!teamId) return;
@@ -193,16 +205,21 @@ import { api, formatDateTime, t } from './common';
       }
     }
 
-    const columns = useMemo(() => unifySlotGrid(rows), [rows]);
+    const visibleRows = useMemo(
+      () => showInactive ? rows : rows.filter((r) => !isRowInactive(r)),
+      [rows, showInactive],
+    );
+    const inactiveCount = useMemo(() => rows.filter(isRowInactive).length, [rows]);
+    const columns = useMemo(() => unifySlotGrid(visibleRows), [visibleRows]);
     const slotMap = useMemo(() => {
       const map = new Map<string, Map<string, Slot>>();
-      for (const row of rows) {
+      for (const row of visibleRows) {
         const inner = new Map<string, Slot>();
         for (const s of row.slots) inner.set(s.startsAt, s);
         map.set(row.locationId, inner);
       }
       return map;
-    }, [rows]);
+    }, [visibleRows]);
 
     // ===== render =====
     const headerCellStyle = { ...t.th, padding: '0.25rem 0.4rem', fontSize: '0.75rem', whiteSpace: 'nowrap' as const };
@@ -268,6 +285,14 @@ import { api, formatDateTime, t } from './common';
           onClick: () => setShowSettings(!showSettings),
           style: t.btnGhost,
         }, showSettings ? 'Hide settings' : 'Settings'),
+        inactiveCount > 0
+          ? h('button', {
+              type: 'button',
+              onClick: () => setShowInactive(!showInactive),
+              style: t.btnGhost,
+              title: 'YOT often keeps duplicate location records — these have no bookings and no rostered staff.',
+            }, showInactive ? `Hide ${inactiveCount} inactive` : `Show ${inactiveCount} inactive`)
+          : null,
         h('span', { style: { ...t.faint, fontSize: '0.85em' } },
           'Click a red cell to find cover.'),
       ),
@@ -308,7 +333,7 @@ import { api, formatDateTime, t } from './common';
             ),
           ),
           h('tbody', null,
-            ...rows.map((row) => h('tr', { key: row.locationId },
+            ...visibleRows.map((row) => h('tr', { key: row.locationId },
               h('td', { style: locCellStyle },
                 row.locationName,
                 typeof row.averageDailyAppointments === 'number'
