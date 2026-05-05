@@ -10,7 +10,7 @@ import { eq, and } from 'drizzle-orm';
 import { initializeDatabase } from '../db';
 import * as schema from '../db/schema';
 import type { YotConfig } from '../types';
-import { fetchLocationRosterHtml } from '../drivers/yot-mvc-client';
+import { fetchLocationRosterHtml, withAutoLogin } from '../drivers/yot-mvc-client';
 import { parseRosterHtml, scheduledOnly } from './parse-roster-html';
 import { computeCoverageSlots, aggregateLightWindows } from './compute';
 import { resolveBusinessHoursForDate, type BusinessHoursSchedule } from './business-hours';
@@ -41,6 +41,15 @@ function readConfig(sqlite: SqliteDb, teamId: string): YotConfig {
   const parsed = JSON.parse(row.value) as YotConfig;
   if (!parsed?.apiKey) throw new Error(`Invalid YOT config payload for team ${teamId}`);
   return parsed;
+}
+
+/**
+ * Persist a freshly-issued MVC cookie back into plugin_config.value JSON.
+ */
+function persistMvcCookie(sqlite: SqliteDb, teamId: string, cookie: string): void {
+  sqlite
+    .prepare("UPDATE plugin_config SET value = json_set(value, '$.mvcCookie', ?) WHERE team_id = ? AND key = 'yot'")
+    .run(cookie, teamId);
 }
 
 function weekStartOf(dateIso: string): string {
@@ -87,9 +96,15 @@ export async function syncCoverageForLocationDay(opts: SyncCoverageOptions): Pro
   const { db, sqlite } = initializeDatabase(opts.teamId);
   const config = readConfig(sqlite, opts.teamId);
 
-  // 1. Fetch one week of HTML and parse
+  // 1. Fetch one week of HTML and parse. withAutoLogin re-logs in transparently
+  // when mvcCookie is missing/expired AND mvcUserName/mvcPassword/mvcOrganisation
+  // are configured, persisting the new cookie back to plugin_config.
   const weekStart = weekStartOf(opts.date);
-  const html = await fetchLocationRosterHtml(config, opts.locationId, weekStart);
+  const html = await withAutoLogin(
+    config,
+    (cookie) => persistMvcCookie(sqlite, opts.teamId, cookie),
+    (cfg) => fetchLocationRosterHtml(cfg, opts.locationId, weekStart),
+  );
   const allEntries = parseRosterHtml(html);
 
   // 2. For each day in the week, compute slots and persist

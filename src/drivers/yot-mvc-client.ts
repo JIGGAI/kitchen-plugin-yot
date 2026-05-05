@@ -77,6 +77,94 @@ async function mvcFetch(config: YotConfig, path: string, init: RequestInit & { f
   return res;
 }
 
+export class MvcLoginRejectedError extends Error {
+  constructor(public detail: string) {
+    super(`YOT MVC login rejected the credentials: ${detail}`);
+    this.name = 'MvcLoginRejectedError';
+  }
+}
+
+/**
+ * POST credentials to /Account/Login and return a cookie-header string built
+ * from the Set-Cookie response headers. Throws MvcLoginRejectedError when the
+ * server bounces us back to the login page (typical for bad UserName / Password
+ * / Organisation).
+ */
+export async function loginToMvc(config: YotConfig): Promise<string> {
+  if (!config.mvcUserName || !config.mvcPassword || !config.mvcOrganisation) {
+    throw new MvcLoginRejectedError('mvcUserName, mvcPassword, and mvcOrganisation must all be set');
+  }
+  const baseUrl = resolveBaseUrl(config);
+  const res = await fetch(`${baseUrl}/Account/Login`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      UserName: config.mvcUserName,
+      Password: config.mvcPassword,
+      Organisation: config.mvcOrganisation,
+      ReturnUrl: '',
+    }).toString(),
+  });
+
+  // Successful login is a 302 redirect to /Diary or similar. A 200 means the
+  // login page re-rendered (with an error banner) — treat as rejection.
+  if (res.status !== 302 && res.status !== 303) {
+    const body = await res.text();
+    const lower = body.toLowerCase();
+    const hint = lower.includes('login-form') ? 'login page returned (credentials rejected)' : `unexpected status ${res.status}`;
+    throw new MvcLoginRejectedError(hint);
+  }
+
+  // Collect Set-Cookie headers (Node 18.13+ exposes getSetCookie; fall back to single).
+  const getSetCookie = (res.headers as any).getSetCookie?.bind(res.headers);
+  const setCookieList: string[] = getSetCookie ? getSetCookie() : (res.headers.get('set-cookie') ? [res.headers.get('set-cookie')!] : []);
+  if (setCookieList.length === 0) throw new MvcLoginRejectedError('login redirect carried no Set-Cookie');
+
+  const pairs: string[] = [];
+  for (const sc of setCookieList) {
+    const firstSemi = sc.indexOf(';');
+    const nameValue = (firstSemi > 0 ? sc.slice(0, firstSemi) : sc).trim();
+    if (nameValue && nameValue.includes('=')) pairs.push(nameValue);
+  }
+  // YOT also expects YOT-Language/LocationId etc. for the AJAX endpoint to
+  // behave like the browser. Carry those over from the existing cookie if present.
+  if (config.mvcCookie) {
+    const existingPairs = config.mvcCookie.split(';').map((s) => s.trim()).filter(Boolean);
+    const newKeys = new Set(pairs.map((p) => p.split('=', 1)[0]));
+    for (const ep of existingPairs) {
+      const key = ep.split('=', 1)[0];
+      // Only carry over things we didn't get fresh; skip auth cookies that login replaced.
+      if (!newKeys.has(key) && !key.startsWith('.AspNetCore')) pairs.push(ep);
+    }
+  }
+  return pairs.join('; ');
+}
+
+/**
+ * Wrap `op` so that an MvcAuthExpiredError triggers a login attempt (when
+ * credentials are configured), persists the new cookie via the supplied
+ * `persistCookie` callback, then retries `op` once with the refreshed config.
+ */
+export async function withAutoLogin<T>(
+  config: YotConfig,
+  persistCookie: (cookie: string) => Promise<void> | void,
+  op: (config: YotConfig) => Promise<T>,
+): Promise<T> {
+  try {
+    return await op(config);
+  } catch (err) {
+    const isAuthErr = err instanceof MvcAuthExpiredError || err instanceof MvcAuthMissingError;
+    const canLogin = !!(config.mvcUserName && config.mvcPassword && config.mvcOrganisation);
+    if (!isAuthErr || !canLogin) throw err;
+
+    const fresh = await loginToMvc(config);
+    await persistCookie(fresh);
+    const refreshed: YotConfig = { ...config, mvcCookie: fresh };
+    return op(refreshed);
+  }
+}
+
 /**
  * Fetch the rostered-staff week view for one location starting on the given
  * date. Returns the raw HTML fragment (a `<table class="grid">` chunk), which
