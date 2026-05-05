@@ -166,28 +166,29 @@ import { api, formatDateTime, t } from './common';
         padding: '0.25rem 0.3rem',
         textAlign: 'center',
         fontSize: '0.75rem',
-        cursor: 'default',
-        minWidth: '36px',
+        minWidth: '40px',
+        fontWeight: 600,
       };
       if (!slot) {
-        return h('td', { key: col, style: { ...baseStyle, background: 'transparent', color: 'rgba(255,255,255,0.2)' } }, '·');
+        return h('td', { key: col, style: { ...baseStyle, background: 'transparent', color: 'rgba(255,255,255,0.2)', fontWeight: 400 } }, '·');
       }
+      const title = `${slot.scheduledStylists} scheduled • need ${slot.requiredStylists} • ${slot.customerCount} customers`;
       if (slot.light) {
-        const deficit = Math.max(1, slot.requiredStylists - slot.scheduledStylists);
         return h('td', {
           key: col,
-          title: `Need ${slot.requiredStylists}, have ${slot.scheduledStylists}, ${slot.customerCount} customers`,
-          style: { ...baseStyle, background: 'rgba(220, 50, 50, 0.55)', color: '#fff', fontWeight: 600, cursor: 'pointer' },
+          title,
+          style: { ...baseStyle, background: 'rgba(220, 50, 50, 0.65)', color: '#fff', cursor: 'pointer' },
           onClick: () => void findCover({ locationId: row.locationId, locationName: row.locationName }, slot),
-        }, `−${deficit}`);
+        }, String(slot.scheduledStylists));
       }
-      // Covered: green. Slightly dimmer if required==0 (closed/no customers).
-      const intensity = slot.requiredStylists === 0 ? 0.18 : 0.40;
+      // Covered. Slightly dimmer when there are no customers (required=0)
+      // so the visual emphasizes the active customer-load slots.
+      const intensity = slot.customerCount === 0 ? 0.18 : 0.40;
       return h('td', {
         key: col,
-        title: `Need ${slot.requiredStylists}, have ${slot.scheduledStylists}, ${slot.customerCount} customers`,
+        title,
         style: { ...baseStyle, background: `rgba(80, 200, 120, ${intensity})`, color: '#cfe' },
-      }, slot.requiredStylists === 0 ? '·' : '✓');
+      }, String(slot.scheduledStylists));
     }
 
     return h('div', { style: { padding: '1rem', display: 'flex', flexDirection: 'column', gap: '1rem' } },
