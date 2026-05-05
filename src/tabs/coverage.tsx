@@ -189,14 +189,22 @@ import { api, formatDateTime, modal, t } from './common';
       }
     }
 
-    async function findCover(loc: { locationId: string; locationName: string }, slot: Slot) {
+    async function findCover(loc: { locationId: string; locationName: string }, slot: Slot, opts?: { fromCell?: boolean }) {
       if (!teamId) return;
+      // First click on a slot: reset min-minutes filter to the slot's own
+      // duration (otherwise a default 60-min threshold drops every candidate
+      // for a 30-min slot since gap = window).
+      let effectiveServiceMinutes = serviceMinutes;
+      if (!opts || opts.fromCell) {
+        effectiveServiceMinutes = Math.max(0, Math.round((new Date(slot.endsAt).getTime() - new Date(slot.startsAt).getTime()) / 60000));
+        setServiceMinutes(effectiveServiceMinutes);
+      }
       setSelected({ locationId: loc.locationId, locationName: loc.locationName, slot });
       setCandidates([]);
       setFindingCover(true);
       try {
         const res = await api('yot', teamId,
-          `/coverage/staff-available?locationId=${encodeURIComponent(loc.locationId)}&from=${encodeURIComponent(slot.startsAt)}&to=${encodeURIComponent(slot.endsAt)}&serviceMinutes=${serviceMinutes}&pool=${pool}`) as any;
+          `/coverage/staff-available?locationId=${encodeURIComponent(loc.locationId)}&from=${encodeURIComponent(slot.startsAt)}&to=${encodeURIComponent(slot.endsAt)}&serviceMinutes=${effectiveServiceMinutes}&pool=${pool}`) as any;
         setCandidates(res.candidates || []);
       } catch (e: any) {
         setError(deepError(e));
@@ -244,7 +252,7 @@ import { api, formatDateTime, modal, t } from './common';
           key: col,
           title,
           style: { ...baseStyle, background: 'rgba(220, 50, 50, 0.65)', color: '#fff', cursor: 'pointer' },
-          onClick: () => void findCover({ locationId: row.locationId, locationName: row.locationName }, slot),
+          onClick: () => void findCover({ locationId: row.locationId, locationName: row.locationName }, slot, { fromCell: true }),
         }, String(slot.scheduledStylists));
       }
       // Covered. Slightly dimmer when there are no customers (required=0)
@@ -378,7 +386,7 @@ import { api, formatDateTime, modal, t } from './common';
             ),
             h('button', {
               type: 'button',
-              onClick: () => void findCover({ locationId: selected.locationId, locationName: selected.locationName }, selected.slot),
+              onClick: () => void findCover({ locationId: selected.locationId, locationName: selected.locationName }, selected.slot, { fromCell: false }),
               disabled: findingCover,
               style: t.btnPrimary,
             }, findingCover ? 'Searching…' : 'Re-search'),
