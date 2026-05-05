@@ -6,6 +6,7 @@ import { api, formatDateTime, t } from './common';
   const h = R.createElement;
   const useEffect = R.useEffect as typeof R.useEffect;
   const useState = R.useState as (initial: any) => [any, (value: any) => void];
+  const useMemo = R.useMemo as <T>(factory: () => T, deps: any[]) => T;
 
   type Slot = {
     startsAt: string;
@@ -16,14 +17,13 @@ import { api, formatDateTime, t } from './common';
     light: boolean;
   };
 
-  type LightWindow = {
-    startsAt: string;
-    endsAt: string;
-    durationMinutes: number;
-    customerCount: number;
-    requiredStylists: number;
-    scheduledStylists: number;
-    deficit: number;
+  type LocationOption = { id: string; name: string };
+  type LocationRow = {
+    locationId: string;
+    locationName: string;
+    slots: Slot[];
+    error?: string | null;
+    computedAt?: string | null;
   };
 
   type Candidate = {
@@ -38,7 +38,7 @@ import { api, formatDateTime, t } from './common';
     lastWorkedHereAt: string | null;
   };
 
-  type LocationOption = { id: string; name: string };
+  type SelectedCell = { locationId: string; locationName: string; slot: Slot } | null;
 
   function todayLocal(): string {
     const d = new Date();
@@ -47,20 +47,30 @@ import { api, formatDateTime, t } from './common';
 
   function hhmm(iso: string): string { return iso.slice(11, 16); }
 
+  function deepError(e: any): string {
+    return String(e?.message || e || 'unknown error');
+  }
+
+  // Pull a stable column grid out of all loaded rows (union of slot startsAt).
+  function unifySlotGrid(rows: LocationRow[]): string[] {
+    const set = new Set<string>();
+    for (const row of rows) for (const s of row.slots) set.add(s.startsAt);
+    return Array.from(set).sort();
+  }
+
   function Coverage(props: any) {
     const teamId = typeof props?.teamId === 'string' && props.teamId.trim() ? props.teamId.trim() : null;
     const [locations, setLocations] = useState([] as LocationOption[]);
-    const [locationId, setLocationId] = useState('');
     const [date, setDate] = useState(todayLocal());
-    const [slots, setSlots] = useState([] as Slot[]);
-    const [windows, setWindows] = useState([] as LightWindow[]);
-    const [computedAt, setComputedAt] = useState(null as string | null);
+    const [rows, setRows] = useState([] as LocationRow[]);
     const [busy, setBusy] = useState(false);
+    const [progress, setProgress] = useState(null as { current: number; total: number; phase: string } | null);
     const [error, setError] = useState(null as string | null);
-    const [coverWindow, setCoverWindow] = useState(null as LightWindow | null);
+    const [selected, setSelected] = useState(null as SelectedCell);
     const [candidates, setCandidates] = useState([] as Candidate[]);
     const [serviceMinutes, setServiceMinutes] = useState(60);
     const [pool, setPool] = useState('cross' as 'cross' | 'same');
+    const [findingCover, setFindingCover] = useState(false);
 
     useEffect(() => {
       if (!teamId) return;
@@ -68,74 +78,121 @@ import { api, formatDateTime, t } from './common';
         const opts: LocationOption[] = (res?.data || []).map((l: any) => ({ id: String(l.id), name: l.name || String(l.id) }));
         opts.sort((a, b) => a.name.localeCompare(b.name));
         setLocations(opts);
-        if (!locationId && opts.length > 0) setLocationId(opts[0].id);
-      }).catch((e: any) => setError(String(e?.message || e)));
+      }).catch((e: any) => setError(deepError(e)));
     }, [teamId]);
 
-    async function refresh(forceSync: boolean = false) {
-      if (!teamId || !locationId) return;
-      setBusy(true);
-      setError(null);
-      setCoverWindow(null);
-      setCandidates([]);
+    async function loadOne(locationId: string, locationName: string, forceSync: boolean): Promise<LocationRow> {
       try {
         if (forceSync) {
-          await api('yot', teamId, '/coverage/sync', {
+          await api('yot', teamId!, '/coverage/sync', {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ locationId, date }),
           });
         }
-        try {
-          const slotsRes = await api('yot', teamId, `/coverage/slots?locationId=${encodeURIComponent(locationId)}&date=${date}`) as any;
-          setSlots(slotsRes.data.slots);
-          setComputedAt(slotsRes.data.computedAt);
-        } catch (e: any) {
-          if (String(e?.message || '').includes('NO_COVERAGE_CACHE') && !forceSync) {
-            return await refresh(true);
-          }
-          throw e;
-        }
-        const winRes = await api('yot', teamId, `/coverage/light-windows?locationId=${encodeURIComponent(locationId)}&date=${date}`) as any;
-        setWindows(winRes.data.windows || []);
+        const slotsRes = await api('yot', teamId!, `/coverage/slots?locationId=${encodeURIComponent(locationId)}&date=${date}`) as any;
+        return { locationId, locationName, slots: slotsRes.data.slots || [], computedAt: slotsRes.data.computedAt };
       } catch (e: any) {
-        const msg = String(e?.message || e);
-        if (msg.includes('MVC_AUTH_MISSING')) {
-          setError('YOT MVC cookie not set. Add it via: openclaw config set plugins.entries.yot.config.mvcCookie "<cookie>"');
-        } else if (msg.includes('MVC_AUTH_EXPIRED')) {
-          setError('YOT session expired — refresh mvcCookie from a fresh logged-in browser session.');
-        } else {
-          setError(msg);
+        const msg = deepError(e);
+        if (msg.includes('NO_COVERAGE_CACHE') && !forceSync) {
+          return loadOne(locationId, locationName, true);
+        }
+        return { locationId, locationName, slots: [], error: msg };
+      }
+    }
+
+    async function refreshAll(forceSync: boolean) {
+      if (!teamId || locations.length === 0) return;
+      setBusy(true); setError(null); setSelected(null); setCandidates([]);
+      setRows([]);
+      setProgress({ current: 0, total: locations.length, phase: forceSync ? 'Syncing' : 'Loading' });
+      try {
+        const out: LocationRow[] = [];
+        // Sequential to avoid blasting YOT MVC. Each call is one HTTP round trip.
+        for (let i = 0; i < locations.length; i++) {
+          const loc = locations[i];
+          setProgress({ current: i, total: locations.length, phase: `${forceSync ? 'Syncing' : 'Loading'} ${loc.name}` });
+          out.push(await loadOne(loc.id, loc.name, forceSync));
+          setRows([...out]); // progressive render
+        }
+        // Surface any auth errors at top
+        const authError = out.find((r) => r.error && (r.error.includes('MVC_AUTH_MISSING') || r.error.includes('MVC_AUTH_EXPIRED')));
+        if (authError) {
+          setError(authError.error!.includes('MVC_AUTH_MISSING')
+            ? 'YOT MVC cookie not set. Run: openclaw config patch ... mvcCookie'
+            : 'YOT session expired — refresh mvcCookie from a fresh logged-in browser session.');
         }
       } finally {
+        setProgress(null);
         setBusy(false);
       }
     }
 
-    async function findCover(w: LightWindow) {
-      if (!teamId || !locationId) return;
-      setCoverWindow(w);
+    async function findCover(loc: { locationId: string; locationName: string }, slot: Slot) {
+      if (!teamId) return;
+      setSelected({ locationId: loc.locationId, locationName: loc.locationName, slot });
       setCandidates([]);
+      setFindingCover(true);
       try {
         const res = await api('yot', teamId,
-          `/coverage/staff-available?locationId=${encodeURIComponent(locationId)}&from=${encodeURIComponent(w.startsAt)}&to=${encodeURIComponent(w.endsAt)}&serviceMinutes=${serviceMinutes}&pool=${pool}`) as any;
+          `/coverage/staff-available?locationId=${encodeURIComponent(loc.locationId)}&from=${encodeURIComponent(slot.startsAt)}&to=${encodeURIComponent(slot.endsAt)}&serviceMinutes=${serviceMinutes}&pool=${pool}`) as any;
         setCandidates(res.data.candidates || []);
       } catch (e: any) {
-        setError(String(e?.message || e));
+        setError(deepError(e));
+      } finally {
+        setFindingCover(false);
       }
+    }
+
+    const columns = useMemo(() => unifySlotGrid(rows), [rows]);
+    const slotMap = useMemo(() => {
+      const map = new Map<string, Map<string, Slot>>();
+      for (const row of rows) {
+        const inner = new Map<string, Slot>();
+        for (const s of row.slots) inner.set(s.startsAt, s);
+        map.set(row.locationId, inner);
+      }
+      return map;
+    }, [rows]);
+
+    // ===== render =====
+    const headerCellStyle = { ...t.th, padding: '0.25rem 0.4rem', fontSize: '0.75rem', whiteSpace: 'nowrap' as const };
+    const locCellStyle = { ...t.td, fontWeight: 600, whiteSpace: 'nowrap' as const, position: 'sticky' as const, left: 0, background: 'var(--ck-bg-soft, #1a1a1f)', zIndex: 1 };
+
+    function cellFor(row: LocationRow, col: string) {
+      const slot = slotMap.get(row.locationId)?.get(col);
+      const baseStyle: any = {
+        ...t.td,
+        padding: '0.25rem 0.3rem',
+        textAlign: 'center',
+        fontSize: '0.75rem',
+        cursor: 'default',
+        minWidth: '36px',
+      };
+      if (!slot) {
+        return h('td', { key: col, style: { ...baseStyle, background: 'transparent', color: 'rgba(255,255,255,0.2)' } }, '·');
+      }
+      if (slot.light) {
+        const deficit = Math.max(1, slot.requiredStylists - slot.scheduledStylists);
+        return h('td', {
+          key: col,
+          title: `Need ${slot.requiredStylists}, have ${slot.scheduledStylists}, ${slot.customerCount} customers`,
+          style: { ...baseStyle, background: 'rgba(220, 50, 50, 0.55)', color: '#fff', fontWeight: 600, cursor: 'pointer' },
+          onClick: () => void findCover({ locationId: row.locationId, locationName: row.locationName }, slot),
+        }, `−${deficit}`);
+      }
+      // Covered: green. Slightly dimmer if required==0 (closed/no customers).
+      const intensity = slot.requiredStylists === 0 ? 0.18 : 0.40;
+      return h('td', {
+        key: col,
+        title: `Need ${slot.requiredStylists}, have ${slot.scheduledStylists}, ${slot.customerCount} customers`,
+        style: { ...baseStyle, background: `rgba(80, 200, 120, ${intensity})`, color: '#cfe' },
+      }, slot.requiredStylists === 0 ? '·' : '✓');
     }
 
     return h('div', { style: { padding: '1rem', display: 'flex', flexDirection: 'column', gap: '1rem' } },
       // Controls
       h('div', { style: { display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' } },
-        h('select', {
-          value: locationId,
-          onChange: (e: any) => setLocationId(e.target.value),
-          style: t.input,
-        },
-          h('option', { value: '' }, 'Pick a location…'),
-          ...locations.map((l) => h('option', { key: l.id, value: l.id }, l.name)),
-        ),
         h('input', {
           type: 'date',
           value: date,
@@ -144,81 +201,64 @@ import { api, formatDateTime, t } from './common';
         }),
         h('button', {
           type: 'button',
-          onClick: () => refresh(false),
-          disabled: !locationId || busy,
+          onClick: () => void refreshAll(false),
+          disabled: busy || locations.length === 0,
           style: t.btnPrimary,
-        }, busy ? 'Loading…' : 'Refresh'),
+        }, busy ? (progress?.phase || 'Loading…') : 'Refresh'),
         h('button', {
           type: 'button',
-          onClick: () => refresh(true),
-          disabled: !locationId || busy,
+          onClick: () => void refreshAll(true),
+          disabled: busy || locations.length === 0,
           style: t.btnGhost,
-        }, 'Force Sync'),
-        computedAt ? h('span', { style: { ...t.faint, fontSize: '0.85em' } },
-          `Computed ${formatDateTime(computedAt)}`) : null,
+        }, 'Force Sync (refresh from YOT)'),
+        progress ? h('span', { style: { ...t.faint, fontSize: '0.85em' } },
+          `${progress.current}/${progress.total}`) : null,
+        h('span', { style: { ...t.faint, fontSize: '0.85em' } },
+          'Click a red cell to find cover.'),
       ),
 
-      // Error
+      // Error banner
       error ? h('div', {
         style: { color: '#ff8888', padding: '0.5rem', border: '1px solid #553', borderRadius: '4px' },
       }, error) : null,
 
-      // Slot table
-      slots.length === 0 && !busy && !error ? h('div', { style: t.faint }, 'Pick a location and date, then Refresh.') : null,
-      slots.length > 0 ? h('div', null,
-        h('h3', { style: { margin: '0 0 0.5rem 0' } }, 'Coverage by 30-min slot'),
-        h('table', { style: t.table },
-          h('thead', null, h('tr', null,
-            ['Time', 'Required', 'Scheduled', 'Customers', 'Status'].map((c) => h('th', { key: c, style: t.th }, c)),
-          )),
-          h('tbody', null, ...slots.map((s) => h('tr', {
-            key: s.startsAt,
-            style: s.light ? { background: 'rgba(255, 80, 80, 0.18)' } : undefined,
-          },
-            h('td', { style: t.td }, hhmm(s.startsAt) + '–' + hhmm(s.endsAt)),
-            h('td', { style: t.td }, s.requiredStylists),
-            h('td', { style: t.td }, s.scheduledStylists),
-            h('td', { style: t.td }, s.customerCount),
-            h('td', { style: t.td }, s.light ? 'LIGHT' : 'ok'),
-          ))),
-        ),
-      ) : null,
-
-      // Light windows
-      windows.length > 0 ? h('div', null,
-        h('h3', { style: { margin: '0 0 0.5rem 0' } }, `Light windows (${windows.length})`),
-        h('div', { style: { display: 'flex', flexDirection: 'column', gap: '0.5rem' } },
-          ...windows.map((w) => h('div', {
-            key: w.startsAt,
-            style: { display: 'flex', alignItems: 'center', gap: '0.75rem', padding: '0.5rem', border: '1px solid #444', borderRadius: '4px' },
-          },
-            h('div', { style: { flex: 1 } },
-              h('strong', null, `${hhmm(w.startsAt)}–${hhmm(w.endsAt)}`),
-              h('span', { style: { marginLeft: '1rem' } },
-                `needs ${w.requiredStylists}, have ${w.scheduledStylists} → deficit ${w.deficit}`),
-              h('span', { style: { ...t.faint, marginLeft: '0.5rem' } },
-                `(${w.durationMinutes} min, peak ${w.customerCount} customers)`),
+      // Heatmap grid
+      rows.length > 0 ? h('div', { style: { overflowX: 'auto' } },
+        h('table', { style: { ...t.table, borderCollapse: 'separate', borderSpacing: 0 } },
+          h('thead', null,
+            h('tr', null,
+              h('th', { style: { ...headerCellStyle, position: 'sticky', left: 0, background: 'var(--ck-bg-soft, #1a1a1f)', zIndex: 2 } }, 'Location'),
+              ...columns.map((c) => h('th', { key: c, style: headerCellStyle }, hhmm(c))),
             ),
-            h('button', {
-              type: 'button',
-              onClick: () => void findCover(w),
-              style: t.btnGhost,
-            }, 'Find cover'),
-          )),
+          ),
+          h('tbody', null,
+            ...rows.map((row) => h('tr', { key: row.locationId },
+              h('td', { style: locCellStyle },
+                row.locationName,
+                row.error
+                  ? h('div', { style: { ...t.faint, fontSize: '0.7rem', fontWeight: 400 } }, row.error.slice(0, 60))
+                  : null,
+              ),
+              ...columns.map((c) => cellFor(row, c)),
+            )),
+          ),
         ),
-      ) : null,
+      ) : (!busy && !error
+        ? h('div', { style: t.faint }, 'Pick a date and click Refresh to load coverage.')
+        : null),
 
-      // Find cover panel
-      coverWindow ? h('div', {
+      // Find-cover panel
+      selected ? h('div', {
         style: { padding: '0.75rem', border: '1px solid #555', borderRadius: '4px', background: 'rgba(80,80,120,0.1)' },
       },
-        h('div', { style: { display: 'flex', alignItems: 'center', gap: '1rem', marginBottom: '0.5rem' } },
-          h('strong', null, `Find cover: ${hhmm(coverWindow.startsAt)}–${hhmm(coverWindow.endsAt)}`),
+        h('div', { style: { display: 'flex', alignItems: 'center', gap: '1rem', marginBottom: '0.5rem', flexWrap: 'wrap' } },
+          h('strong', null, `${selected.locationName} • ${hhmm(selected.slot.startsAt)}–${hhmm(selected.slot.endsAt)} • need ${selected.slot.requiredStylists}, have ${selected.slot.scheduledStylists}`),
           h('label', null, 'Min minutes: ',
             h('input', {
               type: 'number',
               value: serviceMinutes,
-              min: 0, step: 15,
+              min: 0,
+              step: 15,
               onChange: (e: any) => setServiceMinutes(Number(e.target.value) || 0),
               style: { ...t.input, width: '5rem' },
             }),
@@ -226,7 +266,7 @@ import { api, formatDateTime, t } from './common';
           h('label', null, 'Pool: ',
             h('select', {
               value: pool,
-              onChange: (e: any) => setPool(e.target.value as 'cross' | 'same'),
+              onChange: (e: any) => setPool(e.target.value),
               style: t.input,
             },
               h('option', { value: 'cross' }, 'Cross-location'),
@@ -235,28 +275,36 @@ import { api, formatDateTime, t } from './common';
           ),
           h('button', {
             type: 'button',
-            onClick: () => void findCover(coverWindow),
+            onClick: () => void findCover({ locationId: selected.locationId, locationName: selected.locationName }, selected.slot),
+            disabled: findingCover,
             style: t.btnPrimary,
-          }, 'Re-search'),
+          }, findingCover ? 'Searching…' : 'Re-search'),
+          h('button', {
+            type: 'button',
+            onClick: () => { setSelected(null); setCandidates([]); },
+            style: t.btnGhost,
+          }, 'Close'),
         ),
-        candidates.length === 0
+        candidates.length === 0 && !findingCover
           ? h('div', { style: { ...t.faint, fontStyle: 'italic' } }, 'No candidates found for this window.')
-          : h('table', { style: t.table },
-              h('thead', null, h('tr', null,
-                ['Name', 'Home', 'Free', 'Rostered', 'Qualified', 'Last worked here'].map((c) => h('th', { key: c, style: t.th }, c)),
-              )),
-              h('tbody', null, ...candidates.map((c) => {
-                const homeName = locations.find((l) => l.id === c.homeLocationId)?.name || c.homeLocationId || '—';
-                return h('tr', { key: c.stylistId },
-                  h('td', { style: t.td }, c.name),
-                  h('td', { style: t.td }, homeName),
-                  h('td', { style: t.td }, `${hhmm(c.gapStart)}–${hhmm(c.gapEnd)} (${c.gapMinutes}m)`),
-                  h('td', { style: t.td }, c.rosteredToday ? '✓' : '—'),
-                  h('td', { style: t.td }, c.qualifiedHere ? '✓' : '—'),
-                  h('td', { style: t.td }, c.lastWorkedHereAt ? formatDateTime(c.lastWorkedHereAt) : '—'),
-                );
-              })),
-            ),
+          : candidates.length > 0
+            ? h('table', { style: t.table },
+                h('thead', null, h('tr', null,
+                  ['Name', 'Home', 'Free', 'Rostered', 'Qualified', 'Last worked here'].map((c) => h('th', { key: c, style: t.th }, c)),
+                )),
+                h('tbody', null, ...candidates.map((c) => {
+                  const homeName = locations.find((l) => l.id === c.homeLocationId)?.name || c.homeLocationId || '—';
+                  return h('tr', { key: c.stylistId },
+                    h('td', { style: t.td }, c.name),
+                    h('td', { style: t.td }, homeName),
+                    h('td', { style: t.td }, `${hhmm(c.gapStart)}–${hhmm(c.gapEnd)} (${c.gapMinutes}m)`),
+                    h('td', { style: t.td }, c.rosteredToday ? '✓' : '—'),
+                    h('td', { style: t.td }, c.qualifiedHere ? '✓' : '—'),
+                    h('td', { style: t.td }, c.lastWorkedHereAt ? formatDateTime(c.lastWorkedHereAt) : '—'),
+                  );
+                })),
+              )
+            : null,
       ) : null,
     );
   }
