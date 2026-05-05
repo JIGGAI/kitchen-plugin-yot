@@ -2376,12 +2376,29 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     const { db } = initializeDatabase(teamId);
     const { findStaffAvailable } = await import('../coverage/find-cover');
 
+    // stylists.id is stored as `LOCATION:YOT_ID` (per-location scoped record),
+    // while appointments.stylist_id and the roster's data-id attribute are the
+    // YOT id alone. Strip the prefix so the appointment-overlap, rostered-
+    // today, and lastWorkedHereAt joins line up. Dedup by YOT id, preferring
+    // the row whose home matches the requested location.
     const stylistsRaw = db.select().from(schema.stylists).where(eq(schema.stylists.teamId, teamId)).all() as schema.Stylist[];
-    const stylists = stylistsRaw.map((s) => ({
-      id: s.id,
-      name: s.fullName ?? (`${s.firstName ?? ''} ${s.lastName ?? ''}`.trim() || s.id),
-      homeLocationId: s.locationId ?? s.sourceLocationId ?? null,
-    }));
+    const stripPrefix = (compound: string): string => {
+      const i = compound.indexOf(':');
+      return i >= 0 ? compound.slice(i + 1) : compound;
+    };
+    const stylistByYotId = new Map<string, { id: string; name: string; homeLocationId: string | null }>();
+    for (const s of stylistsRaw) {
+      const yotId = stripPrefix(s.id);
+      const homeLocId = s.locationId ?? s.sourceLocationId ?? null;
+      const name = s.fullName ?? (`${s.firstName ?? ''} ${s.lastName ?? ''}`.trim() || s.id);
+      const existing = stylistByYotId.get(yotId);
+      if (!existing) {
+        stylistByYotId.set(yotId, { id: yotId, name, homeLocationId: homeLocId });
+      } else if (homeLocId === locationId && existing.homeLocationId !== locationId) {
+        existing.homeLocationId = homeLocId;
+      }
+    }
+    const stylists = Array.from(stylistByYotId.values());
 
     const apptsRaw = db.select().from(schema.appointments).where(eq(schema.appointments.teamId, teamId)).all() as schema.Appointment[];
     const appointments = apptsRaw
