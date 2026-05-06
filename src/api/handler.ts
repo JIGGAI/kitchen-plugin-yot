@@ -5,6 +5,7 @@
 import { mkdirSync, writeFileSync } from 'fs';
 import path from 'path';
 import { randomUUID } from 'crypto';
+import { execFileSync } from 'child_process';
 import { and, eq, sql } from 'drizzle-orm';
 import { initializeDatabase } from '../db';
 import * as schema from '../db/schema';
@@ -128,16 +129,34 @@ type PayoutFactRow = {
   date: string;
   locationName: string;
   staffName: string;
+  staffId: string | null;
   bankToBankAmount: number | null;
+  originalPayoutAmount: number | null;
+  garnishmentPercent: number | null;
+  garnishmentAmount: number;
+  netPayoutAmount: number | null;
   lastUpdatedAt: string;
 };
 type PayoutLocationTotalRow = {
   date: string;
   locationName: string;
   branchTotal: number;
+  originalPayoutTotal: number;
+  garnishmentTotal: number;
   stylistCount: number;
   lastUpdatedAt: string | null;
 };
+type GarnishmentRule = {
+  staffId: string;
+  firstName: string;
+  lastName: string;
+  percent: number;
+};
+
+type SheetValuesResponse = {
+  values?: string[][];
+};
+
 type RevenuePeriodAccumulator = {
   periodKey: string;
   periodStart: string;
@@ -190,6 +209,8 @@ type PromotionMatrixAccumulator = {
 
 const REPORTS_TIME_ZONE = 'America/New_York';
 const DEFAULT_REVENUE_ORGANISATION_ID = 11082;
+const GOG_ACCOUNT = 'govna.assistant@gmail.com';
+const GARNISHMENTS_SHEET_ID = '1pvwN3h0X9ZsdhpH024zue9DlE4NaZiuzTia5NMoEn6c';
 
 function mostRecentIso(a: string | null, b: string | null): string | null {
   if (!a) return b;
@@ -393,6 +414,41 @@ function listRevenueFacts(db: ReturnType<typeof initializeDatabase>['db'], teamI
   return rows.map((row) => ({ ...row, locationName: nameByLocationId.get(row.locationId) ?? null }));
 }
 
+function parseGarnishmentPercent(value: string | null | undefined): number | null {
+  if (!value) return null;
+  const cleaned = String(value).replace(/[%\s]/g, '').trim();
+  if (!cleaned) return null;
+  const raw = Number(cleaned);
+  if (!Number.isFinite(raw) || raw <= 0) return null;
+  return raw > 1 ? raw / 100 : raw;
+}
+
+function loadGarnishmentRules(): Map<string, GarnishmentRule> {
+  try {
+    const out = execFileSync('gog', ['sheets', 'get', GARNISHMENTS_SHEET_ID, 'GARNISHMENTS!A1:H1200', '--account', GOG_ACCOUNT, '--json', '--no-input'], {
+      encoding: 'utf8',
+      maxBuffer: 20 * 1024 * 1024,
+    });
+    const response = JSON.parse(out) as SheetValuesResponse;
+    const rows = response.values || [];
+    const rules = new Map<string, GarnishmentRule>();
+    for (const row of rows.slice(1)) {
+      const staffId = cleanString(row[0]);
+      const percent = parseGarnishmentPercent(cleanString(row[4]));
+      if (!staffId || percent == null) continue;
+      rules.set(staffId, {
+        staffId,
+        firstName: cleanString(row[1]) || '',
+        lastName: cleanString(row[2]) || '',
+        percent,
+      });
+    }
+    return rules;
+  } catch {
+    return new Map();
+  }
+}
+
 function listPayoutFacts(sqlite: ReturnType<typeof initializeDatabase>['sqlite'], teamId: string, filters: { startDate?: string | null; endDate?: string | null; locationName?: string | null } = {}): PayoutFactRow[] {
   const startDate = filters.startDate ? String(filters.startDate).slice(0, 10) : null;
   const endDate = filters.endDate ? String(filters.endDate).slice(0, 10) : null;
@@ -405,23 +461,54 @@ function listPayoutFacts(sqlite: ReturnType<typeof initializeDatabase>['sqlite']
     SELECT date,
            location_name AS locationName,
            staff_name AS staffName,
+           staff_id AS staffId,
            bank_to_bank_amount AS bankToBankAmount,
            last_updated_at AS lastUpdatedAt
     FROM staff_cashout_facts
     WHERE ${conditions.join(' AND ')}
     ORDER BY date DESC, location_name ASC, bank_to_bank_amount DESC, staff_name ASC
   `;
-  return sqlite.prepare(sqlText).all(...params) as PayoutFactRow[];
+  const rules = loadGarnishmentRules();
+  const rawRows = sqlite.prepare(sqlText).all(...params) as Array<{
+    date: string;
+    locationName: string;
+    staffName: string;
+    staffId: string | null;
+    bankToBankAmount: number | null;
+    lastUpdatedAt: string;
+  }>;
+  return rawRows.map((row) => {
+    const originalPayoutAmount = row.bankToBankAmount;
+    const rule = row.staffId ? rules.get(String(row.staffId)) : undefined;
+    const garnishmentPercent = rule?.percent ?? null;
+    const garnishmentAmount = garnishmentPercent && originalPayoutAmount != null
+      ? Number((originalPayoutAmount * garnishmentPercent).toFixed(2))
+      : 0;
+    const netPayoutAmount = originalPayoutAmount == null
+      ? null
+      : Number((originalPayoutAmount - garnishmentAmount).toFixed(2));
+    return {
+      ...row,
+      originalPayoutAmount,
+      garnishmentPercent,
+      garnishmentAmount,
+      netPayoutAmount,
+    } satisfies PayoutFactRow;
+  });
 }
 
 function computePayoutTotals(rows: PayoutFactRow[]) {
   let payoutTotal = 0;
+  let originalPayoutTotal = 0;
+  let garnishmentTotal = 0;
   let lastUpdatedAt: string | null = null;
   const dates = new Set<string>();
   const branches = new Set<string>();
   const stylists = new Set<string>();
   for (const row of rows) {
-    payoutTotal += asNumber(row.bankToBankAmount);
+    payoutTotal += asNumber(row.netPayoutAmount);
+    originalPayoutTotal += asNumber(row.originalPayoutAmount);
+    garnishmentTotal += asNumber(row.garnishmentAmount);
     if (row.date) dates.add(row.date);
     if (row.locationName) branches.add(row.locationName);
     if (row.staffName) stylists.add(`${row.date}::${row.locationName}::${row.staffName}`);
@@ -429,6 +516,8 @@ function computePayoutTotals(rows: PayoutFactRow[]) {
   }
   return {
     payoutTotal,
+    originalPayoutTotal,
+    garnishmentTotal,
     rowCount: rows.length,
     dayCount: dates.size,
     branchCount: branches.size,
@@ -445,10 +534,14 @@ function buildPayoutLocationTotals(rows: PayoutFactRow[]): PayoutLocationTotalRo
       date: row.date,
       locationName: row.locationName,
       branchTotal: 0,
+      originalPayoutTotal: 0,
+      garnishmentTotal: 0,
       stylistCount: 0,
       lastUpdatedAt: null,
     };
-    bucket.branchTotal += asNumber(row.bankToBankAmount);
+    bucket.branchTotal += asNumber(row.netPayoutAmount);
+    bucket.originalPayoutTotal += asNumber(row.originalPayoutAmount);
+    bucket.garnishmentTotal += asNumber(row.garnishmentAmount);
     bucket.stylistCount += 1;
     bucket.lastUpdatedAt = mostRecentIso(bucket.lastUpdatedAt, row.lastUpdatedAt || null);
     buckets.set(key, bucket);
@@ -1550,7 +1643,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       const endDate = requestedEnd || anchorEnd;
       const startDate = requestedStart || endDate;
       const locationName = cleanString(req.query.location || req.query.locationName);
-      const rows = listPayoutFacts(sqlite, teamId, { startDate, endDate, locationName }).filter((row) => asNumber(row.bankToBankAmount) > 0);
+      const rows = listPayoutFacts(sqlite, teamId, { startDate, endDate, locationName }).filter((row) => asNumber(row.originalPayoutAmount) > 0);
       const locationTotals = buildPayoutLocationTotals(rows);
       const totals = computePayoutTotals(rows);
       const lastSyncedAt = (sqlite
