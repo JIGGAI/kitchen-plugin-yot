@@ -12,18 +12,30 @@ import { api, fmtNumber, formatDateTime, loadCacheMeta, renderCacheSummaryCards,
     date: string;
     locationName: string;
     staffName: string;
+    staffId: string | null;
     bankToBankAmount: number | null;
+    originalPayoutAmount: number | null;
+    garnishmentPercent: number | null;
+    garnishmentAmount: number;
+    loanPaymentAmount: number;
+    netPayoutAmount: number | null;
     lastUpdatedAt: string;
   };
   type BranchTotalRow = {
     date: string;
     locationName: string;
     branchTotal: number;
+    originalPayoutTotal: number;
+    garnishmentTotal: number;
+    loanPaymentTotal: number;
     stylistCount: number;
     lastUpdatedAt: string | null;
   };
   type PayoutTotals = {
     payoutTotal: number;
+    originalPayoutTotal: number;
+    garnishmentTotal: number;
+    loanPaymentTotal: number;
     rowCount: number;
     dayCount: number;
     branchCount: number;
@@ -63,12 +75,18 @@ import { api, fmtNumber, formatDateTime, loadCacheMeta, renderCacheSummaryCards,
     const byDate = new Map<string, {
       date: string;
       totalPayout: number;
+      originalPayoutTotal: number;
+      garnishmentTotal: number;
+      loanPaymentTotal: number;
       stylistKeys: Set<string>;
       lastUpdatedAt: string | null;
       locations: Map<string, {
         locationName: string;
         rows: PayoutRow[];
         branchTotal: number | null;
+        originalPayoutTotal: number | null;
+        garnishmentTotal: number | null;
+        loanPaymentTotal: number | null;
         stylistCount: number | null;
         lastUpdatedAt: string | null;
       }>;
@@ -78,11 +96,17 @@ import { api, fmtNumber, formatDateTime, loadCacheMeta, renderCacheSummaryCards,
       const dateBucket = byDate.get(row.date) || {
         date: row.date,
         totalPayout: 0,
+        originalPayoutTotal: 0,
+        garnishmentTotal: 0,
+        loanPaymentTotal: 0,
         stylistKeys: new Set<string>(),
         lastUpdatedAt: null,
         locations: new Map(),
       };
-      dateBucket.totalPayout += row.bankToBankAmount || 0;
+      dateBucket.totalPayout += row.netPayoutAmount || 0;
+      dateBucket.originalPayoutTotal += row.originalPayoutAmount || 0;
+      dateBucket.garnishmentTotal += row.garnishmentAmount || 0;
+      dateBucket.loanPaymentTotal += row.loanPaymentAmount || 0;
       dateBucket.stylistKeys.add(`${row.locationName}::${row.staffName}`);
       dateBucket.lastUpdatedAt = mostRecentIso(dateBucket.lastUpdatedAt, row.lastUpdatedAt);
 
@@ -92,6 +116,9 @@ import { api, fmtNumber, formatDateTime, loadCacheMeta, renderCacheSummaryCards,
         locationName: row.locationName,
         rows: [],
         branchTotal: existingTotal?.branchTotal ?? null,
+        originalPayoutTotal: existingTotal?.originalPayoutTotal ?? null,
+        garnishmentTotal: existingTotal?.garnishmentTotal ?? null,
+        loanPaymentTotal: existingTotal?.loanPaymentTotal ?? null,
         stylistCount: existingTotal?.stylistCount ?? null,
         lastUpdatedAt: existingTotal?.lastUpdatedAt ?? null,
       };
@@ -106,13 +133,16 @@ import { api, fmtNumber, formatDateTime, loadCacheMeta, renderCacheSummaryCards,
       .map((dateBucket) => ({
         date: dateBucket.date,
         totalPayout: dateBucket.totalPayout,
+        originalPayoutTotal: dateBucket.originalPayoutTotal,
+        garnishmentTotal: dateBucket.garnishmentTotal,
+        loanPaymentTotal: dateBucket.loanPaymentTotal,
         stylistCount: dateBucket.stylistKeys.size,
         lastUpdatedAt: dateBucket.lastUpdatedAt,
         locations: [...dateBucket.locations.values()]
           .sort((a, b) => a.locationName.localeCompare(b.locationName))
           .map((locationBucket) => ({
             ...locationBucket,
-            rows: [...locationBucket.rows].sort((a, b) => (b.bankToBankAmount || 0) - (a.bankToBankAmount || 0) || a.staffName.localeCompare(b.staffName)),
+            rows: [...locationBucket.rows].sort((a, b) => (b.netPayoutAmount || 0) - (a.netPayoutAmount || 0) || a.staffName.localeCompare(b.staffName)),
           })),
       }));
   };
@@ -134,6 +164,7 @@ import { api, fmtNumber, formatDateTime, loadCacheMeta, renderCacheSummaryCards,
     const [busy, setBusy] = useState(null as string | null);
     const [message, setMessage] = useState(null as string | null);
     const [error, setError] = useState(null as string | null);
+    const [openDays, setOpenDays] = useState({} as Record<string, boolean>);
 
     const loadLocations = async () => {
       if (!teamId) return;
@@ -187,8 +218,8 @@ import { api, fmtNumber, formatDateTime, loadCacheMeta, renderCacheSummaryCards,
           startDate ? `startDate=${encodeURIComponent(startDate)}` : '',
           endDate ? `endDate=${encodeURIComponent(endDate)}` : '',
         ].filter(Boolean).join('&');
-        const res = await api('yot', teamId, `/staff-cashout/sync${params ? `?${params}` : ''}`, { method: 'POST', headers: { 'content-type': 'application/json' } }) as any;
-        setMessage(`Payout sync complete • ${fmtNumber(res?.rowsWritten)} rows written from ${res?.startDate || startDate} to ${res?.endDate || endDate}`);
+        const res = await api('yot', teamId, `/payouts/sync${params ? `?${params}` : ''}`, { method: 'POST', headers: { 'content-type': 'application/json' } }) as any;
+        setMessage(`Payout export complete • ${fmtNumber(res?.dayCount)} day${res?.dayCount === 1 ? '' : 's'} regenerated from ${res?.startDate || startDate} to ${res?.endDate || endDate}`);
         await Promise.all([loadMeta(), load()]);
       } catch (e: any) {
         setError(e?.message || 'Failed to sync payouts');
@@ -199,6 +230,23 @@ import { api, fmtNumber, formatDateTime, loadCacheMeta, renderCacheSummaryCards,
 
     useEffect(() => { if (teamId) { void refreshAll(); } else setLoading(false); }, [teamId, startDate, endDate, locationName]);
 
+    const groupedPayouts = data?.rows?.length ? buildGroupedPayouts(data.rows, data.locationTotals || []) : [];
+
+    useEffect(() => {
+      if (!groupedPayouts.length) return;
+      setOpenDays((current: Record<string, boolean>) => {
+        const next = { ...current };
+        let changed = false;
+        for (const dayGroup of groupedPayouts as any[]) {
+          if (!(dayGroup.date in next)) {
+            next[dayGroup.date] = false;
+            changed = true;
+          }
+        }
+        return changed ? next : current;
+      });
+    }, [JSON.stringify(groupedPayouts.map((row: any) => row.date))]);
+
     if (!teamId) return h('div', { style: t.card }, h('div', { className: 'text-sm font-medium', style: t.text }, 'Payouts'), h('div', { className: 'mt-2 text-sm', style: t.danger }, 'No team context was provided to the YOT Payouts tab.'));
 
     return h('div', { className: 'space-y-3' },
@@ -206,7 +254,7 @@ import { api, fmtNumber, formatDateTime, loadCacheMeta, renderCacheSummaryCards,
         h('div', { className: 'flex items-start justify-between gap-2' },
           h('div', null,
             h('div', { className: 'text-sm font-medium', style: t.text }, 'Payouts'),
-            h('div', { className: 'mt-1 text-xs', style: t.faint }, 'Bank-to-bank payout amounts from cached YOT Staff Cashout data.')
+            h('div', { className: 'mt-1 text-xs', style: t.faint }, 'Finalized payout rows sourced from the branch export files in /Users/hairmx/hmx-reports.')
           ),
           h('button', { type: 'button', onClick: () => void refreshAll(), style: t.btnGhost, disabled: loading || !!busy }, loading ? 'Loading…' : '↻ Refresh')
         ),
@@ -230,22 +278,24 @@ import { api, fmtNumber, formatDateTime, loadCacheMeta, renderCacheSummaryCards,
         h('div', { className: 'mt-3 flex flex-wrap gap-2' },
           h('button', { type: 'button', style: t.btnPrimary, onClick: () => { setStartDate(startDateInput); setEndDate(endDateInput); } }, 'Apply filters'),
           h('button', { type: 'button', style: t.btnGhost, onClick: () => { const day = yesterday(); setLocationName(''); setStartDateInput(day); setEndDateInput(day); setStartDate(day); setEndDate(day); } }, 'Reset to yesterday'),
-          h('button', { type: 'button', style: t.btnGhost, disabled: !!busy, onClick: () => void runSync() }, busy === 'sync' ? 'Syncing…' : 'Sync range')
+          h('button', { type: 'button', style: t.btnGhost, disabled: !!busy, onClick: () => void runSync() }, busy === 'sync' ? 'Regenerating…' : 'Regenerate range')
         )
       ),
       h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '0.75rem' } },
-        h('div', { style: t.card }, h('div', { className: 'text-xs', style: t.faint }, 'Payout total'), h('div', { className: 'mt-1 text-lg font-semibold', style: t.text }, fmtCurrency(data?.totals?.payoutTotal ?? null))),
+        h('div', { style: t.card }, h('div', { className: 'text-xs', style: t.faint }, 'Net payout total'), h('div', { className: 'mt-1 text-lg font-semibold', style: t.text }, fmtCurrency(data?.totals?.payoutTotal ?? null))),
+        h('div', { style: t.card }, h('div', { className: 'text-xs', style: t.faint }, 'Garnishments total'), h('div', { className: 'mt-1 text-lg font-semibold', style: t.text }, fmtCurrency(data?.totals?.garnishmentTotal ?? null))),
+        h('div', { style: t.card }, h('div', { className: 'text-xs', style: t.faint }, 'Loan payments total'), h('div', { className: 'mt-1 text-lg font-semibold', style: t.text }, fmtCurrency(data?.totals?.loanPaymentTotal ?? null))),
+        h('div', { style: t.card }, h('div', { className: 'text-xs', style: t.faint }, 'Original payout total'), h('div', { className: 'mt-1 text-lg font-semibold', style: t.text }, fmtCurrency(data?.totals?.originalPayoutTotal ?? null))),
         h('div', { style: t.card }, h('div', { className: 'text-xs', style: t.faint }, 'Branches'), h('div', { className: 'mt-1 text-lg font-semibold', style: t.text }, fmtNumber(data?.totals?.branchCount ?? null))),
         h('div', { style: t.card }, h('div', { className: 'text-xs', style: t.faint }, 'Stylists'), h('div', { className: 'mt-1 text-lg font-semibold', style: t.text }, fmtNumber(data?.totals?.stylistCount ?? null))),
         h('div', { style: t.card }, h('div', { className: 'text-xs', style: t.faint }, 'Days'), h('div', { className: 'mt-1 text-lg font-semibold', style: t.text }, fmtNumber(data?.totals?.dayCount ?? null)))
       ),
       h('div', { style: t.card },
         h('div', { className: 'text-sm font-medium mb-3', style: t.text }, 'Payout rows'),
-        data?.rows?.length
-          ? buildGroupedPayouts(data.rows, data.locationTotals || []).map((dayGroup: any) =>
-              h('details', {
+        groupedPayouts.length
+          ? groupedPayouts.map((dayGroup: any) =>
+              h('div', {
                 key: dayGroup.date,
-                open: true,
                 style: {
                   border: '1px solid var(--ck-border-subtle)',
                   borderRadius: '10px',
@@ -254,26 +304,28 @@ import { api, fmtNumber, formatDateTime, loadCacheMeta, renderCacheSummaryCards,
                   background: 'rgba(255,255,255,0.02)',
                 }
               },
-                h('summary', {
+                h('button', {
+                  type: 'button',
+                  onClick: () => setOpenDays((current: Record<string, boolean>) => ({ ...current, [dayGroup.date]: !current[dayGroup.date] })),
                   style: {
-                    listStyle: 'none',
+                    width: '100%',
+                    border: 'none',
+                    background: 'transparent',
                     cursor: 'pointer',
                     padding: '0.85rem 1rem',
                     display: 'grid',
-                    gridTemplateColumns: 'minmax(150px, 1.1fr) minmax(140px, 1fr) minmax(100px, 0.8fr) minmax(180px, 1.2fr)',
+                    gridTemplateColumns: 'minmax(150px, 1.1fr) minmax(140px, 1fr) minmax(100px, 0.8fr) minmax(180px, 1.2fr) 24px',
                     gap: '0.75rem',
                     alignItems: 'center',
+                    textAlign: 'left',
                   }
                 },
-                  h('div', { style: { display: 'flex', alignItems: 'center', gap: '0.6rem' } },
-                    h('span', { style: { ...t.faint, fontSize: '0.9rem' } }, '▸'),
-                    h('div', null,
-                      h('div', { className: 'text-xs', style: t.faint }, 'Date'),
-                      h('div', { className: 'text-sm font-medium', style: t.text }, dayGroup.date)
-                    )
+                  h('div', null,
+                    h('div', { className: 'text-xs', style: t.faint }, 'Date'),
+                    h('div', { className: 'text-sm font-medium', style: t.text }, dayGroup.date)
                   ),
                   h('div', null,
-                    h('div', { className: 'text-xs', style: t.faint }, 'Total payout'),
+                    h('div', { className: 'text-xs', style: t.faint }, 'Net payout'),
                     h('div', { className: 'text-sm font-medium', style: t.text }, fmtCurrency(dayGroup.totalPayout))
                   ),
                   h('div', null,
@@ -283,9 +335,26 @@ import { api, fmtNumber, formatDateTime, loadCacheMeta, renderCacheSummaryCards,
                   h('div', null,
                     h('div', { className: 'text-xs', style: t.faint }, 'Last updated'),
                     h('div', { className: 'text-sm font-medium', style: t.text }, formatDateTime(dayGroup.lastUpdatedAt))
-                  )
+                  ),
+                  h('div', { style: { ...t.text, fontSize: '1rem', textAlign: 'right' } }, openDays[dayGroup.date] ? '▴' : '▾')
                 ),
-                h('div', { style: { padding: '0 1rem 1rem 1rem' } },
+                openDays[dayGroup.date] && h('div', { style: { padding: '0 1rem 1rem 1rem' } },
+                  h('div', {
+                    style: {
+                      marginTop: '0.75rem',
+                      marginBottom: '0.25rem',
+                      display: 'flex',
+                      flexWrap: 'wrap',
+                      gap: '1rem',
+                      fontSize: '0.8rem',
+                      color: t.faint.color,
+                    }
+                  },
+                    h('span', null, `Original: ${fmtCurrency(dayGroup.originalPayoutTotal)}`),
+                    h('span', null, `Garnishments: ${fmtCurrency(dayGroup.garnishmentTotal)}`),
+                    h('span', null, `Loan payments: ${fmtCurrency(dayGroup.loanPaymentTotal)}`),
+                    h('span', null, `Net: ${fmtCurrency(dayGroup.totalPayout)}`)
+                  ),
                   ...dayGroup.locations.map((locationGroup: any) =>
                     h('div', {
                       key: `${dayGroup.date}::${locationGroup.locationName}`,
@@ -308,23 +377,37 @@ import { api, fmtNumber, formatDateTime, loadCacheMeta, renderCacheSummaryCards,
                         }
                       },
                         h('div', { className: 'text-sm font-medium', style: t.text }, locationGroup.locationName),
-                        h('div', { className: 'text-xs', style: t.faint }, `${fmtNumber(locationGroup.stylistCount)} stylists`)
+                        h('div', { className: 'text-xs', style: t.faint }, `${fmtNumber(locationGroup.stylistCount)} stylists • ${fmtCurrency(locationGroup.branchTotal)} net • ${fmtCurrency(locationGroup.loanPaymentTotal)} loans`)
                       ),
                       h('div', { style: t.tableWrap },
                         h('table', { style: t.table },
                           h('thead', null, h('tr', null,
                             h('th', { style: t.th }, 'Stylist'),
-                            h('th', { style: t.th }, 'Payout amount'),
+                            h('th', { style: t.th }, 'Staff ID'),
+                            h('th', { style: t.th }, 'Original payout'),
+                            h('th', { style: t.th }, 'Loan payment'),
+                            h('th', { style: t.th }, 'Garnishment'),
+                            h('th', { style: t.th }, 'Net payout'),
                             h('th', { style: t.th }, 'Last updated')
                           )),
                           h('tbody', null,
-                            ...locationGroup.rows.map((row: PayoutRow) => h('tr', { key: `${row.date}::${row.locationName}::${row.staffName}` },
+                            ...locationGroup.rows.map((row: PayoutRow) => h('tr', { key: `${row.date}::${row.locationName}::${row.staffId || row.staffName}` },
                               h('td', { style: t.td }, row.staffName),
-                              h('td', { style: t.td }, fmtCurrency(row.bankToBankAmount)),
+                              h('td', { style: t.td }, row.staffId || '—'),
+                              h('td', { style: t.td }, fmtCurrency(row.originalPayoutAmount)),
+                              h('td', { style: t.td }, row.loanPaymentAmount > 0 ? fmtCurrency(row.loanPaymentAmount) : '—'),
+                              h('td', { style: t.td }, row.garnishmentAmount > 0
+                                ? `${fmtCurrency(row.garnishmentAmount)}${row.garnishmentPercent ? ` (${fmtNumber(Math.round(row.garnishmentPercent * 100))}%)` : ''}`
+                                : '—'),
+                              h('td', { style: t.td }, fmtCurrency(row.netPayoutAmount)),
                               h('td', { style: t.td }, formatDateTime(row.lastUpdatedAt))
                             )),
                             h('tr', { style: { background: 'rgba(255,255,255,0.025)' } },
                               h('td', { style: { ...t.td, fontWeight: 700 } }, `${locationGroup.locationName} total`),
+                              h('td', { style: { ...t.td, fontWeight: 700 } }, '—'),
+                              h('td', { style: { ...t.td, fontWeight: 700 } }, fmtCurrency(locationGroup.originalPayoutTotal)),
+                              h('td', { style: { ...t.td, fontWeight: 700 } }, fmtCurrency(locationGroup.loanPaymentTotal)),
+                              h('td', { style: { ...t.td, fontWeight: 700 } }, fmtCurrency(locationGroup.garnishmentTotal)),
                               h('td', { style: { ...t.td, fontWeight: 700 } }, fmtCurrency(locationGroup.branchTotal)),
                               h('td', { style: { ...t.td, fontWeight: 700 } }, formatDateTime(locationGroup.lastUpdatedAt))
                             )
