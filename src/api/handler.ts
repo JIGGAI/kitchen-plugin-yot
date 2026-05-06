@@ -152,6 +152,7 @@ type GarnishmentRule = {
   staffId: string;
   firstName: string;
   lastName: string;
+  locationName: string;
   percent: number;
 };
 
@@ -448,7 +449,7 @@ function normalizeMatchLocation(value: string | null | undefined): string {
     .trim();
 }
 
-function loadGarnishmentRules(): Map<string, GarnishmentRule> {
+function loadGarnishmentRules(): { byStaffId: Map<string, GarnishmentRule>; byNameLocation: Map<string, GarnishmentRule> } {
   try {
     const out = execFileSync('gog', ['sheets', 'get', GARNISHMENTS_SHEET_ID, 'GARNISHMENTS!A1:H1200', '--account', GOG_ACCOUNT, '--json', '--no-input'], {
       encoding: 'utf8',
@@ -456,21 +457,29 @@ function loadGarnishmentRules(): Map<string, GarnishmentRule> {
     });
     const response = JSON.parse(out) as SheetValuesResponse;
     const rows = response.values || [];
-    const rules = new Map<string, GarnishmentRule>();
+    const byStaffId = new Map<string, GarnishmentRule>();
+    const byNameLocation = new Map<string, GarnishmentRule>();
     for (const row of rows.slice(1)) {
       const staffId = cleanString(row[0]);
+      const firstName = cleanString(row[1]) || '';
+      const lastName = cleanString(row[2]) || '';
       const percent = parseGarnishmentPercent(cleanString(row[4]));
+      const locationName = cleanString(row[6]) || '';
       if (!staffId || percent == null) continue;
-      rules.set(staffId, {
+      const rule = {
         staffId,
-        firstName: cleanString(row[1]) || '',
-        lastName: cleanString(row[2]) || '',
+        firstName,
+        lastName,
+        locationName,
         percent,
-      });
+      } satisfies GarnishmentRule;
+      byStaffId.set(staffId, rule);
+      const nameLocationKey = `${normalizeMatchText(`${firstName} ${lastName}`)}::${normalizeMatchLocation(locationName)}`;
+      if (firstName || lastName) byNameLocation.set(nameLocationKey, rule);
     }
-    return rules;
+    return { byStaffId, byNameLocation };
   } catch {
-    return new Map();
+    return { byStaffId: new Map(), byNameLocation: new Map() };
   }
 }
 
@@ -518,7 +527,7 @@ function listPayoutFacts(sqlite: ReturnType<typeof initializeDatabase>['sqlite']
     WHERE ${conditions.join(' AND ')}
     ORDER BY date DESC, location_name ASC, bank_to_bank_amount DESC, staff_name ASC
   `;
-  const rules = loadGarnishmentRules();
+  const garnishmentRules = loadGarnishmentRules();
   const coverageRules = loadCoverageWithholdingRules();
   const rawRows = sqlite.prepare(sqlText).all(...params) as Array<{
     date: string;
@@ -530,7 +539,9 @@ function listPayoutFacts(sqlite: ReturnType<typeof initializeDatabase>['sqlite']
   }>;
   return rawRows.map((row) => {
     const originalPayoutAmount = row.bankToBankAmount;
-    const rule = row.staffId ? rules.get(String(row.staffId)) : undefined;
+    const nameLocationKey = `${normalizeMatchText(row.staffName)}::${normalizeMatchLocation(row.locationName)}`;
+    const rule = (row.staffId ? garnishmentRules.byStaffId.get(String(row.staffId)) : undefined)
+      || garnishmentRules.byNameLocation.get(nameLocationKey);
     const garnishmentPercent = rule?.percent ?? null;
     const garnishmentAmount = garnishmentPercent && originalPayoutAmount != null
       ? Number((originalPayoutAmount * garnishmentPercent).toFixed(2))
