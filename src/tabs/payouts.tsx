@@ -52,6 +52,71 @@ import { api, fmtNumber, formatDateTime, loadCacheMeta, renderCacheSummaryCards,
     return isoDay(d);
   };
 
+  const mostRecentIso = (a: string | null | undefined, b: string | null | undefined) => {
+    if (!a) return b || null;
+    if (!b) return a || null;
+    return new Date(a).getTime() >= new Date(b).getTime() ? a : b;
+  };
+
+  const buildGroupedPayouts = (rows: PayoutRow[], locationTotals: BranchTotalRow[]) => {
+    const totalsByDateLocation = new Map(locationTotals.map((row) => [`${row.date}::${row.locationName}`, row]));
+    const byDate = new Map<string, {
+      date: string;
+      totalPayout: number;
+      stylistKeys: Set<string>;
+      lastUpdatedAt: string | null;
+      locations: Map<string, {
+        locationName: string;
+        rows: PayoutRow[];
+        branchTotal: number | null;
+        stylistCount: number | null;
+        lastUpdatedAt: string | null;
+      }>;
+    }>();
+
+    for (const row of rows) {
+      const dateBucket = byDate.get(row.date) || {
+        date: row.date,
+        totalPayout: 0,
+        stylistKeys: new Set<string>(),
+        lastUpdatedAt: null,
+        locations: new Map(),
+      };
+      dateBucket.totalPayout += row.bankToBankAmount || 0;
+      dateBucket.stylistKeys.add(`${row.locationName}::${row.staffName}`);
+      dateBucket.lastUpdatedAt = mostRecentIso(dateBucket.lastUpdatedAt, row.lastUpdatedAt);
+
+      const locationKey = `${row.date}::${row.locationName}`;
+      const existingTotal = totalsByDateLocation.get(locationKey);
+      const locationBucket = dateBucket.locations.get(row.locationName) || {
+        locationName: row.locationName,
+        rows: [],
+        branchTotal: existingTotal?.branchTotal ?? null,
+        stylistCount: existingTotal?.stylistCount ?? null,
+        lastUpdatedAt: existingTotal?.lastUpdatedAt ?? null,
+      };
+      locationBucket.rows.push(row);
+      locationBucket.lastUpdatedAt = mostRecentIso(locationBucket.lastUpdatedAt, row.lastUpdatedAt);
+      dateBucket.locations.set(row.locationName, locationBucket);
+      byDate.set(row.date, dateBucket);
+    }
+
+    return [...byDate.values()]
+      .sort((a, b) => b.date.localeCompare(a.date))
+      .map((dateBucket) => ({
+        date: dateBucket.date,
+        totalPayout: dateBucket.totalPayout,
+        stylistCount: dateBucket.stylistKeys.size,
+        lastUpdatedAt: dateBucket.lastUpdatedAt,
+        locations: [...dateBucket.locations.values()]
+          .sort((a, b) => a.locationName.localeCompare(b.locationName))
+          .map((locationBucket) => ({
+            ...locationBucket,
+            rows: [...locationBucket.rows].sort((a, b) => (b.bankToBankAmount || 0) - (a.bankToBankAmount || 0) || a.staffName.localeCompare(b.staffName)),
+          })),
+      }));
+  };
+
   function Payouts(props: any) {
     const teamId = typeof props?.teamId === 'string' && props.teamId.trim() ? props.teamId.trim() : null;
     const defaultDay = yesterday();
@@ -175,54 +240,109 @@ import { api, fmtNumber, formatDateTime, loadCacheMeta, renderCacheSummaryCards,
         h('div', { style: t.card }, h('div', { className: 'text-xs', style: t.faint }, 'Days'), h('div', { className: 'mt-1 text-lg font-semibold', style: t.text }, fmtNumber(data?.totals?.dayCount ?? null)))
       ),
       h('div', { style: t.card },
-        h('div', { className: 'text-sm font-medium mb-3', style: t.text }, 'Branch totals'),
-        h('div', { style: t.tableWrap },
-          h('table', { style: t.table },
-            h('thead', null, h('tr', null,
-              h('th', { style: t.th }, 'Day'),
-              h('th', { style: t.th }, 'Branch'),
-              h('th', { style: t.th }, 'Branch total'),
-              h('th', { style: t.th }, 'Stylists'),
-              h('th', { style: t.th }, 'Last updated')
-            )),
-            h('tbody', null,
-              data?.locationTotals?.length
-                ? data.locationTotals.map((row: BranchTotalRow) => h('tr', { key: `${row.date}::${row.locationName}` },
-                    h('td', { style: t.td }, row.date),
-                    h('td', { style: t.td }, row.locationName),
-                    h('td', { style: t.td }, fmtCurrency(row.branchTotal)),
-                    h('td', { style: t.td }, fmtNumber(row.stylistCount)),
-                    h('td', { style: t.td }, formatDateTime(row.lastUpdatedAt))
-                  ))
-                : h('tr', null, h('td', { style: t.td, colSpan: 5 }, loading ? 'Loading branch totals…' : 'No payouts found for this filter.'))
-            )
-          )
-        )
-      ),
-      h('div', { style: t.card },
         h('div', { className: 'text-sm font-medium mb-3', style: t.text }, 'Payout rows'),
-        h('div', { style: t.tableWrap },
-          h('table', { style: t.table },
-            h('thead', null, h('tr', null,
-              h('th', { style: t.th }, 'Day'),
-              h('th', { style: t.th }, 'Branch'),
-              h('th', { style: t.th }, 'Stylist'),
-              h('th', { style: t.th }, 'Payout amount'),
-              h('th', { style: t.th }, 'Last updated')
-            )),
-            h('tbody', null,
-              data?.rows?.length
-                ? data.rows.map((row: PayoutRow) => h('tr', { key: `${row.date}::${row.locationName}::${row.staffName}` },
-                    h('td', { style: t.td }, row.date),
-                    h('td', { style: t.td }, row.locationName),
-                    h('td', { style: t.td }, row.staffName),
-                    h('td', { style: t.td }, fmtCurrency(row.bankToBankAmount)),
-                    h('td', { style: t.td }, formatDateTime(row.lastUpdatedAt))
-                  ))
-                : h('tr', null, h('td', { style: t.td, colSpan: 5 }, loading ? 'Loading payouts…' : 'No payout rows found for this filter.'))
+        data?.rows?.length
+          ? buildGroupedPayouts(data.rows, data.locationTotals || []).map((dayGroup: any) =>
+              h('details', {
+                key: dayGroup.date,
+                open: true,
+                style: {
+                  border: '1px solid var(--ck-border-subtle)',
+                  borderRadius: '10px',
+                  marginBottom: '0.9rem',
+                  overflow: 'hidden',
+                  background: 'rgba(255,255,255,0.02)',
+                }
+              },
+                h('summary', {
+                  style: {
+                    listStyle: 'none',
+                    cursor: 'pointer',
+                    padding: '0.85rem 1rem',
+                    display: 'grid',
+                    gridTemplateColumns: 'minmax(150px, 1.1fr) minmax(140px, 1fr) minmax(100px, 0.8fr) minmax(180px, 1.2fr)',
+                    gap: '0.75rem',
+                    alignItems: 'center',
+                  }
+                },
+                  h('div', { style: { display: 'flex', alignItems: 'center', gap: '0.6rem' } },
+                    h('span', { style: { ...t.faint, fontSize: '0.9rem' } }, '▸'),
+                    h('div', null,
+                      h('div', { className: 'text-xs', style: t.faint }, 'Date'),
+                      h('div', { className: 'text-sm font-medium', style: t.text }, dayGroup.date)
+                    )
+                  ),
+                  h('div', null,
+                    h('div', { className: 'text-xs', style: t.faint }, 'Total payout'),
+                    h('div', { className: 'text-sm font-medium', style: t.text }, fmtCurrency(dayGroup.totalPayout))
+                  ),
+                  h('div', null,
+                    h('div', { className: 'text-xs', style: t.faint }, 'Stylists'),
+                    h('div', { className: 'text-sm font-medium', style: t.text }, fmtNumber(dayGroup.stylistCount))
+                  ),
+                  h('div', null,
+                    h('div', { className: 'text-xs', style: t.faint }, 'Last updated'),
+                    h('div', { className: 'text-sm font-medium', style: t.text }, formatDateTime(dayGroup.lastUpdatedAt))
+                  )
+                ),
+                h('div', { style: { padding: '0 1rem 1rem 1rem' } },
+                  ...dayGroup.locations.map((locationGroup: any) =>
+                    h('div', {
+                      key: `${dayGroup.date}::${locationGroup.locationName}`,
+                      style: {
+                        marginTop: '0.8rem',
+                        border: '1px solid rgba(255,255,255,0.05)',
+                        borderRadius: '10px',
+                        overflow: 'hidden',
+                      }
+                    },
+                      h('div', {
+                        style: {
+                          padding: '0.75rem 0.9rem',
+                          display: 'flex',
+                          justifyContent: 'space-between',
+                          alignItems: 'center',
+                          gap: '0.75rem',
+                          background: 'rgba(255,255,255,0.03)',
+                          borderBottom: '1px solid rgba(255,255,255,0.05)',
+                        }
+                      },
+                        h('div', { className: 'text-sm font-medium', style: t.text }, locationGroup.locationName),
+                        h('div', { className: 'text-xs', style: t.faint }, `${fmtNumber(locationGroup.stylistCount)} stylists`)
+                      ),
+                      h('div', { style: t.tableWrap },
+                        h('table', { style: t.table },
+                          h('thead', null, h('tr', null,
+                            h('th', { style: t.th }, 'Stylist'),
+                            h('th', { style: t.th }, 'Payout amount'),
+                            h('th', { style: t.th }, 'Last updated')
+                          )),
+                          h('tbody', null,
+                            ...locationGroup.rows.map((row: PayoutRow) => h('tr', { key: `${row.date}::${row.locationName}::${row.staffName}` },
+                              h('td', { style: t.td }, row.staffName),
+                              h('td', { style: t.td }, fmtCurrency(row.bankToBankAmount)),
+                              h('td', { style: t.td }, formatDateTime(row.lastUpdatedAt))
+                            )),
+                            h('tr', { style: { background: 'rgba(255,255,255,0.025)' } },
+                              h('td', { style: { ...t.td, fontWeight: 700 } }, `${locationGroup.locationName} total`),
+                              h('td', { style: { ...t.td, fontWeight: 700 } }, fmtCurrency(locationGroup.branchTotal)),
+                              h('td', { style: { ...t.td, fontWeight: 700 } }, formatDateTime(locationGroup.lastUpdatedAt))
+                            )
+                          )
+                        )
+                      )
+                    )
+                  )
+                )
+              )
             )
-          )
-        )
+          : h('div', { style: { ...t.tableWrap } },
+              h('table', { style: t.table },
+                h('tbody', null,
+                  h('tr', null, h('td', { style: t.td }, loading ? 'Loading payouts…' : 'No payout rows found for this filter.'))
+                )
+              )
+            )
       )
     );
   }
