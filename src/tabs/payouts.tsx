@@ -234,7 +234,7 @@ import { api, fmtNumber, formatDateTime, loadCacheMeta, renderCacheSummaryCards,
 
     useEffect(() => {
       if (!groupedPayouts.length) return;
-      setOpenDays((current) => {
+      setOpenDays((current: Record<string, boolean>) => {
         const next = { ...current };
         let changed = false;
         for (const dayGroup of groupedPayouts as any[]) {
