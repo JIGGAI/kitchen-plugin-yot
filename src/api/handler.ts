@@ -134,6 +134,7 @@ type PayoutFactRow = {
   originalPayoutAmount: number | null;
   garnishmentPercent: number | null;
   garnishmentAmount: number;
+  loanPaymentAmount: number;
   netPayoutAmount: number | null;
   lastUpdatedAt: string;
 };
@@ -143,6 +144,7 @@ type PayoutLocationTotalRow = {
   branchTotal: number;
   originalPayoutTotal: number;
   garnishmentTotal: number;
+  loanPaymentTotal: number;
   stylistCount: number;
   lastUpdatedAt: string | null;
 };
@@ -151,6 +153,12 @@ type GarnishmentRule = {
   firstName: string;
   lastName: string;
   percent: number;
+};
+
+type CoverageWithholdingRule = {
+  staffName: string;
+  locationName: string;
+  amount: number;
 };
 
 type SheetValuesResponse = {
@@ -423,6 +431,23 @@ function parseGarnishmentPercent(value: string | null | undefined): number | nul
   return raw > 1 ? raw / 100 : raw;
 }
 
+function normalizeMatchText(value: string | null | undefined): string {
+  return String(value || '')
+    .normalize('NFKD')
+    .replace(/[’']/g, '')
+    .replace(/[^a-zA-Z0-9\s-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+function normalizeMatchLocation(value: string | null | undefined): string {
+  return normalizeMatchText(value)
+    .replace(/\bmi\b|\boh\b|\bpa\b/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function loadGarnishmentRules(): Map<string, GarnishmentRule> {
   try {
     const out = execFileSync('gog', ['sheets', 'get', GARNISHMENTS_SHEET_ID, 'GARNISHMENTS!A1:H1200', '--account', GOG_ACCOUNT, '--json', '--no-input'], {
@@ -442,6 +467,31 @@ function loadGarnishmentRules(): Map<string, GarnishmentRule> {
         lastName: cleanString(row[2]) || '',
         percent,
       });
+    }
+    return rules;
+  } catch {
+    return new Map();
+  }
+}
+
+function loadCoverageWithholdingRules(): Map<string, CoverageWithholdingRule> {
+  try {
+    const out = execFileSync('gog', ['sheets', 'get', GARNISHMENTS_SHEET_ID, `'COVERAGE WITHHOLDINGS'!A1:H1200`, '--account', GOG_ACCOUNT, '--json', '--no-input'], {
+      encoding: 'utf8',
+      maxBuffer: 20 * 1024 * 1024,
+    });
+    const response = JSON.parse(out) as SheetValuesResponse;
+    const rows = response.values || [];
+    const rules = new Map<string, CoverageWithholdingRule>();
+    for (const row of rows) {
+      const staffName = cleanString(row[0]);
+      const locationName = cleanString(row[1]);
+      if (!staffName || !locationName) continue;
+      const statusText = `${cleanString(row[3]) || ''} ${cleanString(row[6]) || ''}`.toLowerCase();
+      if (statusText.includes('paid') || statusText.includes('quit') || statusText.includes('fired')) continue;
+      const amount = 25;
+      const key = `${normalizeMatchText(staffName)}::${normalizeMatchLocation(locationName)}`;
+      rules.set(key, { staffName, locationName, amount });
     }
     return rules;
   } catch {
@@ -469,6 +519,7 @@ function listPayoutFacts(sqlite: ReturnType<typeof initializeDatabase>['sqlite']
     ORDER BY date DESC, location_name ASC, bank_to_bank_amount DESC, staff_name ASC
   `;
   const rules = loadGarnishmentRules();
+  const coverageRules = loadCoverageWithholdingRules();
   const rawRows = sqlite.prepare(sqlText).all(...params) as Array<{
     date: string;
     locationName: string;
@@ -484,6 +535,8 @@ function listPayoutFacts(sqlite: ReturnType<typeof initializeDatabase>['sqlite']
     const garnishmentAmount = garnishmentPercent && originalPayoutAmount != null
       ? Number((originalPayoutAmount * garnishmentPercent).toFixed(2))
       : 0;
+    const coverageKey = `${normalizeMatchText(row.staffName)}::${normalizeMatchLocation(row.locationName)}`;
+    const loanPaymentAmount = coverageRules.get(coverageKey)?.amount ?? 0;
     const netPayoutAmount = originalPayoutAmount == null
       ? null
       : Number((originalPayoutAmount - garnishmentAmount).toFixed(2));
@@ -492,6 +545,7 @@ function listPayoutFacts(sqlite: ReturnType<typeof initializeDatabase>['sqlite']
       originalPayoutAmount,
       garnishmentPercent,
       garnishmentAmount,
+      loanPaymentAmount,
       netPayoutAmount,
     } satisfies PayoutFactRow;
   });
@@ -501,6 +555,7 @@ function computePayoutTotals(rows: PayoutFactRow[]) {
   let payoutTotal = 0;
   let originalPayoutTotal = 0;
   let garnishmentTotal = 0;
+  let loanPaymentTotal = 0;
   let lastUpdatedAt: string | null = null;
   const dates = new Set<string>();
   const branches = new Set<string>();
@@ -509,6 +564,7 @@ function computePayoutTotals(rows: PayoutFactRow[]) {
     payoutTotal += asNumber(row.netPayoutAmount);
     originalPayoutTotal += asNumber(row.originalPayoutAmount);
     garnishmentTotal += asNumber(row.garnishmentAmount);
+    loanPaymentTotal += asNumber(row.loanPaymentAmount);
     if (row.date) dates.add(row.date);
     if (row.locationName) branches.add(row.locationName);
     if (row.staffName) stylists.add(`${row.date}::${row.locationName}::${row.staffName}`);
@@ -518,6 +574,7 @@ function computePayoutTotals(rows: PayoutFactRow[]) {
     payoutTotal,
     originalPayoutTotal,
     garnishmentTotal,
+    loanPaymentTotal,
     rowCount: rows.length,
     dayCount: dates.size,
     branchCount: branches.size,
@@ -536,12 +593,14 @@ function buildPayoutLocationTotals(rows: PayoutFactRow[]): PayoutLocationTotalRo
       branchTotal: 0,
       originalPayoutTotal: 0,
       garnishmentTotal: 0,
+      loanPaymentTotal: 0,
       stylistCount: 0,
       lastUpdatedAt: null,
     };
     bucket.branchTotal += asNumber(row.netPayoutAmount);
     bucket.originalPayoutTotal += asNumber(row.originalPayoutAmount);
     bucket.garnishmentTotal += asNumber(row.garnishmentAmount);
+    bucket.loanPaymentTotal += asNumber(row.loanPaymentAmount);
     bucket.stylistCount += 1;
     bucket.lastUpdatedAt = mostRecentIso(bucket.lastUpdatedAt, row.lastUpdatedAt || null);
     buckets.set(key, bucket);

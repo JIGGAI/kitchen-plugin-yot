@@ -17,6 +17,7 @@ import { api, fmtNumber, formatDateTime, loadCacheMeta, renderCacheSummaryCards,
     originalPayoutAmount: number | null;
     garnishmentPercent: number | null;
     garnishmentAmount: number;
+    loanPaymentAmount: number;
     netPayoutAmount: number | null;
     lastUpdatedAt: string;
   };
@@ -26,6 +27,7 @@ import { api, fmtNumber, formatDateTime, loadCacheMeta, renderCacheSummaryCards,
     branchTotal: number;
     originalPayoutTotal: number;
     garnishmentTotal: number;
+    loanPaymentTotal: number;
     stylistCount: number;
     lastUpdatedAt: string | null;
   };
@@ -33,6 +35,7 @@ import { api, fmtNumber, formatDateTime, loadCacheMeta, renderCacheSummaryCards,
     payoutTotal: number;
     originalPayoutTotal: number;
     garnishmentTotal: number;
+    loanPaymentTotal: number;
     rowCount: number;
     dayCount: number;
     branchCount: number;
@@ -74,6 +77,7 @@ import { api, fmtNumber, formatDateTime, loadCacheMeta, renderCacheSummaryCards,
       totalPayout: number;
       originalPayoutTotal: number;
       garnishmentTotal: number;
+      loanPaymentTotal: number;
       stylistKeys: Set<string>;
       lastUpdatedAt: string | null;
       locations: Map<string, {
@@ -82,6 +86,7 @@ import { api, fmtNumber, formatDateTime, loadCacheMeta, renderCacheSummaryCards,
         branchTotal: number | null;
         originalPayoutTotal: number | null;
         garnishmentTotal: number | null;
+        loanPaymentTotal: number | null;
         stylistCount: number | null;
         lastUpdatedAt: string | null;
       }>;
@@ -93,6 +98,7 @@ import { api, fmtNumber, formatDateTime, loadCacheMeta, renderCacheSummaryCards,
         totalPayout: 0,
         originalPayoutTotal: 0,
         garnishmentTotal: 0,
+        loanPaymentTotal: 0,
         stylistKeys: new Set<string>(),
         lastUpdatedAt: null,
         locations: new Map(),
@@ -100,6 +106,7 @@ import { api, fmtNumber, formatDateTime, loadCacheMeta, renderCacheSummaryCards,
       dateBucket.totalPayout += row.netPayoutAmount || 0;
       dateBucket.originalPayoutTotal += row.originalPayoutAmount || 0;
       dateBucket.garnishmentTotal += row.garnishmentAmount || 0;
+      dateBucket.loanPaymentTotal += row.loanPaymentAmount || 0;
       dateBucket.stylistKeys.add(`${row.locationName}::${row.staffName}`);
       dateBucket.lastUpdatedAt = mostRecentIso(dateBucket.lastUpdatedAt, row.lastUpdatedAt);
 
@@ -111,6 +118,7 @@ import { api, fmtNumber, formatDateTime, loadCacheMeta, renderCacheSummaryCards,
         branchTotal: existingTotal?.branchTotal ?? null,
         originalPayoutTotal: existingTotal?.originalPayoutTotal ?? null,
         garnishmentTotal: existingTotal?.garnishmentTotal ?? null,
+        loanPaymentTotal: existingTotal?.loanPaymentTotal ?? null,
         stylistCount: existingTotal?.stylistCount ?? null,
         lastUpdatedAt: existingTotal?.lastUpdatedAt ?? null,
       };
@@ -127,6 +135,7 @@ import { api, fmtNumber, formatDateTime, loadCacheMeta, renderCacheSummaryCards,
         totalPayout: dateBucket.totalPayout,
         originalPayoutTotal: dateBucket.originalPayoutTotal,
         garnishmentTotal: dateBucket.garnishmentTotal,
+        loanPaymentTotal: dateBucket.loanPaymentTotal,
         stylistCount: dateBucket.stylistKeys.size,
         lastUpdatedAt: dateBucket.lastUpdatedAt,
         locations: [...dateBucket.locations.values()]
@@ -275,6 +284,7 @@ import { api, fmtNumber, formatDateTime, loadCacheMeta, renderCacheSummaryCards,
       h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '0.75rem' } },
         h('div', { style: t.card }, h('div', { className: 'text-xs', style: t.faint }, 'Net payout total'), h('div', { className: 'mt-1 text-lg font-semibold', style: t.text }, fmtCurrency(data?.totals?.payoutTotal ?? null))),
         h('div', { style: t.card }, h('div', { className: 'text-xs', style: t.faint }, 'Garnishments total'), h('div', { className: 'mt-1 text-lg font-semibold', style: t.text }, fmtCurrency(data?.totals?.garnishmentTotal ?? null))),
+        h('div', { style: t.card }, h('div', { className: 'text-xs', style: t.faint }, 'Loan payments total'), h('div', { className: 'mt-1 text-lg font-semibold', style: t.text }, fmtCurrency(data?.totals?.loanPaymentTotal ?? null))),
         h('div', { style: t.card }, h('div', { className: 'text-xs', style: t.faint }, 'Original payout total'), h('div', { className: 'mt-1 text-lg font-semibold', style: t.text }, fmtCurrency(data?.totals?.originalPayoutTotal ?? null))),
         h('div', { style: t.card }, h('div', { className: 'text-xs', style: t.faint }, 'Branches'), h('div', { className: 'mt-1 text-lg font-semibold', style: t.text }, fmtNumber(data?.totals?.branchCount ?? null))),
         h('div', { style: t.card }, h('div', { className: 'text-xs', style: t.faint }, 'Stylists'), h('div', { className: 'mt-1 text-lg font-semibold', style: t.text }, fmtNumber(data?.totals?.stylistCount ?? null))),
@@ -342,6 +352,7 @@ import { api, fmtNumber, formatDateTime, loadCacheMeta, renderCacheSummaryCards,
                   },
                     h('span', null, `Original: ${fmtCurrency(dayGroup.originalPayoutTotal)}`),
                     h('span', null, `Garnishments: ${fmtCurrency(dayGroup.garnishmentTotal)}`),
+                    h('span', null, `Loan payments: ${fmtCurrency(dayGroup.loanPaymentTotal)}`),
                     h('span', null, `Net: ${fmtCurrency(dayGroup.totalPayout)}`)
                   ),
                   ...dayGroup.locations.map((locationGroup: any) =>
@@ -366,7 +377,7 @@ import { api, fmtNumber, formatDateTime, loadCacheMeta, renderCacheSummaryCards,
                         }
                       },
                         h('div', { className: 'text-sm font-medium', style: t.text }, locationGroup.locationName),
-                        h('div', { className: 'text-xs', style: t.faint }, `${fmtNumber(locationGroup.stylistCount)} stylists • ${fmtCurrency(locationGroup.branchTotal)} net`)
+                        h('div', { className: 'text-xs', style: t.faint }, `${fmtNumber(locationGroup.stylistCount)} stylists • ${fmtCurrency(locationGroup.branchTotal)} net • ${fmtCurrency(locationGroup.loanPaymentTotal)} loans`)
                       ),
                       h('div', { style: t.tableWrap },
                         h('table', { style: t.table },
@@ -374,6 +385,7 @@ import { api, fmtNumber, formatDateTime, loadCacheMeta, renderCacheSummaryCards,
                             h('th', { style: t.th }, 'Stylist'),
                             h('th', { style: t.th }, 'Staff ID'),
                             h('th', { style: t.th }, 'Original payout'),
+                            h('th', { style: t.th }, 'Loan payment'),
                             h('th', { style: t.th }, 'Garnishment'),
                             h('th', { style: t.th }, 'Net payout'),
                             h('th', { style: t.th }, 'Last updated')
@@ -383,6 +395,7 @@ import { api, fmtNumber, formatDateTime, loadCacheMeta, renderCacheSummaryCards,
                               h('td', { style: t.td }, row.staffName),
                               h('td', { style: t.td }, row.staffId || '—'),
                               h('td', { style: t.td }, fmtCurrency(row.originalPayoutAmount)),
+                              h('td', { style: t.td }, row.loanPaymentAmount > 0 ? fmtCurrency(row.loanPaymentAmount) : '—'),
                               h('td', { style: t.td }, row.garnishmentAmount > 0
                                 ? `${fmtCurrency(row.garnishmentAmount)}${row.garnishmentPercent ? ` (${fmtNumber(Math.round(row.garnishmentPercent * 100))}%)` : ''}`
                                 : '—'),
@@ -393,6 +406,7 @@ import { api, fmtNumber, formatDateTime, loadCacheMeta, renderCacheSummaryCards,
                               h('td', { style: { ...t.td, fontWeight: 700 } }, `${locationGroup.locationName} total`),
                               h('td', { style: { ...t.td, fontWeight: 700 } }, '—'),
                               h('td', { style: { ...t.td, fontWeight: 700 } }, fmtCurrency(locationGroup.originalPayoutTotal)),
+                              h('td', { style: { ...t.td, fontWeight: 700 } }, fmtCurrency(locationGroup.loanPaymentTotal)),
                               h('td', { style: { ...t.td, fontWeight: 700 } }, fmtCurrency(locationGroup.garnishmentTotal)),
                               h('td', { style: { ...t.td, fontWeight: 700 } }, fmtCurrency(locationGroup.branchTotal)),
                               h('td', { style: { ...t.td, fontWeight: 700 } }, formatDateTime(locationGroup.lastUpdatedAt))
