@@ -78,8 +78,9 @@ export async function syncStaffCashoutFromReport(options: SyncStaffCashoutOption
     const upsert = sqlite.prepare(`
       INSERT INTO staff_cashout_facts (
         team_id, date, location_name, staff_name, location_id, staff_id,
-        service_revenue, product_revenue, tips, total_revenue, last_updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        service_revenue, product_revenue, tips, total_revenue,
+        total_cash_received, bank_to_bank_amount, last_updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(team_id, date, location_name, staff_name) DO UPDATE SET
         location_id = excluded.location_id,
         staff_id = excluded.staff_id,
@@ -87,6 +88,8 @@ export async function syncStaffCashoutFromReport(options: SyncStaffCashoutOption
         product_revenue = excluded.product_revenue,
         tips = excluded.tips,
         total_revenue = excluded.total_revenue,
+        total_cash_received = excluded.total_cash_received,
+        bank_to_bank_amount = excluded.bank_to_bank_amount,
         last_updated_at = excluded.last_updated_at
     `);
 
@@ -109,6 +112,8 @@ export async function syncStaffCashoutFromReport(options: SyncStaffCashoutOption
           row.productRevenue,
           row.tips,
           row.totalRevenue,
+          row.totalCashReceived,
+          row.bankToBankAmount,
           lastUpdatedAt,
         );
         rowsWritten += 1;
@@ -158,6 +163,8 @@ export type StaffCashoutCacheRow = {
   productRevenue: number | null;
   tips: number | null;
   totalRevenue: number | null;
+  totalCashReceived: number | null;
+  bankToBankAmount: number | null;
   lastUpdatedAt: string;
 };
 
@@ -176,10 +183,13 @@ export function listStaffCashoutFacts(
   const sql = `
     SELECT date, location_name AS locationName, staff_name AS staffName,
            service_revenue AS serviceRevenue, product_revenue AS productRevenue,
-           tips, total_revenue AS totalRevenue, last_updated_at AS lastUpdatedAt
+           tips, total_revenue AS totalRevenue,
+           total_cash_received AS totalCashReceived,
+           bank_to_bank_amount AS bankToBankAmount,
+           last_updated_at AS lastUpdatedAt
     FROM staff_cashout_facts
     WHERE ${conditions.join(' AND ')}
-    ORDER BY date DESC, location_name ASC, total_revenue DESC
+    ORDER BY date DESC, location_name ASC, bank_to_bank_amount DESC, total_revenue DESC
   `;
   return sqlite.prepare(sql).all(...params) as StaffCashoutCacheRow[];
 }

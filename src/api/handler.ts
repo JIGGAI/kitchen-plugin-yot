@@ -124,6 +124,20 @@ type RelationshipComputation = RelationshipSummary;
 
 type RevenueGrain = 'day' | 'week' | 'month';
 type RevenueFactRow = schema.RevenueFact & { locationName: string | null };
+type PayoutFactRow = {
+  date: string;
+  locationName: string;
+  staffName: string;
+  bankToBankAmount: number | null;
+  lastUpdatedAt: string;
+};
+type PayoutLocationTotalRow = {
+  date: string;
+  locationName: string;
+  branchTotal: number;
+  stylistCount: number;
+  lastUpdatedAt: string | null;
+};
 type RevenuePeriodAccumulator = {
   periodKey: string;
   periodStart: string;
@@ -377,6 +391,72 @@ function listRevenueFacts(db: ReturnType<typeof initializeDatabase>['db'], teamI
   if (filters.startDate) rows = rows.filter((row) => row.date >= filters.startDate!);
   if (filters.endDate) rows = rows.filter((row) => row.date <= filters.endDate!);
   return rows.map((row) => ({ ...row, locationName: nameByLocationId.get(row.locationId) ?? null }));
+}
+
+function listPayoutFacts(sqlite: ReturnType<typeof initializeDatabase>['sqlite'], teamId: string, filters: { startDate?: string | null; endDate?: string | null; locationName?: string | null } = {}): PayoutFactRow[] {
+  const startDate = filters.startDate ? String(filters.startDate).slice(0, 10) : null;
+  const endDate = filters.endDate ? String(filters.endDate).slice(0, 10) : null;
+  const conditions: string[] = ['team_id = ?', 'bank_to_bank_amount IS NOT NULL'];
+  const params: Array<string> = [teamId];
+  if (startDate) { conditions.push('date >= ?'); params.push(startDate); }
+  if (endDate) { conditions.push('date <= ?'); params.push(endDate); }
+  if (filters.locationName) { conditions.push('location_name = ?'); params.push(filters.locationName); }
+  const sqlText = `
+    SELECT date,
+           location_name AS locationName,
+           staff_name AS staffName,
+           bank_to_bank_amount AS bankToBankAmount,
+           last_updated_at AS lastUpdatedAt
+    FROM staff_cashout_facts
+    WHERE ${conditions.join(' AND ')}
+    ORDER BY date DESC, location_name ASC, bank_to_bank_amount DESC, staff_name ASC
+  `;
+  return sqlite.prepare(sqlText).all(...params) as PayoutFactRow[];
+}
+
+function computePayoutTotals(rows: PayoutFactRow[]) {
+  let payoutTotal = 0;
+  let lastUpdatedAt: string | null = null;
+  const dates = new Set<string>();
+  const branches = new Set<string>();
+  const stylists = new Set<string>();
+  for (const row of rows) {
+    payoutTotal += asNumber(row.bankToBankAmount);
+    if (row.date) dates.add(row.date);
+    if (row.locationName) branches.add(row.locationName);
+    if (row.staffName) stylists.add(`${row.date}::${row.locationName}::${row.staffName}`);
+    lastUpdatedAt = mostRecentIso(lastUpdatedAt, row.lastUpdatedAt || null);
+  }
+  return {
+    payoutTotal,
+    rowCount: rows.length,
+    dayCount: dates.size,
+    branchCount: branches.size,
+    stylistCount: stylists.size,
+    lastUpdatedAt,
+  };
+}
+
+function buildPayoutLocationTotals(rows: PayoutFactRow[]): PayoutLocationTotalRow[] {
+  const buckets = new Map<string, PayoutLocationTotalRow>();
+  for (const row of rows) {
+    const key = `${row.date}::${row.locationName}`;
+    const bucket = buckets.get(key) || {
+      date: row.date,
+      locationName: row.locationName,
+      branchTotal: 0,
+      stylistCount: 0,
+      lastUpdatedAt: null,
+    };
+    bucket.branchTotal += asNumber(row.bankToBankAmount);
+    bucket.stylistCount += 1;
+    bucket.lastUpdatedAt = mostRecentIso(bucket.lastUpdatedAt, row.lastUpdatedAt || null);
+    buckets.set(key, bucket);
+  }
+  return [...buckets.values()].sort((a, b) => {
+    if (a.date !== b.date) return b.date.localeCompare(a.date);
+    return a.locationName.localeCompare(b.locationName);
+  });
 }
 
 function computeRevenueTotals(rows: RevenueFactRow[]) {
@@ -1458,6 +1538,27 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       return { status: 200, data: { startDate, endDate, locationName: locationName || null, rows, lastSyncedAt } };
     } catch (error: any) {
       return apiError(500, 'DATABASE_ERROR', error?.message || 'Failed to read staff cashout facts');
+    }
+  }
+
+  if (req.path === '/payouts' && req.method === 'GET') {
+    try {
+      const { sqlite } = initializeDatabase(teamId);
+      const requestedStart = toDateOnlyInput(req.query.startDate || req.query.dateFrom || req.query.start || req.query.date);
+      const requestedEnd = toDateOnlyInput(req.query.endDate || req.query.dateTo || req.query.end || req.query.date);
+      const anchorEnd = addDaysToDateOnly(dateOnlyNow(), -1);
+      const endDate = requestedEnd || anchorEnd;
+      const startDate = requestedStart || endDate;
+      const locationName = cleanString(req.query.location || req.query.locationName);
+      const rows = listPayoutFacts(sqlite, teamId, { startDate, endDate, locationName }).filter((row) => asNumber(row.bankToBankAmount) > 0);
+      const locationTotals = buildPayoutLocationTotals(rows);
+      const totals = computePayoutTotals(rows);
+      const lastSyncedAt = (sqlite
+        .prepare("SELECT last_synced_at AS lastSyncedAt FROM sync_state WHERE team_id = ? AND resource = 'staff_cashout_facts'")
+        .get(teamId) as { lastSyncedAt?: string } | undefined)?.lastSyncedAt || null;
+      return { status: 200, data: { startDate, endDate, locationName: locationName || null, rows, locationTotals, totals, lastSyncedAt } };
+    } catch (error: any) {
+      return apiError(500, 'DATABASE_ERROR', error?.message || 'Failed to read payout facts');
     }
   }
 

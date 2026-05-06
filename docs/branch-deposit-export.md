@@ -32,14 +32,14 @@ npm run export:branch-deposits -- --date=2026-05-05
 - Organisation: `11082`
 - Google account: `govna.assistant@gmail.com`
 - Branch sheet: `1jIFWOMmvMVbGULUbDpEqV2e6CsXy_DzhBrCorV9H-EA`
-- Output dir: `~/Downloads/branch-deposits`
+- Output dir: `/Users/hairmx/hmx-reports`
 
 ## Output files
 
 For `--date=2026-05-05` the script writes:
 
-- `~/Downloads/branch-deposits/branch-deposits-2026-05-05.csv`
-- `~/Downloads/branch-deposits/branch-deposits-2026-05-05.diagnostics.json`
+- `/Users/hairmx/hmx-reports/branch-deposits-2026-05-05.csv`
+- `/Users/hairmx/hmx-reports/branch-deposits-2026-05-05.diagnostics.json`
 
 ## Notes
 

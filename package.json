@@ -43,6 +43,12 @@
         "bundle": "./dist/tabs/revenue.js"
       },
       {
+        "id": "payouts",
+        "label": "Payouts",
+        "icon": "wallet",
+        "bundle": "./dist/tabs/payouts.js"
+      },
+      {
         "id": "promotion",
         "label": "Promotion",
         "icon": "ticket",

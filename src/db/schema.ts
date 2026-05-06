@@ -209,6 +209,8 @@ export const staffCashoutFacts = sqliteTable('staff_cashout_facts', {
   productRevenue: real('product_revenue'),
   tips: real('tips'),
   totalRevenue: real('total_revenue'),
+  totalCashReceived: real('total_cash_received'),
+  bankToBankAmount: real('bank_to_bank_amount'),
   lastUpdatedAt: text('last_updated_at').notNull(),
 }, (t) => ({
   pk: primaryKey({ columns: [t.teamId, t.date, t.locationName, t.staffName] }),

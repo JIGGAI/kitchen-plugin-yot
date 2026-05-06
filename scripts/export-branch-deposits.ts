@@ -75,7 +75,7 @@ const DEFAULT_SHEET_ID = '1jIFWOMmvMVbGULUbDpEqV2e6CsXy_DzhBrCorV9H-EA';
 const DEFAULT_ACCOUNT = 'govna.assistant@gmail.com';
 const DEFAULT_TEAM_ID = 'hmx-marketing-team';
 const DEFAULT_ORGANISATION_ID = 11082;
-const DEFAULT_OUTPUT_DIR = path.join(homedir(), 'Downloads', 'branch-deposits');
+const DEFAULT_OUTPUT_DIR = '/Users/hairmx/hmx-reports';
 const NEW_YORK_TZ = 'America/New_York';
 
 function parseArgs(argv: string[]): Args {
