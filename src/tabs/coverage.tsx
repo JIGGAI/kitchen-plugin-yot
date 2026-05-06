@@ -67,6 +67,13 @@ import { api, formatDateTime, modal, t } from './common';
 
   function hhmm(iso: string): string { return iso.slice(11, 16); }
 
+  function fmtSlotDate(iso: string): string {
+    if (!iso) return '';
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return iso.slice(0, 10);
+    return d.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
+  }
+
   function deepError(e: any): string {
     return String(e?.message || e || 'unknown error');
   }
@@ -363,7 +370,7 @@ import { api, formatDateTime, modal, t } from './common';
       // Find-cover modal
       selected ? modal(h, {
         title: `Find cover · ${selected.locationName}`,
-        subtitle: `${hhmm(selected.slot.startsAt)}–${hhmm(selected.slot.endsAt)} · need ${selected.slot.requiredStylists}, have ${selected.slot.scheduledStylists}`,
+        subtitle: `${fmtSlotDate(selected.slot.startsAt)} · ${hhmm(selected.slot.startsAt)}–${hhmm(selected.slot.endsAt)} · need ${selected.slot.requiredStylists}, have ${selected.slot.scheduledStylists}`,
         onClose: () => { setSelected(null); setCandidates([]); },
         children: h('div', { style: { display: 'flex', flexDirection: 'column', gap: '1rem' } },
           h('div', { style: { display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap' } },
