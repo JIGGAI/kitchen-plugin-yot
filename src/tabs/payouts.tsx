@@ -218,8 +218,8 @@ import { api, fmtNumber, formatDateTime, loadCacheMeta, renderCacheSummaryCards,
           startDate ? `startDate=${encodeURIComponent(startDate)}` : '',
           endDate ? `endDate=${encodeURIComponent(endDate)}` : '',
         ].filter(Boolean).join('&');
-        const res = await api('yot', teamId, `/staff-cashout/sync${params ? `?${params}` : ''}`, { method: 'POST', headers: { 'content-type': 'application/json' } }) as any;
-        setMessage(`Payout sync complete • ${fmtNumber(res?.rowsWritten)} rows written from ${res?.startDate || startDate} to ${res?.endDate || endDate}`);
+        const res = await api('yot', teamId, `/payouts/sync${params ? `?${params}` : ''}`, { method: 'POST', headers: { 'content-type': 'application/json' } }) as any;
+        setMessage(`Payout export complete • ${fmtNumber(res?.dayCount)} day${res?.dayCount === 1 ? '' : 's'} regenerated from ${res?.startDate || startDate} to ${res?.endDate || endDate}`);
         await Promise.all([loadMeta(), load()]);
       } catch (e: any) {
         setError(e?.message || 'Failed to sync payouts');
@@ -254,7 +254,7 @@ import { api, fmtNumber, formatDateTime, loadCacheMeta, renderCacheSummaryCards,
         h('div', { className: 'flex items-start justify-between gap-2' },
           h('div', null,
             h('div', { className: 'text-sm font-medium', style: t.text }, 'Payouts'),
-            h('div', { className: 'mt-1 text-xs', style: t.faint }, 'Bank-to-bank payout amounts from cached YOT Staff Cashout data.')
+            h('div', { className: 'mt-1 text-xs', style: t.faint }, 'Finalized payout rows sourced from the branch export files in /Users/hairmx/hmx-reports.')
           ),
           h('button', { type: 'button', onClick: () => void refreshAll(), style: t.btnGhost, disabled: loading || !!busy }, loading ? 'Loading…' : '↻ Refresh')
         ),
@@ -278,7 +278,7 @@ import { api, fmtNumber, formatDateTime, loadCacheMeta, renderCacheSummaryCards,
         h('div', { className: 'mt-3 flex flex-wrap gap-2' },
           h('button', { type: 'button', style: t.btnPrimary, onClick: () => { setStartDate(startDateInput); setEndDate(endDateInput); } }, 'Apply filters'),
           h('button', { type: 'button', style: t.btnGhost, onClick: () => { const day = yesterday(); setLocationName(''); setStartDateInput(day); setEndDateInput(day); setStartDate(day); setEndDate(day); } }, 'Reset to yesterday'),
-          h('button', { type: 'button', style: t.btnGhost, disabled: !!busy, onClick: () => void runSync() }, busy === 'sync' ? 'Syncing…' : 'Sync range')
+          h('button', { type: 'button', style: t.btnGhost, disabled: !!busy, onClick: () => void runSync() }, busy === 'sync' ? 'Regenerating…' : 'Regenerate range')
         )
       ),
       h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '0.75rem' } },

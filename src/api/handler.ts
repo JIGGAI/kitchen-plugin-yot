@@ -2,7 +2,7 @@
 // Kitchen invokes handleRequest({ path, method, query, headers, body }, ctx)
 // and expects { status, data } back.
 
-import { mkdirSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import path from 'path';
 import { randomUUID } from 'crypto';
 import { execFileSync } from 'child_process';
@@ -138,6 +138,31 @@ type PayoutFactRow = {
   netPayoutAmount: number | null;
   lastUpdatedAt: string;
 };
+
+type ExportCsvRow = {
+  staffId: string;
+  firstName: string;
+  lastName: string;
+  type: 'Deposit';
+  amount: number;
+  transactionId: string;
+  location: string;
+};
+
+type PayoutExportDiagnostics = {
+  date: string;
+  generatedAt: string;
+  garnishmentPayoutRows?: Array<{
+    staffId: string;
+    firstName: string;
+    lastName: string;
+    type: 'GARNISHMENT';
+    amount: number;
+    transactionId: string;
+    location: string;
+    date: string;
+  }>;
+};
 type PayoutLocationTotalRow = {
   date: string;
   locationName: string;
@@ -148,24 +173,6 @@ type PayoutLocationTotalRow = {
   stylistCount: number;
   lastUpdatedAt: string | null;
 };
-type GarnishmentRule = {
-  staffId: string;
-  firstName: string;
-  lastName: string;
-  locationName: string;
-  percent: number;
-};
-
-type CoverageWithholdingRule = {
-  staffName: string;
-  locationName: string;
-  amount: number;
-};
-
-type SheetValuesResponse = {
-  values?: string[][];
-};
-
 type RevenuePeriodAccumulator = {
   periodKey: string;
   periodStart: string;
@@ -218,8 +225,7 @@ type PromotionMatrixAccumulator = {
 
 const REPORTS_TIME_ZONE = 'America/New_York';
 const DEFAULT_REVENUE_ORGANISATION_ID = 11082;
-const GOG_ACCOUNT = 'govna.assistant@gmail.com';
-const GARNISHMENTS_SHEET_ID = '1pvwN3h0X9ZsdhpH024zue9DlE4NaZiuzTia5NMoEn6c';
+const PAYOUT_EXPORT_DIR = '/Users/hairmx/hmx-reports';
 
 function mostRecentIso(a: string | null, b: string | null): string | null {
   if (!a) return b;
@@ -423,15 +429,6 @@ function listRevenueFacts(db: ReturnType<typeof initializeDatabase>['db'], teamI
   return rows.map((row) => ({ ...row, locationName: nameByLocationId.get(row.locationId) ?? null }));
 }
 
-function parseGarnishmentPercent(value: string | null | undefined): number | null {
-  if (!value) return null;
-  const cleaned = String(value).replace(/[%\s]/g, '').trim();
-  if (!cleaned) return null;
-  const raw = Number(cleaned);
-  if (!Number.isFinite(raw) || raw <= 0) return null;
-  return raw > 1 ? raw / 100 : raw;
-}
-
 function normalizeMatchText(value: string | null | undefined): string {
   return String(value || '')
     .normalize('NFKD')
@@ -449,117 +446,128 @@ function normalizeMatchLocation(value: string | null | undefined): string {
     .trim();
 }
 
-function loadGarnishmentRules(): { byStaffId: Map<string, GarnishmentRule>; byNameLocation: Map<string, GarnishmentRule> } {
-  try {
-    const out = execFileSync('gog', ['sheets', 'get', GARNISHMENTS_SHEET_ID, 'GARNISHMENTS!A1:H1200', '--account', GOG_ACCOUNT, '--json', '--no-input'], {
-      encoding: 'utf8',
-      maxBuffer: 20 * 1024 * 1024,
-    });
-    const response = JSON.parse(out) as SheetValuesResponse;
-    const rows = response.values || [];
-    const byStaffId = new Map<string, GarnishmentRule>();
-    const byNameLocation = new Map<string, GarnishmentRule>();
-    for (const row of rows.slice(1)) {
-      const staffId = cleanString(row[0]);
-      const firstName = cleanString(row[1]) || '';
-      const lastName = cleanString(row[2]) || '';
-      const percent = parseGarnishmentPercent(cleanString(row[4]));
-      const locationName = cleanString(row[6]) || '';
-      if (!staffId || percent == null) continue;
-      const rule = {
-        staffId,
-        firstName,
-        lastName,
-        locationName,
-        percent,
-      } satisfies GarnishmentRule;
-      byStaffId.set(staffId, rule);
-      const nameLocationKey = `${normalizeMatchText(`${firstName} ${lastName}`)}::${normalizeMatchLocation(locationName)}`;
-      if (firstName || lastName) byNameLocation.set(nameLocationKey, rule);
+function parseCsvRow(line: string): string[] {
+  const cells: string[] = [];
+  let current = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i += 1) {
+    const char = line[i]!;
+    if (char === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        current += '"';
+        i += 1;
+      } else {
+        inQuotes = !inQuotes;
+      }
+      continue;
     }
-    return { byStaffId, byNameLocation };
-  } catch {
-    return { byStaffId: new Map(), byNameLocation: new Map() };
+    if (char === ',' && !inQuotes) {
+      cells.push(current);
+      current = '';
+      continue;
+    }
+    current += char;
   }
+  cells.push(current);
+  return cells;
 }
 
-function loadCoverageWithholdingRules(): Map<string, CoverageWithholdingRule> {
-  try {
-    const out = execFileSync('gog', ['sheets', 'get', GARNISHMENTS_SHEET_ID, `'COVERAGE WITHHOLDINGS'!A1:H1200`, '--account', GOG_ACCOUNT, '--json', '--no-input'], {
-      encoding: 'utf8',
-      maxBuffer: 20 * 1024 * 1024,
-    });
-    const response = JSON.parse(out) as SheetValuesResponse;
-    const rows = response.values || [];
-    const rules = new Map<string, CoverageWithholdingRule>();
-    for (const row of rows) {
-      const staffName = cleanString(row[0]);
-      const locationName = cleanString(row[1]);
-      if (!staffName || !locationName) continue;
-      const statusText = `${cleanString(row[3]) || ''} ${cleanString(row[6]) || ''}`.toLowerCase();
-      if (statusText.includes('paid') || statusText.includes('quit') || statusText.includes('fired')) continue;
-      const amount = 25;
-      const key = `${normalizeMatchText(staffName)}::${normalizeMatchLocation(locationName)}`;
-      rules.set(key, { staffName, locationName, amount });
-    }
-    return rules;
-  } catch {
-    return new Map();
-  }
+function parseExportCsv(text: string): ExportCsvRow[] {
+  const lines = text.split(/\r?\n/).filter(Boolean);
+  if (lines.length <= 1) return [];
+  return lines.slice(1).map((line) => {
+    const [staffId = '', firstName = '', lastName = '', type = 'Deposit', amount = '0', transactionId = '', location = ''] = parseCsvRow(line);
+    return {
+      staffId: String(staffId).trim(),
+      firstName: String(firstName).trim(),
+      lastName: String(lastName).trim(),
+      type: 'Deposit' as const,
+      amount: Number(String(amount).replace(/[$,]/g, '').trim() || '0') || 0,
+      transactionId: String(transactionId).trim(),
+      location: String(location).trim(),
+    };
+  }).filter((row) => row.staffId || row.transactionId || row.location);
 }
 
-function listPayoutFacts(sqlite: ReturnType<typeof initializeDatabase>['sqlite'], teamId: string, filters: { startDate?: string | null; endDate?: string | null; locationName?: string | null } = {}): PayoutFactRow[] {
+function readPayoutExportForDate(date: string): { rows: PayoutFactRow[]; generatedAt: string | null } {
+  const csvPath = path.join(PAYOUT_EXPORT_DIR, `branch-deposits-${date}.csv`);
+  const diagnosticsPath = path.join(PAYOUT_EXPORT_DIR, `branch-deposits-${date}.diagnostics.json`);
+  if (!existsSync(csvPath)) return { rows: [], generatedAt: null };
+
+  const csvRows = parseExportCsv(readFileSync(csvPath, 'utf8'));
+  const diagnostics = existsSync(diagnosticsPath)
+    ? JSON.parse(readFileSync(diagnosticsPath, 'utf8')) as PayoutExportDiagnostics
+    : null;
+  const generatedAt = diagnostics?.generatedAt || `${date}T00:00:00.000Z`;
+  const garnishmentRows = diagnostics?.garnishmentPayoutRows || [];
+  const garnishmentByKey = new Map<string, number>();
+  for (const row of garnishmentRows) {
+    const key = `${row.staffId}::${row.transactionId}::${normalizeMatchLocation(row.location)}`;
+    garnishmentByKey.set(key, asNumber(row.amount));
+  }
+
+  return {
+    generatedAt,
+    rows: csvRows.map((row) => {
+      const key = `${row.staffId}::${row.transactionId}::${normalizeMatchLocation(row.location)}`;
+      const garnishmentAmount = garnishmentByKey.get(key) || 0;
+      const originalPayoutAmount = Number((row.amount + garnishmentAmount).toFixed(2));
+      const garnishmentPercent = garnishmentAmount > 0 && originalPayoutAmount > 0
+        ? Number((garnishmentAmount / originalPayoutAmount).toFixed(4))
+        : null;
+      return {
+        date,
+        locationName: row.location,
+        staffName: [row.firstName, row.lastName].filter(Boolean).join(' ').trim(),
+        staffId: row.staffId || null,
+        bankToBankAmount: row.amount,
+        originalPayoutAmount,
+        garnishmentPercent,
+        garnishmentAmount,
+        loanPaymentAmount: 0,
+        netPayoutAmount: row.amount,
+        lastUpdatedAt: generatedAt,
+      } satisfies PayoutFactRow;
+    }),
+  };
+}
+
+function listPayoutFactsFromExports(filters: { startDate?: string | null; endDate?: string | null; locationName?: string | null } = {}): { rows: PayoutFactRow[]; lastExportedAt: string | null } {
   const startDate = filters.startDate ? String(filters.startDate).slice(0, 10) : null;
   const endDate = filters.endDate ? String(filters.endDate).slice(0, 10) : null;
-  const conditions: string[] = ['team_id = ?', 'bank_to_bank_amount IS NOT NULL'];
-  const params: Array<string> = [teamId];
-  if (startDate) { conditions.push('date >= ?'); params.push(startDate); }
-  if (endDate) { conditions.push('date <= ?'); params.push(endDate); }
-  if (filters.locationName) { conditions.push('location_name = ?'); params.push(filters.locationName); }
-  const sqlText = `
-    SELECT date,
-           location_name AS locationName,
-           staff_name AS staffName,
-           staff_id AS staffId,
-           bank_to_bank_amount AS bankToBankAmount,
-           last_updated_at AS lastUpdatedAt
-    FROM staff_cashout_facts
-    WHERE ${conditions.join(' AND ')}
-    ORDER BY date DESC, location_name ASC, bank_to_bank_amount DESC, staff_name ASC
-  `;
-  const garnishmentRules = loadGarnishmentRules();
-  const coverageRules = loadCoverageWithholdingRules();
-  const rawRows = sqlite.prepare(sqlText).all(...params) as Array<{
-    date: string;
-    locationName: string;
-    staffName: string;
-    staffId: string | null;
-    bankToBankAmount: number | null;
-    lastUpdatedAt: string;
-  }>;
-  return rawRows.map((row) => {
-    const originalPayoutAmount = row.bankToBankAmount;
-    const nameLocationKey = `${normalizeMatchText(row.staffName)}::${normalizeMatchLocation(row.locationName)}`;
-    const rule = (row.staffId ? garnishmentRules.byStaffId.get(String(row.staffId)) : undefined)
-      || garnishmentRules.byNameLocation.get(nameLocationKey);
-    const garnishmentPercent = rule?.percent ?? null;
-    const garnishmentAmount = garnishmentPercent && originalPayoutAmount != null
-      ? Number((originalPayoutAmount * garnishmentPercent).toFixed(2))
-      : 0;
-    const coverageKey = `${normalizeMatchText(row.staffName)}::${normalizeMatchLocation(row.locationName)}`;
-    const loanPaymentAmount = coverageRules.get(coverageKey)?.amount ?? 0;
-    const netPayoutAmount = originalPayoutAmount == null
-      ? null
-      : Number((originalPayoutAmount - garnishmentAmount).toFixed(2));
-    return {
-      ...row,
-      originalPayoutAmount,
-      garnishmentPercent,
-      garnishmentAmount,
-      loanPaymentAmount,
-      netPayoutAmount,
-    } satisfies PayoutFactRow;
+  if (!startDate || !endDate) return { rows: [], lastExportedAt: null };
+
+  const rows: PayoutFactRow[] = [];
+  let lastExportedAt: string | null = null;
+  for (let cursor = startDate; cursor <= endDate; cursor = addDaysToDateOnly(cursor, 1)) {
+    const loaded = readPayoutExportForDate(cursor);
+    lastExportedAt = mostRecentIso(lastExportedAt, loaded.generatedAt);
+    rows.push(...loaded.rows);
+  }
+
+  const filtered = filters.locationName
+    ? rows.filter((row) => row.locationName === filters.locationName)
+    : rows;
+
+  filtered.sort((a, b) => {
+    if (a.date !== b.date) return b.date.localeCompare(a.date);
+    if (a.locationName !== b.locationName) return a.locationName.localeCompare(b.locationName);
+    return (b.netPayoutAmount || 0) - (a.netPayoutAmount || 0) || a.staffName.localeCompare(b.staffName);
   });
+
+  return { rows: filtered, lastExportedAt };
+}
+
+function resolvePluginFile(startDir: string, relativePath: string): string | null {
+  let cursor = startDir;
+  for (let i = 0; i < 6; i += 1) {
+    const candidate = path.join(cursor, relativePath);
+    if (existsSync(candidate)) return candidate;
+    const parent = path.dirname(cursor);
+    if (parent === cursor) break;
+    cursor = parent;
+  }
+  return null;
 }
 
 function computePayoutTotals(rows: PayoutFactRow[]) {
@@ -1706,22 +1714,48 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
 
   if (req.path === '/payouts' && req.method === 'GET') {
     try {
-      const { sqlite } = initializeDatabase(teamId);
       const requestedStart = toDateOnlyInput(req.query.startDate || req.query.dateFrom || req.query.start || req.query.date);
       const requestedEnd = toDateOnlyInput(req.query.endDate || req.query.dateTo || req.query.end || req.query.date);
       const anchorEnd = addDaysToDateOnly(dateOnlyNow(), -1);
       const endDate = requestedEnd || anchorEnd;
       const startDate = requestedStart || endDate;
       const locationName = cleanString(req.query.location || req.query.locationName);
-      const rows = listPayoutFacts(sqlite, teamId, { startDate, endDate, locationName }).filter((row) => asNumber(row.originalPayoutAmount) > 0);
+      const loaded = listPayoutFactsFromExports({ startDate, endDate, locationName });
+      const rows = loaded.rows.filter((row) => asNumber(row.originalPayoutAmount) > 0);
       const locationTotals = buildPayoutLocationTotals(rows);
       const totals = computePayoutTotals(rows);
-      const lastSyncedAt = (sqlite
-        .prepare("SELECT last_synced_at AS lastSyncedAt FROM sync_state WHERE team_id = ? AND resource = 'staff_cashout_facts'")
-        .get(teamId) as { lastSyncedAt?: string } | undefined)?.lastSyncedAt || null;
-      return { status: 200, data: { startDate, endDate, locationName: locationName || null, rows, locationTotals, totals, lastSyncedAt } };
+      return { status: 200, data: { startDate, endDate, locationName: locationName || null, rows, locationTotals, totals, lastSyncedAt: loaded.lastExportedAt } };
     } catch (error: any) {
-      return apiError(500, 'DATABASE_ERROR', error?.message || 'Failed to read payout facts');
+      return apiError(500, 'DATABASE_ERROR', error?.message || 'Failed to read payout export facts');
+    }
+  }
+
+  if (req.path === '/payouts/sync' && req.method === 'POST') {
+    try {
+      const requestedStart = toDateOnlyInput(req.query.startDate || req.query.dateFrom || req.query.start || req.query.date);
+      const requestedEnd = toDateOnlyInput(req.query.endDate || req.query.dateTo || req.query.end || req.query.date);
+      const anchorEnd = addDaysToDateOnly(dateOnlyNow(), -1);
+      const endDate = requestedEnd || anchorEnd;
+      const startDate = requestedStart || endDate;
+      const scriptPath = resolvePluginFile(__dirname, path.join('scripts', 'export-branch-deposits.ts'));
+      if (!scriptPath) return apiError(500, 'CONFIG_ERROR', 'Could not locate the branch deposit export script.');
+
+      const results: any[] = [];
+      for (let cursor = startDate; cursor <= endDate; cursor = addDaysToDateOnly(cursor, 1)) {
+        const out = execFileSync('npx', ['tsx', scriptPath, `--date=${cursor}`, `--teamId=${teamId}`, `--organisationId=${DEFAULT_REVENUE_ORGANISATION_ID}`, `--outputDir=${PAYOUT_EXPORT_DIR}`], {
+          encoding: 'utf8',
+          maxBuffer: 20 * 1024 * 1024,
+        });
+        try {
+          results.push(JSON.parse(out));
+        } catch {
+          results.push({ date: cursor, raw: out.trim() });
+        }
+      }
+
+      return { status: 200, data: { ok: true, startDate, endDate, dayCount: results.length, results } };
+    } catch (error: any) {
+      return apiError(502, 'EXPORT_ERROR', error?.message || 'Failed to regenerate payout export files');
     }
   }
 
