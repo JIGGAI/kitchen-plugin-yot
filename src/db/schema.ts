@@ -214,6 +214,19 @@ export const staffCashoutFacts = sqliteTable('staff_cashout_facts', {
   pk: primaryKey({ columns: [t.teamId, t.date, t.locationName, t.staffName] }),
 }));
 
+export const locationCoverageFacts = sqliteTable('location_coverage_facts', {
+  teamId: text('team_id').notNull(),
+  locationId: text('location_id').notNull(),
+  date: text('date').notNull(),
+  slotPayload: text('slot_payload').notNull(),
+  rosteredPayload: text('rostered_payload').notNull(),
+  timecardPayload: text('timecard_payload').notNull(),
+  computedAt: text('computed_at').notNull(),
+  customersPerStylist: integer('customers_per_stylist').notNull(),
+}, (t) => ({
+  pk: primaryKey({ columns: [t.teamId, t.locationId, t.date] }),
+}));
+
 export const syncState = sqliteTable('sync_state', {
   teamId: text('team_id').notNull(),
   resource: text('resource').notNull(),
@@ -257,6 +270,8 @@ export type RevenueFact = typeof revenueFacts.$inferSelect;
 export type NewRevenueFact = typeof revenueFacts.$inferInsert;
 export type StaffCashoutFact = typeof staffCashoutFacts.$inferSelect;
 export type NewStaffCashoutFact = typeof staffCashoutFacts.$inferInsert;
+export type LocationCoverageFact = typeof locationCoverageFacts.$inferSelect;
+export type NewLocationCoverageFact = typeof locationCoverageFacts.$inferInsert;
 export type SyncRun = typeof syncRuns.$inferSelect;
 export type NewSyncRun = typeof syncRuns.$inferInsert;
 
@@ -274,5 +289,6 @@ export const SYNC_RESOURCES = [
   'promotion_usage',
   'revenue_facts',
   'staff_cashout_facts',
+  'location_coverage_facts',
 ] as const;
 export type SyncResource = typeof SYNC_RESOURCES[number];

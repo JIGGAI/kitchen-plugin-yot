@@ -2307,5 +2307,147 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     }
   }
 
+  // ============================================================
+  // Coverage endpoints (staff coverage + light windows + find cover)
+  // ============================================================
+
+  if (req.path === '/coverage/sync' && req.method === 'POST') {
+    try {
+      const body = (req.body || {}) as {
+        locationId?: string;
+        date?: string;
+        ratios?: { weekday?: number; saturday?: number; sunday?: number };
+        averagingDays?: number;
+      };
+      if (!body.locationId || !body.date) return apiError(400, 'BAD_REQUEST', 'locationId and date required');
+      const { syncCoverageForLocationDay } = await import('../coverage/sync');
+      const ratios = body.ratios
+        ? {
+            weekday: Number(body.ratios.weekday) || 10,
+            saturday: Number(body.ratios.saturday) || 8,
+            sunday: Number(body.ratios.sunday) || 6,
+          }
+        : undefined;
+      const result = await syncCoverageForLocationDay({
+        teamId,
+        locationId: body.locationId,
+        date: body.date,
+        ratios,
+        averagingDays: body.averagingDays,
+      });
+      return { status: 200, data: result };
+    } catch (err: any) {
+      const msg = err?.message || 'Coverage sync failed';
+      if (err?.name === 'MvcAuthMissingError') return apiError(412, 'MVC_AUTH_MISSING', msg);
+      if (err?.name === 'MvcAuthExpiredError') return apiError(401, 'MVC_AUTH_EXPIRED', msg);
+      return apiError(500, 'COVERAGE_SYNC_FAILED', msg);
+    }
+  }
+
+  if (req.path === '/coverage/slots' && req.method === 'GET') {
+    const locationId = cleanString(req.query.locationId);
+    const date = cleanString(req.query.date);
+    if (!locationId || !date) return apiError(400, 'BAD_REQUEST', 'locationId and date required');
+    const { readCachedCoverage } = await import('../coverage/sync');
+    const cached = readCachedCoverage(teamId, locationId, date);
+    if (!cached) return apiError(404, 'NO_COVERAGE_CACHE', 'Run /coverage/sync first');
+    return { status: 200, data: cached };
+  }
+
+  if (req.path === '/coverage/light-windows' && req.method === 'GET') {
+    const locationId = cleanString(req.query.locationId);
+    const date = cleanString(req.query.date);
+    if (!locationId || !date) return apiError(400, 'BAD_REQUEST', 'locationId and date required');
+    const { readCachedCoverage, aggregateLightWindows } = await import('../coverage/sync');
+    const cached = readCachedCoverage(teamId, locationId, date);
+    if (!cached) return apiError(404, 'NO_COVERAGE_CACHE', 'Run /coverage/sync first');
+    const windows = aggregateLightWindows(cached.slots);
+    return { status: 200, data: { date: cached.date, computedAt: cached.computedAt, windows } };
+  }
+
+  if (req.path === '/coverage/staff-available' && req.method === 'GET') {
+    const locationId = cleanString(req.query.locationId);
+    const from = cleanString(req.query.from);
+    const to = cleanString(req.query.to);
+    const serviceMinutes = Number(req.query.serviceMinutes ?? 0);
+    const pool = (cleanString(req.query.pool) === 'same' ? 'same' : 'cross') as 'cross' | 'same';
+    if (!locationId || !from || !to) return apiError(400, 'BAD_REQUEST', 'locationId, from, to required');
+
+    const { db } = initializeDatabase(teamId);
+    const { findStaffAvailable } = await import('../coverage/find-cover');
+
+    // stylists.id is stored as `LOCATION:YOT_ID` (per-location scoped record),
+    // while appointments.stylist_id and the roster's data-id attribute are the
+    // YOT id alone. Strip the prefix so the appointment-overlap, rostered-
+    // today, and lastWorkedHereAt joins line up. Dedup by YOT id, preferring
+    // the row whose home matches the requested location.
+    const stylistsRaw = db.select().from(schema.stylists).where(eq(schema.stylists.teamId, teamId)).all() as schema.Stylist[];
+    const stripPrefix = (compound: string): string => {
+      const i = compound.indexOf(':');
+      return i >= 0 ? compound.slice(i + 1) : compound;
+    };
+    const stylistByYotId = new Map<string, { id: string; name: string; homeLocationId: string | null }>();
+    for (const s of stylistsRaw) {
+      const yotId = stripPrefix(s.id);
+      const homeLocId = s.locationId ?? s.sourceLocationId ?? null;
+      const name = s.fullName ?? s.id;
+      const existing = stylistByYotId.get(yotId);
+      if (!existing) {
+        stylistByYotId.set(yotId, { id: yotId, name, homeLocationId: homeLocId });
+      } else if (homeLocId === locationId && existing.homeLocationId !== locationId) {
+        existing.homeLocationId = homeLocId;
+      }
+    }
+    const stylists = Array.from(stylistByYotId.values());
+
+    const apptsRaw = db.select().from(schema.appointments).where(eq(schema.appointments.teamId, teamId)).all() as schema.Appointment[];
+    const appointments = apptsRaw
+      .map((a) => ({
+        stylistId: (a.stylistId ?? a.staffId) as string | null,
+        startsAt: (a.startAt ?? a.startsAt) as string | null,
+        endsAt: (a.endAt ?? a.endsAt) as string | null,
+        locationId: a.locationId ?? null,
+      }))
+      .filter((a): a is { stylistId: string; startsAt: string; endsAt: string; locationId: string | null } =>
+        !!a.stylistId && !!a.startsAt && !!a.endsAt);
+
+    const pastAppointmentsAtLocation = new Map<string, string>();
+    for (const a of appointments) {
+      if (a.locationId !== locationId) continue;
+      const prev = pastAppointmentsAtLocation.get(a.stylistId);
+      if (!prev || a.startsAt > prev) pastAppointmentsAtLocation.set(a.stylistId, a.startsAt);
+    }
+
+    // Roster: union all rostered shifts cached for the team on `from`'s date.
+    const date = from.slice(0, 10);
+    const allCached = (db.select().from(schema.locationCoverageFacts).all() as schema.LocationCoverageFact[])
+      .filter((r) => r.teamId === teamId && r.date === date);
+    const scheduled: Array<{ stylistId: string; startsAt: string; endsAt: string }> = [];
+    for (const r of allCached) {
+      try {
+        const payload = JSON.parse(r.rosteredPayload) as { rows: Array<{ stylistId: string | null; status: string; startsAt: string | null; endsAt: string | null }> };
+        for (const row of payload.rows) {
+          if (row.status === 'scheduled' && row.stylistId && row.startsAt && row.endsAt) {
+            scheduled.push({ stylistId: row.stylistId, startsAt: row.startsAt, endsAt: row.endsAt });
+          }
+        }
+      } catch { /* ignore malformed cache rows */ }
+    }
+
+    const candidates = findStaffAvailable({
+      locationId,
+      from,
+      to,
+      serviceMinutes,
+      pool,
+      stylists,
+      scheduled,
+      appointments: appointments.map((a) => ({ stylistId: a.stylistId, startsAt: a.startsAt, endsAt: a.endsAt })),
+      pastAppointmentsAtLocation,
+    });
+
+    return { status: 200, data: { candidates, pool, serviceMinutes } };
+  }
+
   return apiError(404, 'NOT_FOUND', `No handler for ${req.method} ${req.path}`);
 }

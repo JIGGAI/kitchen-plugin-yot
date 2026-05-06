@@ -4,6 +4,24 @@
 export interface YotConfig {
   apiKey: string;
   baseUrl?: string;  // defaults to https://api2.youreontime.com
+  /**
+   * Cookie header value for the YOT MVC web app at https://app.youreontime.com.
+   * Required for endpoints that don't accept the API key (e.g. the staff
+   * roster page). Auto-refreshed when mvcUserName/mvcPassword/mvcOrganisation
+   * are configured; otherwise captured manually from a logged-in browser.
+   */
+  mvcCookie?: string;
+  /** Defaults to https://app.youreontime.com */
+  mvcBaseUrl?: string;
+  /**
+   * Credentials for automatic login. When set, the driver re-logs in
+   * transparently on MvcAuthExpiredError and persists the new cookie back
+   * to plugin_config.
+   */
+  mvcUserName?: string;
+  mvcPassword?: string;
+  /** YOT "business code" — third field on the login form. */
+  mvcOrganisation?: string;
 }
 
 export interface ClientRecord {
