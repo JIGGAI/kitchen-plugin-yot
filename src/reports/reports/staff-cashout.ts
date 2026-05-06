@@ -28,6 +28,8 @@ export type StaffCashoutRow = {
   otherRevenue: number | null;
   totalRevenue: number | null;
   tips: number | null;
+  totalCashReceived: number | null;
+  bankToBankAmount: number | null;
   raw: string[];
 };
 
@@ -165,6 +167,8 @@ export function parseStaffCashoutWorkbook(
   const totalServicesIndex = firstDefinedIndex(headerMap, ['Total Services']);
   const totalProductsIndex = firstDefinedIndex(headerMap, ['Total Products']);
   const totalCcTipsIndex = firstDefinedIndex(headerMap, ['Total CC Tips', 'Tips', 'Gratuity']);
+  const totalCashReceivedIndex = firstDefinedIndex(headerMap, ['Total Cash Rcvd.', 'Total Cash Received']);
+  const bankToBankAmountIndex = firstDefinedIndex(headerMap, ['Cash (+) From Bank Cash (-) To Bank', 'Cash (+) From Bank\nCash (-) To Bank']);
 
   const rows: StaffCashoutRow[] = [];
   let currentLocationName: string | null = null;
@@ -194,6 +198,8 @@ export function parseStaffCashoutWorkbook(
     const totalServices = parseNumber(totalServicesIndex == null ? null : cleanCell(rawRow[totalServicesIndex]));
     const totalProducts = parseNumber(totalProductsIndex == null ? null : cleanCell(rawRow[totalProductsIndex]));
     const tips = parseNumber(totalCcTipsIndex == null ? null : cleanCell(rawRow[totalCcTipsIndex]));
+    const totalCashReceived = parseNumber(totalCashReceivedIndex == null ? null : cleanCell(rawRow[totalCashReceivedIndex]));
+    const bankToBankAmount = parseNumber(bankToBankAmountIndex == null ? null : cleanCell(rawRow[bankToBankAmountIndex]));
     const totalRevenue = (totalServices ?? 0) + (totalProducts ?? 0);
 
     rows.push({
@@ -208,6 +214,8 @@ export function parseStaffCashoutWorkbook(
       otherRevenue: null,
       totalRevenue,
       tips,
+      totalCashReceived,
+      bankToBankAmount,
       raw: rawRow.map((value) => String(value || '')),
     });
   }
