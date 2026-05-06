@@ -214,10 +214,10 @@ import { api, formatDateTime, modal, t } from './common';
     }
 
     const visibleRows = useMemo(
-      () => showInactive ? rows : rows.filter((r) => !isRowInactive(r)),
+      () => showInactive ? rows : (rows as LocationRow[]).filter((r: LocationRow) => !isRowInactive(r)),
       [rows, showInactive],
     );
-    const inactiveCount = useMemo(() => rows.filter(isRowInactive).length, [rows]);
+    const inactiveCount = useMemo(() => (rows as LocationRow[]).filter(isRowInactive).length, [rows]);
     const columns = useMemo(() => unifySlotGrid(visibleRows), [visibleRows]);
     const slotMap = useMemo(() => {
       const map = new Map<string, Map<string, Slot>>();
@@ -341,7 +341,7 @@ import { api, formatDateTime, modal, t } from './common';
             ),
           ),
           h('tbody', null,
-            ...visibleRows.map((row) => h('tr', { key: row.locationId },
+            ...visibleRows.map((row: LocationRow) => h('tr', { key: row.locationId },
               h('td', { style: locCellStyle },
                 row.locationName,
                 typeof row.averageDailyAppointments === 'number'
@@ -398,8 +398,8 @@ import { api, formatDateTime, modal, t } from './common';
                   h('thead', null, h('tr', null,
                     ['Name', 'Home', 'Free', 'Rostered', 'Qualified', 'Last worked here'].map((c) => h('th', { key: c, style: t.th }, c)),
                   )),
-                  h('tbody', null, ...candidates.map((c) => {
-                    const homeName = locations.find((l) => l.id === c.homeLocationId)?.name || c.homeLocationId || '—';
+                  h('tbody', null, ...(candidates as Candidate[]).map((c: Candidate) => {
+                    const homeName = (locations as LocationOption[]).find((l: LocationOption) => l.id === c.homeLocationId)?.name || c.homeLocationId || '—';
                     return h('tr', { key: c.stylistId },
                       h('td', { style: t.td }, c.name),
                       h('td', { style: t.td }, homeName),

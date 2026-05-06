@@ -2390,7 +2390,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     for (const s of stylistsRaw) {
       const yotId = stripPrefix(s.id);
       const homeLocId = s.locationId ?? s.sourceLocationId ?? null;
-      const name = s.fullName ?? (`${s.firstName ?? ''} ${s.lastName ?? ''}`.trim() || s.id);
+      const name = s.fullName ?? s.id;
       const existing = stylistByYotId.get(yotId);
       if (!existing) {
         stylistByYotId.set(yotId, { id: yotId, name, homeLocationId: homeLocId });
