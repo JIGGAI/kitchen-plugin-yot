@@ -9,7 +9,9 @@ For a target date, the script:
 1. Pulls the Telerik `StaffCashoutReport` using the same report client flow used by the other YOT report jobs.
 2. Reads the matching date tab from the Google Sheet `Branch Daily Totals`.
 3. Matches report staff rows back to Branch rows by name, with a small fuzzy fallback for middle names / nickname-style first names.
-4. Exports a CSV with:
+4. Cross-references staff IDs against the Google Sheet `Loan / Coverage Repayment/ Garnishments` → `GARNISHMENTS` tab. Matching rows have their payout reduced by the listed percentage.
+5. Rewrites the `GARNISHMENTS PAYOUTS` tab in that same sheet for the target date with the withheld garnishment amounts.
+6. Exports a CSV with:
    - `STAFF ID`
    - `FIRST NAME`
    - `LAST NAME`
@@ -17,7 +19,7 @@ For a target date, the script:
    - `AMOUNT` (YOT bank-to-bank amount)
    - `TRANSACTION ID`
    - `LOCATION`
-5. Writes a diagnostics JSON beside the CSV so unmatched names and negative/non-positive amounts are visible.
+7. Writes a diagnostics JSON beside the CSV so unmatched names, garnishment adjustments, and negative/non-positive amounts are visible.
 
 ## Command
 

@@ -10,6 +10,7 @@ type Args = {
   teamId: string;
   organisationId: number;
   sheetId: string;
+  garnishmentsSheetId: string;
   account: string;
   outputDir: string;
 };
@@ -42,10 +43,31 @@ type ExportRow = {
   lastName: string;
   type: 'Deposit';
   amount: number;
+  originalAmount: number;
+  garnishmentPercent: number | null;
+  garnishmentAmount: number;
   transactionId: string;
   location: string;
   matchedReportName: string;
   matchedReportLocation: string | null;
+};
+
+type GarnishmentRule = {
+  staffId: string;
+  firstName: string;
+  lastName: string;
+  percent: number;
+};
+
+type GarnishmentPayoutRow = {
+  staffId: string;
+  firstName: string;
+  lastName: string;
+  type: 'GARNISHMENT';
+  amount: number;
+  transactionId: string;
+  location: string;
+  date: string;
 };
 
 type MatchDiagnostics = {
@@ -69,9 +91,13 @@ type MatchDiagnostics = {
     location: string;
     amount: number | null;
   }>;
+  garnishmentRuleCount: number;
+  garnishmentAdjustedRowCount: number;
+  garnishmentPayoutRows: GarnishmentPayoutRow[];
 };
 
 const DEFAULT_SHEET_ID = '1jIFWOMmvMVbGULUbDpEqV2e6CsXy_DzhBrCorV9H-EA';
+const DEFAULT_GARNISHMENTS_SHEET_ID = '1pvwN3h0X9ZsdhpH024zue9DlE4NaZiuzTia5NMoEn6c';
 const DEFAULT_ACCOUNT = 'govna.assistant@gmail.com';
 const DEFAULT_TEAM_ID = 'hmx-marketing-team';
 const DEFAULT_ORGANISATION_ID = 11082;
@@ -100,6 +126,7 @@ function parseArgs(argv: string[]): Args {
     teamId: map.get('teamId') || DEFAULT_TEAM_ID,
     organisationId,
     sheetId: map.get('sheetId') || DEFAULT_SHEET_ID,
+    garnishmentsSheetId: map.get('garnishmentsSheetId') || DEFAULT_GARNISHMENTS_SHEET_ID,
     account: map.get('account') || DEFAULT_ACCOUNT,
     outputDir: expandHome(map.get('outputDir') || DEFAULT_OUTPUT_DIR),
   };
@@ -196,12 +223,28 @@ function toCsv(rows: ExportRow[]): string {
       row.firstName,
       row.lastName,
       row.type,
-      Number.isInteger(row.amount) ? String(row.amount) : String(row.amount),
+      Number.isInteger(row.amount) ? String(row.amount) : row.amount.toFixed(2),
       row.transactionId,
       row.location,
     ].map(formatCsvCell).join(','));
   }
   return `${lines.join('\n')}\n`;
+}
+
+function toSheetValues(rows: GarnishmentPayoutRow[]): string[][] {
+  return [
+    ['STAFF ID', 'FIRST NAME', 'LAST NAME', 'TYPE', 'AMOUNT', 'TRANSACTION ID', 'LOCATION', 'DATE'],
+    ...rows.map((row) => [
+      row.staffId,
+      row.firstName,
+      row.lastName,
+      row.type,
+      row.amount.toFixed(2),
+      row.transactionId,
+      row.location,
+      row.date,
+    ]),
+  ];
 }
 
 function parseSheetTabDateCandidates(title: string): string[] {
@@ -322,6 +365,59 @@ function loadBranchDailyRows(sheetId: string, account: string, tabTitle: string)
   return dedupeBranchRows(parseBranchDailyRows(response.values || []));
 }
 
+function parsePercent(value: string | null | undefined): number | null {
+  if (!value) return null;
+  const cleaned = String(value).replace(/[%\s]/g, '').trim();
+  if (!cleaned) return null;
+  const raw = Number(cleaned);
+  if (!Number.isFinite(raw)) return null;
+  if (raw > 1) return raw / 100;
+  if (raw <= 0) return null;
+  return raw;
+}
+
+function loadGarnishmentRules(sheetId: string, account: string): Map<string, GarnishmentRule> {
+  const response = gogJsonForAccount(account, ['sheets', 'get', sheetId, 'GARNISHMENTS!A1:H1200']) as SheetValuesResponse;
+  const rows = response.values || [];
+  const rules = new Map<string, GarnishmentRule>();
+  for (const row of rows.slice(1)) {
+    const staffId = String(row[0] || '').trim();
+    const firstName = String(row[1] || '').trim();
+    const lastName = String(row[2] || '').trim();
+    const percent = parsePercent(row[4]);
+    if (!staffId || percent == null) continue;
+    rules.set(staffId, { staffId, firstName, lastName, percent });
+  }
+  return rules;
+}
+
+function loadExistingGarnishmentPayoutRows(sheetId: string, account: string): GarnishmentPayoutRow[] {
+  const response = gogJsonForAccount(account, ['sheets', 'get', sheetId, `'GARNISHMENTS PAYOUTS'!A1:H1200`]) as SheetValuesResponse;
+  const rows = response.values || [];
+  return rows.slice(1).map((row) => ({
+    staffId: String(row[0] || '').trim(),
+    firstName: String(row[1] || '').trim(),
+    lastName: String(row[2] || '').trim(),
+    type: 'GARNISHMENT' as const,
+    amount: Number(String(row[4] || '').replace(/[$,]/g, '').trim() || '0') || 0,
+    transactionId: String(row[5] || '').trim(),
+    location: String(row[6] || '').trim(),
+    date: String(row[7] || '').trim(),
+  })).filter((row) => row.staffId || row.transactionId || row.date);
+}
+
+function rewriteGarnishmentPayoutSheet(sheetId: string, account: string, rows: GarnishmentPayoutRow[]) {
+  const valuesJson = JSON.stringify(toSheetValues(rows));
+  execFileSync('gog', ['sheets', 'clear', sheetId, `'GARNISHMENTS PAYOUTS'!A:Z`, '--account', account, '--no-input'], {
+    encoding: 'utf8',
+    maxBuffer: 20 * 1024 * 1024,
+  });
+  execFileSync('gog', ['sheets', 'update', sheetId, `'GARNISHMENTS PAYOUTS'!A1:H${Math.max(rows.length + 1, 1)}`, '--values-json', valuesJson, '--input', 'USER_ENTERED', '--account', account, '--no-input'], {
+    encoding: 'utf8',
+    maxBuffer: 20 * 1024 * 1024,
+  });
+}
+
 function buildReportIndexes(rows: StaffCashoutRow[]) {
   const byExactName = new Map<string, StaffCashoutRow[]>();
   const byLastName = new Map<string, StaffCashoutRow[]>();
@@ -384,12 +480,14 @@ async function main() {
 
   const tabTitle = resolveSheetTabForDate(args.sheetId, args.account, args.date);
   const branchRows = loadBranchDailyRows(args.sheetId, args.account, tabTitle);
+  const garnishmentRules = loadGarnishmentRules(args.garnishmentsSheetId, args.account);
   const reportIndexes = buildReportIndexes(report.rows);
   const matchedReportRows = new Set<StaffCashoutRow>();
 
   const exportRows: ExportRow[] = [];
   const unmatchedBranchRows: BranchDailyRow[] = [];
   const skippedNonPositiveReportMatches: MatchDiagnostics['skippedNonPositiveReportMatches'] = [];
+  const garnishmentPayoutRows: GarnishmentPayoutRow[] = [];
 
   for (const branchRow of branchRows) {
     const match = matchBranchRowToReport(branchRow, report.rows, reportIndexes);
@@ -412,17 +510,38 @@ async function main() {
       continue;
     }
 
+    const garnishmentRule = garnishmentRules.get(branchRow.staffId) || null;
+    const garnishmentPercent = garnishmentRule?.percent ?? null;
+    const garnishmentAmount = garnishmentPercent ? Number((amount * garnishmentPercent).toFixed(2)) : 0;
+    const adjustedAmount = Number((amount - garnishmentAmount).toFixed(2));
+
     exportRows.push({
       staffId: branchRow.staffId,
       firstName: branchRow.firstName,
       lastName: branchRow.lastName,
       type: 'Deposit',
-      amount,
+      amount: adjustedAmount,
+      originalAmount: amount,
+      garnishmentPercent,
+      garnishmentAmount,
       transactionId: branchRow.transactionId,
       location: branchRow.location,
       matchedReportName: match.staffName || '',
       matchedReportLocation: match.locationName,
     });
+
+    if (garnishmentAmount > 0) {
+      garnishmentPayoutRows.push({
+        staffId: branchRow.staffId,
+        firstName: branchRow.firstName,
+        lastName: branchRow.lastName,
+        type: 'GARNISHMENT',
+        amount: garnishmentAmount,
+        transactionId: branchRow.transactionId,
+        location: branchRow.location,
+        date: args.date,
+      });
+    }
   }
 
   exportRows.sort((a, b) => a.location.localeCompare(b.location) || a.lastName.localeCompare(b.lastName) || a.firstName.localeCompare(b.firstName));
@@ -441,6 +560,12 @@ async function main() {
       bankToBankAmount: row.bankToBankAmount || 0,
     }));
 
+  const existingGarnishmentPayoutRows = loadExistingGarnishmentPayoutRows(args.garnishmentsSheetId, args.account)
+    .filter((row) => row.date !== args.date);
+  const rewrittenGarnishmentPayoutRows = [...existingGarnishmentPayoutRows, ...garnishmentPayoutRows]
+    .sort((a, b) => (a.date === b.date ? a.location.localeCompare(b.location) || a.lastName.localeCompare(b.lastName) : b.date.localeCompare(a.date)));
+  rewriteGarnishmentPayoutSheet(args.garnishmentsSheetId, args.account, rewrittenGarnishmentPayoutRows);
+
   const csvPath = path.join(args.outputDir, `branch-deposits-${args.date}.csv`);
   const diagnosticsPath = path.join(args.outputDir, `branch-deposits-${args.date}.diagnostics.json`);
 
@@ -455,6 +580,9 @@ async function main() {
     unmatchedBranchRows,
     reportRowsWithPositiveAmountButNoBranchMatch: unmatchedPositiveReportRows,
     skippedNonPositiveReportMatches,
+    garnishmentRuleCount: garnishmentRules.size,
+    garnishmentAdjustedRowCount: garnishmentPayoutRows.length,
+    garnishmentPayoutRows,
   } satisfies MatchDiagnostics, null, 2), 'utf8');
 
   console.log(JSON.stringify({
@@ -467,6 +595,8 @@ async function main() {
     unmatchedBranchRowCount: unmatchedBranchRows.length,
     unmatchedPositiveReportRowCount: unmatchedPositiveReportRows.length,
     skippedNonPositiveReportMatchCount: skippedNonPositiveReportMatches.length,
+    garnishmentRuleCount: garnishmentRules.size,
+    garnishmentAdjustedRowCount: garnishmentPayoutRows.length,
   }, null, 2));
 }
 
