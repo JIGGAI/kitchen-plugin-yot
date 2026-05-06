@@ -93,6 +93,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run --passWithNoTests",
     "sync:revenue-facts": "npx tsx scripts/sync-revenue-facts.ts",
+    "export:branch-deposits": "npx tsx scripts/export-branch-deposits.ts",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
