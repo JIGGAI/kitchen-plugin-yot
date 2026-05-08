@@ -1062,6 +1062,8 @@ function mapLocationRecord(row: schema.Location): LocationRecord {
     state: row.state ?? null,
     postcode: row.postcode ?? null,
     country: row.country ?? null,
+    franchiseId: row.franchiseId ?? null,
+    franchiseName: row.franchiseName ?? null,
     syncedAt: row.syncedAt,
   };
 }
@@ -2666,6 +2668,25 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     if (!cached) return apiError(404, 'NO_COVERAGE_CACHE', 'Run /coverage/sync first');
     const windows = aggregateLightWindows(cached.slots);
     return { status: 200, data: { date: cached.date, computedAt: cached.computedAt, windows } };
+  }
+
+  if (req.path === '/franchises/sync' && req.method === 'POST') {
+    try {
+      const { syncFranchises } = await import('../coverage/sync-franchises');
+      const result = await syncFranchises({ teamId });
+      return { status: 200, data: result };
+    } catch (err: any) {
+      const msg = err?.message || 'Franchise sync failed';
+      if (err?.name === 'MvcAuthMissingError') return apiError(412, 'MVC_AUTH_MISSING', msg);
+      if (err?.name === 'MvcAuthExpiredError') return apiError(401, 'MVC_AUTH_EXPIRED', msg);
+      return apiError(500, 'FRANCHISE_SYNC_FAILED', msg);
+    }
+  }
+
+  if (req.path === '/franchises' && req.method === 'GET') {
+    const { listFranchises } = await import('../coverage/sync-franchises');
+    const data = listFranchises(teamId);
+    return { status: 200, data: { data, total: data.length } };
   }
 
   if (req.path === '/coverage/staff-available' && req.method === 'GET') {

@@ -72,6 +72,8 @@ export interface LocationRecord {
   state: string | null;
   postcode: string | null;
   country: string | null;
+  franchiseId: string | null;
+  franchiseName: string | null;
   syncedAt: string;
 }
 

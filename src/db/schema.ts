@@ -56,9 +56,22 @@ export const locations = sqliteTable('locations', {
   state: text('state'),
   postcode: text('postcode'),
   country: text('country'),
+  franchiseId: text('franchise_id'),
+  franchiseName: text('franchise_name'),
   raw: text('raw'),
   syncedAt: text('synced_at').notNull(),
 });
+
+export const franchises = sqliteTable('franchises', {
+  teamId: text('team_id').notNull(),
+  franchiseId: text('franchise_id').notNull(),
+  name: text('name').notNull(),
+  isCorporate: integer('is_corporate', { mode: 'boolean' }).notNull().default(false),
+  locationCount: integer('location_count').notNull().default(0),
+  syncedAt: text('synced_at').notNull(),
+}, (t) => ({
+  pk: primaryKey({ columns: [t.teamId, t.franchiseId] }),
+}));
 
 export const stylists = sqliteTable('stylists', {
   id: text('id').primaryKey(),
@@ -258,6 +271,8 @@ export type Client = typeof clients.$inferSelect;
 export type NewClient = typeof clients.$inferInsert;
 export type Location = typeof locations.$inferSelect;
 export type NewLocation = typeof locations.$inferInsert;
+export type Franchise = typeof franchises.$inferSelect;
+export type NewFranchise = typeof franchises.$inferInsert;
 export type Stylist = typeof stylists.$inferSelect;
 export type NewStylist = typeof stylists.$inferInsert;
 export type Appointment = typeof appointments.$inferSelect;
