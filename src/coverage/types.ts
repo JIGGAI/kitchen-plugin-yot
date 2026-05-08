@@ -73,7 +73,15 @@ export const DEFAULT_RATIOS: CustomerToStylistRatios = {
   sunday: 6,
 };
 
-export const DEFAULT_AVERAGING_DAYS = 30;
+export const DEFAULT_AVERAGING_DAYS = 90;
+
+// Day-of-week buckets for per-DOW averaging. Index matches Date#getDay()
+// (0 = Sunday, 6 = Saturday) so the array can be addressed directly.
+export type DayOfWeek = 'sun' | 'mon' | 'tue' | 'wed' | 'thu' | 'fri' | 'sat';
+export const DOW_KEYS: DayOfWeek[] = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
+
+export type AverageByDow = Record<DayOfWeek, number>;
+export type ClosedByDow = Record<DayOfWeek, boolean>;
 
 export function ratioForDate(dateIso: string, ratios: CustomerToStylistRatios = DEFAULT_RATIOS): number {
   const [y, m, d] = dateIso.split('-').map(Number);

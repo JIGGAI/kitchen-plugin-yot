@@ -17,9 +17,13 @@ import { resolveBusinessHoursForDate, type BusinessHoursSchedule } from './busin
 import {
   DEFAULT_AVERAGING_DAYS,
   DEFAULT_RATIOS,
+  DOW_KEYS,
   ratioForDate,
+  type AverageByDow,
+  type ClosedByDow,
   type CoverageSlot,
   type CustomerToStylistRatios,
+  type DayOfWeek,
 } from './types';
 
 type SqliteDb = ReturnType<typeof initializeDatabase>['sqlite'];
@@ -41,6 +45,12 @@ export type SyncCoverageResult = {
   averageDailyAppointments: number;
   customersPerStylistForDay: number;
   requiredStylists: number;
+  /** Per-DOW averages (Sun..Sat). Closed days excluded from the bucket. */
+  averageByDow: AverageByDow;
+  /** True for any DOW the store was never open in the averaging window. */
+  closedByDow: ClosedByDow;
+  /** True when the *requested* date's DOW is closed by history. */
+  closed: boolean;
 };
 
 function readConfig(sqlite: SqliteDb, teamId: string): YotConfig {
@@ -94,37 +104,117 @@ function readAppointmentsForDay(
 }
 
 /**
- * Average daily booked appointment count for one location, looking back
- * `averagingDays` calendar days from `referenceDate` (exclusive of the
- * reference day so we don't double-count today's in-progress data).
+ * Per-day-of-week average appointment count for one location, looking back
+ * `averagingDays` calendar days from `referenceDate`. Each historical date
+ * is bucketed by its day-of-week, then the bucket's mean is taken over only
+ * the dates the store was actually open.
  *
- * Returns the float so the caller can ceil it after applying the ratio.
+ * "Open" detection:
+ *   - any appointments on that date  → open
+ *   - within the last 30 days, also check if any stylist was rostered (we
+ *     have roster history in `location_coverage_facts.rostered_payload`).
+ *     A date with zero appointments BUT rostered stylists counts as open
+ *     with zero demand (a real freak-slow day).
+ *   - beyond 30 days the roster signal isn't available, so we fall back
+ *     to "0 appointments = closed".
+ *
+ * Returns:
+ *   - averageByDow: mean appts/day for each DOW the store was ever open
+ *   - closedByDow: true for any DOW the store was never open in the window
  */
-function averageDailyAppointments(
+function averageDailyAppointmentsByDow(
   db: ReturnType<typeof initializeDatabase>['db'],
+  sqlite: SqliteDb,
   teamId: string,
   locationId: string,
   referenceDate: string,
   averagingDays: number,
-): number {
+): { averageByDow: AverageByDow; closedByDow: ClosedByDow } {
   const ref = new Date(`${referenceDate}T00:00:00`);
   const start = new Date(ref);
   start.setDate(ref.getDate() - averagingDays);
   const startIso = start.toISOString().slice(0, 10);
   const endIso = referenceDate; // exclusive end
 
-  const rows = db.select().from(schema.appointments)
+  // 1. Count appointments per historical date.
+  const apptRows = db.select().from(schema.appointments)
     .where(and(eq(schema.appointments.teamId, teamId), eq(schema.appointments.locationId, locationId)))
     .all() as schema.Appointment[];
 
-  let count = 0;
-  for (const r of rows) {
+  const apptCountByDate = new Map<string, number>();
+  for (const r of apptRows) {
     const startsAt = r.startAt ?? r.startsAt;
     if (!startsAt) continue;
     const day = startsAt.slice(0, 10);
-    if (day >= startIso && day < endIso) count++;
+    if (day < startIso || day >= endIso) continue;
+    apptCountByDate.set(day, (apptCountByDate.get(day) || 0) + 1);
   }
-  return count / averagingDays;
+
+  // 2. Within the strict-rule window (last 30 days), pull cached roster
+  // payloads so we can also detect "open but zero appts" days.
+  const strictWindowStart = new Date(ref);
+  strictWindowStart.setDate(ref.getDate() - Math.min(averagingDays, 30));
+  const strictStartIso = strictWindowStart.toISOString().slice(0, 10);
+
+  const rosteredDates = new Set<string>();
+  if (averagingDays > 0) {
+    const rosterRows = sqlite.prepare(
+      `SELECT date, rostered_payload FROM location_coverage_facts
+       WHERE team_id = ? AND location_id = ? AND date >= ? AND date < ?`,
+    ).all(teamId, locationId, strictStartIso, endIso) as Array<{ date: string; rostered_payload: string }>;
+    for (const r of rosterRows) {
+      try {
+        const parsed = JSON.parse(r.rostered_payload || '{}') as { rows?: Array<{ status?: string }> };
+        if ((parsed.rows || []).some((x) => x.status === 'scheduled')) {
+          rosteredDates.add(r.date);
+        }
+      } catch { /* skip malformed cache rows */ }
+    }
+  }
+
+  // 3. For each historical date in the window, decide open/closed and
+  // bucket by DOW.
+  const buckets: Record<DayOfWeek, { sum: number; openDays: number }> = {
+    sun: { sum: 0, openDays: 0 }, mon: { sum: 0, openDays: 0 }, tue: { sum: 0, openDays: 0 },
+    wed: { sum: 0, openDays: 0 }, thu: { sum: 0, openDays: 0 }, fri: { sum: 0, openDays: 0 },
+    sat: { sum: 0, openDays: 0 },
+  };
+
+  const cursor = new Date(start);
+  while (cursor < ref) {
+    const yyyy = cursor.getFullYear();
+    const mm = String(cursor.getMonth() + 1).padStart(2, '0');
+    const dd = String(cursor.getDate()).padStart(2, '0');
+    const dateIso = `${yyyy}-${mm}-${dd}`;
+    const dow = DOW_KEYS[cursor.getDay()];
+    const apptCount = apptCountByDate.get(dateIso) || 0;
+    const wasRostered = rosteredDates.has(dateIso);
+    const isOpen = apptCount > 0 || wasRostered;
+    if (isOpen) {
+      buckets[dow].sum += apptCount;
+      buckets[dow].openDays += 1;
+    }
+    cursor.setDate(cursor.getDate() + 1);
+  }
+
+  const averageByDow: AverageByDow = { sun: 0, mon: 0, tue: 0, wed: 0, thu: 0, fri: 0, sat: 0 };
+  const closedByDow: ClosedByDow = { sun: false, mon: false, tue: false, wed: false, thu: false, fri: false, sat: false };
+  for (const dow of DOW_KEYS) {
+    const b = buckets[dow];
+    if (b.openDays === 0) {
+      closedByDow[dow] = true;
+      averageByDow[dow] = 0;
+    } else {
+      averageByDow[dow] = b.sum / b.openDays;
+    }
+  }
+
+  return { averageByDow, closedByDow };
+}
+
+function dowOf(dateIso: string): DayOfWeek {
+  const [y, m, d] = dateIso.split('-').map(Number);
+  return DOW_KEYS[new Date(y, m - 1, d).getDay()];
 }
 
 /**
@@ -141,9 +231,16 @@ export async function syncCoverageForLocationDay(opts: SyncCoverageOptions): Pro
   const { db, sqlite } = initializeDatabase(opts.teamId);
   const config = readConfig(sqlite, opts.teamId);
 
-  // 1. Daily-average appointment count for this location (lookback window).
-  // Drives the staffing target uniformly across every slot in the day.
-  const avgDaily = averageDailyAppointments(db, opts.teamId, opts.locationId, opts.date, averagingDays);
+  // 1. Per-day-of-week average appointment count for this location, looking
+  // back `averagingDays`. Closed days (zero appts AND no roster) are skipped
+  // so they don't dilute the bucket. Required-stylists for each day in the
+  // synced week is then computed from that day's specific average — so a
+  // Friday's target uses Friday's average, not the global one.
+  const { averageByDow, closedByDow } = averageDailyAppointmentsByDow(
+    db, sqlite, opts.teamId, opts.locationId, opts.date, averagingDays,
+  );
+  // Back-compat scalar: average for the requested date's day-of-week.
+  const avgDaily = averageByDow[dowOf(opts.date)];
 
   // 2. Fetch one week of HTML and parse. withAutoLogin re-logs in transparently
   // when mvcCookie is missing/expired AND mvcUserName/mvcPassword/mvcOrganisation
@@ -174,20 +271,42 @@ export async function syncCoverageForLocationDay(opts: SyncCoverageOptions): Pro
   let requestedSlots: CoverageSlot[] = [];
   let requestedRequired = 0;
   let requestedRatio = ratios.weekday;
+  let requestedClosed = false;
   for (const date of datesInWeek) {
     const customersPerStylistForDay = ratioForDate(date, ratios);
+    const dateDow = dowOf(date);
+    const dayAvg = averageByDow[dateDow];
+    const dayIsClosedByHistory = closedByDow[dateDow];
     // Round-to-nearest, not ceil. Per HMX rule: 40–44 cuts → 4 stylists,
     // 45–54 → 5, 55–64 → 6 etc. (next stylist added at the .5 boundary).
-    const requiredStylists = Math.round(avgDaily / customersPerStylistForDay);
+    const requiredStylists = Math.round(dayAvg / customersPerStylistForDay);
     const businessHours = resolveBusinessHoursForDate(date, schedule);
-    if (!businessHours) {
-      // Store closed: persist empty slot table so the API returns a clean 200.
-      insert.run(opts.teamId, opts.locationId, date, JSON.stringify({ slots: [], averageDailyAppointments: avgDaily, customersPerStylistForDay, requiredStylists }),
+
+    // Two separate "closed" signals:
+    //   1. dayIsClosedByHistory: store has never had an appointment on this DOW
+    //      across the averaging window. Strongest signal that the store is
+    //      systematically closed that day — we skip slot computation and tag
+    //      the response so the dashboard can render a "Closed" badge.
+    //   2. !businessHours: the configured business-hours schedule says closed.
+    //      (Today these are global defaults; future per-location overrides
+    //      could differ.)
+    if (dayIsClosedByHistory || !businessHours) {
+      const payload = {
+        slots: [],
+        averageDailyAppointments: dayAvg,
+        customersPerStylistForDay,
+        requiredStylists: 0,
+        closed: true,
+        averageByDow,
+        closedByDow,
+      };
+      insert.run(opts.teamId, opts.locationId, date, JSON.stringify(payload),
         JSON.stringify({ rows: [] }), '{}', computedAt, customersPerStylistForDay);
       if (date === opts.date) {
         requestedSlots = [];
-        requestedRequired = requiredStylists;
+        requestedRequired = 0;
         requestedRatio = customersPerStylistForDay;
+        requestedClosed = true;
       }
       continue;
     }
@@ -202,7 +321,7 @@ export async function syncCoverageForLocationDay(opts: SyncCoverageOptions): Pro
       businessHours,
       slotMinutes,
       requiredStylists,
-      averageDailyAppointments: avgDaily,
+      averageDailyAppointments: dayAvg,
       customersPerStylistForDay,
       appointments,
       scheduled: dayScheduled,
@@ -210,7 +329,15 @@ export async function syncCoverageForLocationDay(opts: SyncCoverageOptions): Pro
 
     insert.run(
       opts.teamId, opts.locationId, date,
-      JSON.stringify({ slots, averageDailyAppointments: avgDaily, customersPerStylistForDay, requiredStylists }),
+      JSON.stringify({
+        slots,
+        averageDailyAppointments: dayAvg,
+        customersPerStylistForDay,
+        requiredStylists,
+        closed: false,
+        averageByDow,
+        closedByDow,
+      }),
       JSON.stringify({ rows: dayRosteredRaw }),
       '{}',                                    // unused timecard slot
       computedAt,
@@ -221,6 +348,7 @@ export async function syncCoverageForLocationDay(opts: SyncCoverageOptions): Pro
       requestedSlots = slots;
       requestedRequired = requiredStylists;
       requestedRatio = customersPerStylistForDay;
+      requestedClosed = false;
     }
   }
 
@@ -231,6 +359,9 @@ export async function syncCoverageForLocationDay(opts: SyncCoverageOptions): Pro
     averageDailyAppointments: avgDaily,
     customersPerStylistForDay: requestedRatio,
     requiredStylists: requestedRequired,
+    averageByDow,
+    closedByDow,
+    closed: requestedClosed,
   };
 }
 
@@ -253,9 +384,14 @@ export function readCachedCoverage(
     averageDailyAppointments?: number;
     customersPerStylistForDay?: number;
     requiredStylists?: number;
+    closed?: boolean;
+    averageByDow?: AverageByDow;
+    closedByDow?: ClosedByDow;
   };
   const slots = parsed.slots;
   const customersPerStylistForDay = parsed.customersPerStylistForDay ?? row.customers_per_stylist ?? 10;
+  const emptyDow: AverageByDow = { sun: 0, mon: 0, tue: 0, wed: 0, thu: 0, fri: 0, sat: 0 };
+  const emptyClosed: ClosedByDow = { sun: false, mon: false, tue: false, wed: false, thu: false, fri: false, sat: false };
   return {
     date,
     slots,
@@ -263,6 +399,9 @@ export function readCachedCoverage(
     averageDailyAppointments: parsed.averageDailyAppointments ?? 0,
     customersPerStylistForDay,
     requiredStylists: parsed.requiredStylists ?? (slots[0]?.requiredStylists ?? 0),
+    averageByDow: parsed.averageByDow ?? emptyDow,
+    closedByDow: parsed.closedByDow ?? emptyClosed,
+    closed: parsed.closed ?? false,
   };
 }
 
