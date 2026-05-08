@@ -206,6 +206,11 @@ export const revenueFacts = sqliteTable('revenue_facts', {
   netAmount: real('net_amount'),
   appointmentCount: integer('appointment_count'),
   uniqueClientCount: integer('unique_client_count'),
+  /** Distinct checkout transactions for the day, sourced from YOT's
+   *  DailySalesSummary "Number of Sales" column. Null until the DSS sync
+   *  runs for that date. Always <= appointmentCount because one sale can
+   *  bundle multiple service line items. */
+  salesCount: integer('sales_count'),
   lastUpdatedAt: text('last_updated_at').notNull(),
 }, (t) => ({
   pk: primaryKey({ columns: [t.teamId, t.locationId, t.date] }),

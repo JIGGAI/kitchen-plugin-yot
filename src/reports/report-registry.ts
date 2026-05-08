@@ -8,6 +8,14 @@ import {
   parseDailyRevenueSummaryWorkbook,
 } from './reports/daily-revenue-summary';
 import {
+  DAILY_SALES_SUMMARY_REPORT,
+  type DailySalesSummaryParams,
+  type DailySalesSummaryResult,
+  buildDailySalesSummaryInstanceParams,
+  buildDailySalesSummaryParameterDiscovery,
+  parseDailySalesSummaryWorkbook,
+} from './reports/daily-sales-summary';
+import {
   PROMOTION_USAGE_REPORT,
   type PromotionUsageParams,
   type PromotionUsageResult,
@@ -62,6 +70,15 @@ export const reportRegistry = {
     buildInstanceParams: buildStaffCashoutInstanceParams,
     parseDocument: parseStaffCashoutWorkbook,
   } satisfies YotReportDefinition<StaffCashoutParams, StaffCashoutResult>,
+  dailySalesSummary: {
+    key: DAILY_SALES_SUMMARY_REPORT.key,
+    reportName: DAILY_SALES_SUMMARY_REPORT.reportName,
+    reportType: DAILY_SALES_SUMMARY_REPORT.reportType,
+    preferredFormat: DAILY_SALES_SUMMARY_REPORT.preferredFormat,
+    buildParameterDiscovery: buildDailySalesSummaryParameterDiscovery,
+    buildInstanceParams: buildDailySalesSummaryInstanceParams,
+    parseDocument: parseDailySalesSummaryWorkbook,
+  } satisfies YotReportDefinition<DailySalesSummaryParams, DailySalesSummaryResult>,
 };
 
 export type ReportRegistry = typeof reportRegistry;

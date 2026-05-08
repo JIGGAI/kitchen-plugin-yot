@@ -3,7 +3,9 @@ import type { YotConfig } from '../types';
 const REPORTS_BASE_URL = 'https://youreontime-reports.azurewebsites.net';
 const REQUEST_DELAY_MS = 500;
 const DEFAULT_POLL_DELAY_MS = 1500;
-const DEFAULT_MAX_POLLS = 60;
+// 200 polls * 1.5s = 5 minutes. The Telerik renderer can be slow when
+// multiple location blocks need to land in a single DSS / DRS document.
+const DEFAULT_MAX_POLLS = 200;
 
 let lastRequestStartedAt = 0;
 

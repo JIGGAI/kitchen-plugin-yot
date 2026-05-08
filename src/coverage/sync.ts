@@ -51,6 +51,9 @@ export type SyncCoverageResult = {
   closedByDow: ClosedByDow;
   /** True when the *requested* date's DOW is closed by history. */
   closed: boolean;
+  /** Mean appointment count per hour-of-day for the requested date's DOW.
+   *  Keys are hour numbers 0–23; missing keys mean no historical activity. */
+  averageHourlyForDay: Record<number, number>;
 };
 
 function readConfig(sqlite: SqliteDb, teamId: string): YotConfig {
@@ -129,25 +132,75 @@ function averageDailyAppointmentsByDow(
   locationId: string,
   referenceDate: string,
   averagingDays: number,
-): { averageByDow: AverageByDow; closedByDow: ClosedByDow } {
+): {
+  averageByDow: AverageByDow;
+  closedByDow: ClosedByDow;
+  /** Per-DOW per-hour-of-day appointment averages: averageHourlyByDow[dow][hour 0-23] = mean count. */
+  averageHourlyByDow: Record<DayOfWeek, Record<number, number>>;
+} {
   const ref = new Date(`${referenceDate}T00:00:00`);
   const start = new Date(ref);
   start.setDate(ref.getDate() - averagingDays);
   const startIso = start.toISOString().slice(0, 10);
   const endIso = referenceDate; // exclusive end
 
-  // 1. Count appointments per historical date.
+  // 1. Daily totals come from revenue_facts.sales_count — the count of
+  // distinct checkout transactions on YOT's DailySalesSummary report
+  // ("Number of Sales" column). This matches the number business users
+  // see in their YOT sales report. Falls back to:
+  //   a) revenue_facts.appointment_count (counted from the local appointments
+  //      table — line items, ~1.6× higher than sales)
+  //   b) a fresh COUNT(*) over local appointments for any date revenue_facts
+  //      hasn't covered yet (e.g. today, before the cron runs)
+  //
+  // Hourly bucketing still comes from the appointments table — DSS only
+  // gives us daily totals, so the only way to know "when in the day"
+  // demand peaks is to look at appointment start times. The hourly mean
+  // is then scaled (further down) to sum to the DSS daily total so the
+  // tooltip and headline numbers stay consistent.
+  const apptCountByDate = new Map<string, number>();
+  const dssRows = sqlite.prepare(
+    `SELECT date, sales_count, appointment_count FROM revenue_facts
+     WHERE team_id = ? AND location_id = ? AND date >= ? AND date < ?`,
+  ).all(teamId, locationId, startIso, endIso) as Array<{
+    date: string;
+    sales_count: number | null;
+    appointment_count: number | null;
+  }>;
+  for (const r of dssRows) {
+    if (typeof r.sales_count === 'number') {
+      apptCountByDate.set(r.date, r.sales_count);
+    } else if (typeof r.appointment_count === 'number') {
+      apptCountByDate.set(r.date, r.appointment_count);
+    }
+  }
+
   const apptRows = db.select().from(schema.appointments)
     .where(and(eq(schema.appointments.teamId, teamId), eq(schema.appointments.locationId, locationId)))
     .all() as schema.Appointment[];
 
-  const apptCountByDate = new Map<string, number>();
+  // Map<dateIso, Map<hour, count>>: how many appointments START in each
+  // hour-of-day on each historical date.
+  const apptCountByDateHour = new Map<string, Map<number, number>>();
+  // Fallback daily count from the appointments table for dates DSS hasn't
+  // covered yet.
+  const apptFallbackCountByDate = new Map<string, number>();
   for (const r of apptRows) {
     const startsAt = r.startAt ?? r.startsAt;
     if (!startsAt) continue;
     const day = startsAt.slice(0, 10);
     if (day < startIso || day >= endIso) continue;
-    apptCountByDate.set(day, (apptCountByDate.get(day) || 0) + 1);
+    apptFallbackCountByDate.set(day, (apptFallbackCountByDate.get(day) || 0) + 1);
+    const hour = parseInt(startsAt.slice(11, 13), 10);
+    if (!Number.isFinite(hour)) continue;
+    let m = apptCountByDateHour.get(day);
+    if (!m) { m = new Map<number, number>(); apptCountByDateHour.set(day, m); }
+    m.set(hour, (m.get(hour) || 0) + 1);
+  }
+  // Fill DSS gaps with the appointments fallback so the open-day detection
+  // and per-DOW averaging keep working for very-recent dates.
+  for (const [day, count] of apptFallbackCountByDate) {
+    if (!apptCountByDate.has(day)) apptCountByDate.set(day, count);
   }
 
   // 2. Within the strict-rule window (last 30 days), pull cached roster
@@ -173,11 +226,15 @@ function averageDailyAppointmentsByDow(
   }
 
   // 3. For each historical date in the window, decide open/closed and
-  // bucket by DOW.
+  // bucket by DOW. Also accumulate per-hour totals so we can derive
+  // averageHourlyByDow.
   const buckets: Record<DayOfWeek, { sum: number; openDays: number }> = {
     sun: { sum: 0, openDays: 0 }, mon: { sum: 0, openDays: 0 }, tue: { sum: 0, openDays: 0 },
     wed: { sum: 0, openDays: 0 }, thu: { sum: 0, openDays: 0 }, fri: { sum: 0, openDays: 0 },
     sat: { sum: 0, openDays: 0 },
+  };
+  const hourBuckets: Record<DayOfWeek, Record<number, number>> = {
+    sun: {}, mon: {}, tue: {}, wed: {}, thu: {}, fri: {}, sat: {},
   };
 
   const cursor = new Date(start);
@@ -193,12 +250,21 @@ function averageDailyAppointmentsByDow(
     if (isOpen) {
       buckets[dow].sum += apptCount;
       buckets[dow].openDays += 1;
+      const hourMap = apptCountByDateHour.get(dateIso);
+      if (hourMap) {
+        for (const [hour, count] of hourMap) {
+          hourBuckets[dow][hour] = (hourBuckets[dow][hour] || 0) + count;
+        }
+      }
     }
     cursor.setDate(cursor.getDate() + 1);
   }
 
   const averageByDow: AverageByDow = { sun: 0, mon: 0, tue: 0, wed: 0, thu: 0, fri: 0, sat: 0 };
   const closedByDow: ClosedByDow = { sun: false, mon: false, tue: false, wed: false, thu: false, fri: false, sat: false };
+  const averageHourlyByDow: Record<DayOfWeek, Record<number, number>> = {
+    sun: {}, mon: {}, tue: {}, wed: {}, thu: {}, fri: {}, sat: {},
+  };
   for (const dow of DOW_KEYS) {
     const b = buckets[dow];
     if (b.openDays === 0) {
@@ -206,10 +272,23 @@ function averageDailyAppointmentsByDow(
       averageByDow[dow] = 0;
     } else {
       averageByDow[dow] = b.sum / b.openDays;
+      // Hourly distribution comes from the appointments table (DSS only
+      // gives daily totals, so we have no other source for "what hour"). To
+      // keep the tooltip's hourly breakdown summing to the headline daily
+      // avg (which is now DSS-sourced), scale each hour's appointments-based
+      // mean by the ratio of the DSS daily total to the appointments-table
+      // daily total for the same DOW.
+      const apptHourlySum = Object.values(hourBuckets[dow]).reduce((acc, n) => acc + n, 0);
+      const apptDailyAvg = apptHourlySum / b.openDays;
+      const scale = apptDailyAvg > 0 ? averageByDow[dow] / apptDailyAvg : 1;
+      for (const [hourStr, total] of Object.entries(hourBuckets[dow])) {
+        const hour = Number(hourStr);
+        averageHourlyByDow[dow][hour] = (total / b.openDays) * scale;
+      }
     }
   }
 
-  return { averageByDow, closedByDow };
+  return { averageByDow, closedByDow, averageHourlyByDow };
 }
 
 function dowOf(dateIso: string): DayOfWeek {
@@ -236,7 +315,7 @@ export async function syncCoverageForLocationDay(opts: SyncCoverageOptions): Pro
   // so they don't dilute the bucket. Required-stylists for each day in the
   // synced week is then computed from that day's specific average — so a
   // Friday's target uses Friday's average, not the global one.
-  const { averageByDow, closedByDow } = averageDailyAppointmentsByDow(
+  const { averageByDow, closedByDow, averageHourlyByDow } = averageDailyAppointmentsByDow(
     db, sqlite, opts.teamId, opts.locationId, opts.date, averagingDays,
   );
   // Back-compat scalar: average for the requested date's day-of-week.
@@ -290,6 +369,7 @@ export async function syncCoverageForLocationDay(opts: SyncCoverageOptions): Pro
     //   2. !businessHours: the configured business-hours schedule says closed.
     //      (Today these are global defaults; future per-location overrides
     //      could differ.)
+    const averageHourlyForDay = averageHourlyByDow[dateDow];
     if (dayIsClosedByHistory || !businessHours) {
       const payload = {
         slots: [],
@@ -299,6 +379,7 @@ export async function syncCoverageForLocationDay(opts: SyncCoverageOptions): Pro
         closed: true,
         averageByDow,
         closedByDow,
+        averageHourlyForDay,
       };
       insert.run(opts.teamId, opts.locationId, date, JSON.stringify(payload),
         JSON.stringify({ rows: [] }), '{}', computedAt, customersPerStylistForDay);
@@ -337,6 +418,7 @@ export async function syncCoverageForLocationDay(opts: SyncCoverageOptions): Pro
         closed: false,
         averageByDow,
         closedByDow,
+        averageHourlyForDay,
       }),
       JSON.stringify({ rows: dayRosteredRaw }),
       '{}',                                    // unused timecard slot
@@ -362,6 +444,7 @@ export async function syncCoverageForLocationDay(opts: SyncCoverageOptions): Pro
     averageByDow,
     closedByDow,
     closed: requestedClosed,
+    averageHourlyForDay: averageHourlyByDow[dowOf(opts.date)],
   };
 }
 
@@ -387,6 +470,7 @@ export function readCachedCoverage(
     closed?: boolean;
     averageByDow?: AverageByDow;
     closedByDow?: ClosedByDow;
+    averageHourlyForDay?: Record<number, number>;
   };
   const slots = parsed.slots;
   const customersPerStylistForDay = parsed.customersPerStylistForDay ?? row.customers_per_stylist ?? 10;
@@ -402,6 +486,7 @@ export function readCachedCoverage(
     averageByDow: parsed.averageByDow ?? emptyDow,
     closedByDow: parsed.closedByDow ?? emptyClosed,
     closed: parsed.closed ?? false,
+    averageHourlyForDay: parsed.averageHourlyForDay ?? {},
   };
 }
 
