@@ -144,29 +144,63 @@ function averageDailyAppointmentsByDow(
   const startIso = start.toISOString().slice(0, 10);
   const endIso = referenceDate; // exclusive end
 
-  // 1. Count appointments per historical date AND bucket per (date, hour) so
-  // we can derive both daily and hourly averages from one pass.
+  // 1. Daily totals come from revenue_facts.sales_count — the count of
+  // distinct checkout transactions on YOT's DailySalesSummary report
+  // ("Number of Sales" column). This matches the number business users
+  // see in their YOT sales report. Falls back to:
+  //   a) revenue_facts.appointment_count (counted from the local appointments
+  //      table — line items, ~1.6× higher than sales)
+  //   b) a fresh COUNT(*) over local appointments for any date revenue_facts
+  //      hasn't covered yet (e.g. today, before the cron runs)
+  //
+  // Hourly bucketing still comes from the appointments table — DSS only
+  // gives us daily totals, so the only way to know "when in the day"
+  // demand peaks is to look at appointment start times. The hourly mean
+  // is then scaled (further down) to sum to the DSS daily total so the
+  // tooltip and headline numbers stay consistent.
+  const apptCountByDate = new Map<string, number>();
+  const dssRows = sqlite.prepare(
+    `SELECT date, sales_count, appointment_count FROM revenue_facts
+     WHERE team_id = ? AND location_id = ? AND date >= ? AND date < ?`,
+  ).all(teamId, locationId, startIso, endIso) as Array<{
+    date: string;
+    sales_count: number | null;
+    appointment_count: number | null;
+  }>;
+  for (const r of dssRows) {
+    if (typeof r.sales_count === 'number') {
+      apptCountByDate.set(r.date, r.sales_count);
+    } else if (typeof r.appointment_count === 'number') {
+      apptCountByDate.set(r.date, r.appointment_count);
+    }
+  }
+
   const apptRows = db.select().from(schema.appointments)
     .where(and(eq(schema.appointments.teamId, teamId), eq(schema.appointments.locationId, locationId)))
     .all() as schema.Appointment[];
 
-  const apptCountByDate = new Map<string, number>();
   // Map<dateIso, Map<hour, count>>: how many appointments START in each
-  // hour-of-day on each historical date. We use start-time bucketing rather
-  // than overlap because appointments shorter than the slot won't double-count
-  // and longer ones still anchor to a single slot.
+  // hour-of-day on each historical date.
   const apptCountByDateHour = new Map<string, Map<number, number>>();
+  // Fallback daily count from the appointments table for dates DSS hasn't
+  // covered yet.
+  const apptFallbackCountByDate = new Map<string, number>();
   for (const r of apptRows) {
     const startsAt = r.startAt ?? r.startsAt;
     if (!startsAt) continue;
     const day = startsAt.slice(0, 10);
     if (day < startIso || day >= endIso) continue;
-    apptCountByDate.set(day, (apptCountByDate.get(day) || 0) + 1);
+    apptFallbackCountByDate.set(day, (apptFallbackCountByDate.get(day) || 0) + 1);
     const hour = parseInt(startsAt.slice(11, 13), 10);
     if (!Number.isFinite(hour)) continue;
     let m = apptCountByDateHour.get(day);
     if (!m) { m = new Map<number, number>(); apptCountByDateHour.set(day, m); }
     m.set(hour, (m.get(hour) || 0) + 1);
+  }
+  // Fill DSS gaps with the appointments fallback so the open-day detection
+  // and per-DOW averaging keep working for very-recent dates.
+  for (const [day, count] of apptFallbackCountByDate) {
+    if (!apptCountByDate.has(day)) apptCountByDate.set(day, count);
   }
 
   // 2. Within the strict-rule window (last 30 days), pull cached roster
@@ -238,12 +272,18 @@ function averageDailyAppointmentsByDow(
       averageByDow[dow] = 0;
     } else {
       averageByDow[dow] = b.sum / b.openDays;
-      // Hourly: divide each hour's total by the SAME open-day count so
-      // hours with sparse activity (e.g. a single 7am opening shift) still
-      // show the genuine per-day average.
+      // Hourly distribution comes from the appointments table (DSS only
+      // gives daily totals, so we have no other source for "what hour"). To
+      // keep the tooltip's hourly breakdown summing to the headline daily
+      // avg (which is now DSS-sourced), scale each hour's appointments-based
+      // mean by the ratio of the DSS daily total to the appointments-table
+      // daily total for the same DOW.
+      const apptHourlySum = Object.values(hourBuckets[dow]).reduce((acc, n) => acc + n, 0);
+      const apptDailyAvg = apptHourlySum / b.openDays;
+      const scale = apptDailyAvg > 0 ? averageByDow[dow] / apptDailyAvg : 1;
       for (const [hourStr, total] of Object.entries(hourBuckets[dow])) {
         const hour = Number(hourStr);
-        averageHourlyByDow[dow][hour] = total / b.openDays;
+        averageHourlyByDow[dow][hour] = (total / b.openDays) * scale;
       }
     }
   }

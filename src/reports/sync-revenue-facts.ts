@@ -342,6 +342,46 @@ export async function syncRevenueFactsFromDailyRevenueSummary(options: SyncReven
       rowsWritten += 1;
     }
 
+    // Phase 2: pull DailySalesSummary for the same window and stamp
+    // sales_count onto every matching revenue_facts row. DSS is a separate
+    // YOT report whose XLSX has the "Number of Sales" column (count of
+    // distinct checkout transactions). We run this after DRS has populated
+    // the row so the upsert is a no-cost UPDATE.
+    let salesRowsUpdated = 0;
+    let salesUnmatched = 0;
+    let dssError: string | null = null;
+    try {
+      const dssParamDefs = await client.getParameters(
+        reportRegistry.dailySalesSummary.reportType,
+        reportRegistry.dailySalesSummary.buildParameterDiscovery(params, config.apiKey),
+      );
+      const dssInstance = await client.createInstance(
+        reportRegistry.dailySalesSummary.reportType,
+        reportRegistry.dailySalesSummary.buildInstanceParams(params),
+      );
+      const dssDoc = await client.createDocument(dssInstance, reportRegistry.dailySalesSummary.preferredFormat);
+      await client.waitForDocument(dssInstance, dssDoc.documentId);
+      const dssFile = await client.fetchDocument(dssInstance, dssDoc.documentId);
+      const dssParsed = reportRegistry.dailySalesSummary.parseDocument(dssFile.buffer, dssParamDefs);
+      const updateSalesCount = sqlite.prepare(
+        `UPDATE revenue_facts SET sales_count = ?, last_updated_at = ?
+         WHERE team_id = ? AND location_id = ? AND date = ?`,
+      );
+      for (const row of dssParsed.rows) {
+        if (row.rowKind !== 'detail') continue;
+        if (row.numberOfSales == null) continue;
+        const locationId = resolveLocationId(locationLookup, row.locationName);
+        const date = parseReportDate(row.date);
+        if (!locationId || !date) { salesUnmatched += 1; continue; }
+        const result = updateSalesCount.run(row.numberOfSales, startedAt, options.teamId, locationId, date);
+        if (result.changes > 0) salesRowsUpdated += 1;
+      }
+    } catch (dssErr: any) {
+      // DSS is best-effort — failing it shouldn't poison the DRS sync.
+      // The sync_runs note carries the error so it's visible.
+      dssError = (dssErr?.message || String(dssErr)).slice(0, 120);
+    }
+
     const completedAt = new Date().toISOString();
     const noteParts = [
       `start=${options.startDateIso}`,
@@ -352,6 +392,9 @@ export async function syncRevenueFactsFromDailyRevenueSummary(options: SyncReven
       `unmatchedLocations=${unmatchedLocationNames.size}`,
     ];
     if (unmatchedLocationNames.size) noteParts.push(`unmatched=${Array.from(unmatchedLocationNames).slice(0, 10).join('|')}`);
+    if (salesRowsUpdated) noteParts.push(`salesRowsUpdated=${salesRowsUpdated}`);
+    if (salesUnmatched) noteParts.push(`salesUnmatched=${salesUnmatched}`);
+    if (dssError) noteParts.push(`dssError=${dssError}`);
 
     upsertSyncState(sqlite, options.teamId, {
       lastSyncedAt: completedAt,
