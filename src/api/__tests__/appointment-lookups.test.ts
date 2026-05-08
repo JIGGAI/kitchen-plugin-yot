@@ -70,6 +70,8 @@ CREATE TABLE locations (
   state TEXT,
   postcode TEXT,
   country TEXT,
+  franchise_id TEXT,
+  franchise_name TEXT,
   raw TEXT,
   synced_at TEXT NOT NULL
 );

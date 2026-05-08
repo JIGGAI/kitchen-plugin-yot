@@ -204,3 +204,39 @@ export async function fetchLocationRosterHtml(
  */
 export { parseRosterHtml as parseRosterFromHtml, scheduledOnly } from '../coverage/parse-roster-html';
 export type { RosterEntry, RosterStatus } from '../coverage/parse-roster-html';
+
+/**
+ * Fetch the franchise list page from /Administration/Franchises/List.
+ * Returns the raw HTML fragment (a `<ul class="list_view">` with one `<li>`
+ * per franchise), which the caller passes to parseFranchisesHtml.
+ *
+ * Pagination: YOT's listView uses ?PageIndex=N. We fetch all pages by
+ * stopping when an empty list comes back. In practice HMX has 7 franchises
+ * which fits on a single page.
+ */
+export async function fetchFranchisesHtml(config: YotConfig): Promise<string> {
+  const baseUrl = resolveBaseUrl(config);
+  const pages: string[] = [];
+  for (let pageIndex = 0; pageIndex < 20; pageIndex++) {
+    const res = await mvcFetch(config, `/Administration/Franchises/List?PageIndex=${pageIndex}`, {
+      method: 'POST',
+      headers: {
+        origin: baseUrl,
+        referer: `${baseUrl}/Administration/Franchises/Index`,
+      },
+      body: '',
+    });
+    if (!res.ok) {
+      const snippet = (await res.text()).slice(0, 240);
+      throw new Error(`YOT MVC franchises fetch failed: HTTP ${res.status} ${snippet}`);
+    }
+    const html = await res.text();
+    pages.push(html);
+    if (!/itemId=/i.test(html)) break;
+    if (!/hasNextPage:\s*true/i.test(html)) break;
+  }
+  return pages.join('\n');
+}
+
+export { parseFranchisesHtml } from '../coverage/parse-franchises-html';
+export type { FranchiseEntry } from '../coverage/parse-franchises-html';
