@@ -2616,6 +2616,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         date?: string;
         ratios?: { weekday?: number; saturday?: number; sunday?: number };
         averagingDays?: number;
+        slotMinutes?: number;
       };
       if (!body.locationId || !body.date) return apiError(400, 'BAD_REQUEST', 'locationId and date required');
       const { syncCoverageForLocationDay } = await import('../coverage/sync');
@@ -2626,12 +2627,16 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
             sunday: Number(body.ratios.sunday) || 6,
           }
         : undefined;
+      const slotMinutes = Number.isFinite(Number(body.slotMinutes)) && Number(body.slotMinutes) > 0
+        ? Math.round(Number(body.slotMinutes))
+        : undefined;
       const result = await syncCoverageForLocationDay({
         teamId,
         locationId: body.locationId,
         date: body.date,
         ratios,
         averagingDays: body.averagingDays,
+        slotMinutes,
       });
       return { status: 200, data: result };
     } catch (err: any) {
