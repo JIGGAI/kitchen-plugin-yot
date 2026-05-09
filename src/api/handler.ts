@@ -748,6 +748,47 @@ function buildRevenueByLocation(rows: RevenueFactRow[]) {
     }));
 }
 
+function buildRevenueByPeriodLocation(rows: RevenueFactRow[], grain: RevenueGrain) {
+  const buckets = new Map<string, {
+    periodKey: string;
+    periodStart: string;
+    periodEnd: string;
+    label: string;
+    locationId: string;
+    locationName: string | null;
+    grossAmount: number;
+    discountAmount: number;
+    netAmount: number;
+    appointmentCount: number;
+    uniqueClientCount: number;
+  }>();
+  for (const row of rows) {
+    const bounds = periodBoundsForDate(row.date, grain);
+    const key = `${bounds.periodKey}::${row.locationId}`;
+    const bucket = buckets.get(key) || {
+      periodKey: bounds.periodKey,
+      periodStart: bounds.periodStart,
+      periodEnd: bounds.periodEnd,
+      label: bounds.label,
+      locationId: row.locationId,
+      locationName: row.locationName ?? row.locationId,
+      grossAmount: 0,
+      discountAmount: 0,
+      netAmount: 0,
+      appointmentCount: 0,
+      uniqueClientCount: 0,
+    };
+    bucket.grossAmount += asNumber(row.grossAmount);
+    bucket.discountAmount += asNumber(row.discountAmount);
+    bucket.netAmount += asNumber(row.netAmount);
+    bucket.appointmentCount += asNumber(row.appointmentCount);
+    bucket.uniqueClientCount += asNumber(row.uniqueClientCount);
+    if (!bucket.locationName && row.locationName) bucket.locationName = row.locationName;
+    buckets.set(key, bucket);
+  }
+  return Array.from(buckets.values());
+}
+
 function listPromotionUsageRows(db: ReturnType<typeof initializeDatabase>['db'], teamId: string, filters: { locationId?: string | null; startDate?: string | null; endDate?: string | null } = {}): PromotionUsageRow[] {
   const locations = db.select().from(schema.locations).where(eq(schema.locations.teamId, teamId)).all() as schema.Location[];
   const promotions = db.select().from(schema.promotions).where(eq(schema.promotions.teamId, teamId)).all() as schema.Promotion[];
@@ -1565,6 +1606,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
           totals: computeRevenueTotals(rows),
           byPeriod: buildRevenueByPeriod(rows, grain),
           byLocation: buildRevenueByLocation(rows),
+          byPeriodLocation: buildRevenueByPeriodLocation(rows, grain),
         },
       };
     } catch (error: any) {
