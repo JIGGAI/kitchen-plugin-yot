@@ -2068,6 +2068,21 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     }
   }
 
+  if (req.path === '/clients/first-seen' && req.method === 'GET') {
+    try {
+      const { sqlite } = initializeDatabase(teamId);
+      const rows = sqlite
+        .prepare(`SELECT client_id AS clientId, MIN(starts_at) AS firstAppointmentAt
+                  FROM appointments
+                  WHERE team_id = ? AND client_id IS NOT NULL
+                  GROUP BY client_id`)
+        .all(teamId) as Array<{ clientId: string; firstAppointmentAt: string | null }>;
+      return { status: 200, data: { rows, total: rows.length } };
+    } catch (error: any) {
+      return apiError(500, 'DATABASE_ERROR', error?.message || 'Failed to compute first-seen map');
+    }
+  }
+
   if (req.path === '/clients/paging-characterization' && req.method === 'GET') {
     const config = readYotConfig(teamId);
     if (!config) return apiError(400, 'NOT_CONFIGURED', 'YOT apiKey not set for this team. POST /config first.');
