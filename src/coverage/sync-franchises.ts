@@ -113,7 +113,17 @@ export async function syncFranchises(opts: SyncFranchisesOptions): Promise<SyncF
   const records: FranchiseSyncRecord[] = [];
   let totalLocationsUpdated = 0;
 
-  for (const entry of entries) {
+  // Process entries with the corporate franchise LAST so it wins any conflict
+  // (YOT can list a single store under multiple franchises, e.g. Morgantown
+  // WV appears under both "Hair MX" corporate AND "Terry Morgantown" — the
+  // intent in that case is corporate ownership). Within each group, preserve
+  // the source order from YOT.
+  const orderedEntries = [
+    ...entries.filter((e) => !isCorporateFranchise(e.name)),
+    ...entries.filter((e) => isCorporateFranchise(e.name)),
+  ];
+
+  for (const entry of orderedEntries) {
     const isCorp = isCorporateFranchise(entry.name);
     const matchedIds: string[] = [];
     const unmatched: string[] = [];
@@ -130,7 +140,9 @@ export async function syncFranchises(opts: SyncFranchisesOptions): Promise<SyncF
       .run(teamId, entry.franchiseId, entry.name, isCorp ? 1 : 0, entry.locationCount, syncedAt);
 
     if (matchedIds.length) {
-      // Stamp the franchise pointer on every matched location.
+      // Stamp the franchise pointer on every matched location. Since corporate
+      // is processed last, any location appearing in BOTH a franchisee group
+      // and the corporate group ends up correctly tagged as corporate.
       const stmt = sqlite.prepare(
         'UPDATE locations SET franchise_id = ?, franchise_name = ? WHERE team_id = ? AND id = ?',
       );
