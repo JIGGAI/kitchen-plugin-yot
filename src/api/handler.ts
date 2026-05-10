@@ -2743,14 +2743,23 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     const lookbackDays = explicitLookback
       ? Math.max(1, Math.min(parseInt(req.query.lookbackDays || '30', 10) || 30, 365))
       : autoResumeRange(teamId, 'appointments').lookbackDays;
+    // Forward window — pulls upcoming bookings (default 0 = past-only,
+    // backwards-compatible). Use ?forwardDays=N to also fetch appointments
+    // scheduled up to N days from now (e.g. dashboards that need to surface
+    // tomorrow's schedule).
+    const explicitForward = req.query.forwardDays != null;
+    const forwardDays = explicitForward
+      ? Math.max(0, Math.min(parseInt(req.query.forwardDays || '0', 10) || 0, 365))
+      : 0;
     try {
       const { db } = initializeDatabase(teamId);
-      db.insert(schema.syncRuns).values({ id: runId, teamId, resource: 'appointments', status: 'running', startedAt, notes: `lookbackDays=${lookbackDays}${explicitLookback ? '' : ' (auto-resume)'}` }).run();
+      db.insert(schema.syncRuns).values({ id: runId, teamId, resource: 'appointments', status: 'running', startedAt, notes: `lookbackDays=${lookbackDays}${explicitLookback ? '' : ' (auto-resume)'}; forwardDays=${forwardDays}` }).run();
       const locations = await fetchLocations(config);
       const activeLocations = locations.filter((item) => item?.id != null && item?.active !== false);
       const now = new Date().toISOString();
-      const enddate = Date.now();
-      const date = enddate - lookbackDays * 24 * 60 * 60 * 1000;
+      const nowMs = Date.now();
+      const enddate = nowMs + forwardDays * 24 * 60 * 60 * 1000;
+      const date = nowMs - lookbackDays * 24 * 60 * 60 * 1000;
       let rowsSeen = 0;
       let rowsWritten = 0;
       let locationsSynced = 0;
