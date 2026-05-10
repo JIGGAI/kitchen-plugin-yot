@@ -38,6 +38,12 @@ function isoDateOnly(value: string): string {
   return String(value || '').slice(0, 10);
 }
 
+function addDaysIso(dateOnly: string, n: number): string {
+  const d = new Date(`${dateOnly}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+
 export async function syncStaffCashoutFromReport(options: SyncStaffCashoutOptions): Promise<SyncStaffCashoutResult> {
   const { sqlite } = initializeDatabase(options.teamId);
   const startedAt = new Date().toISOString();
@@ -53,27 +59,6 @@ export async function syncStaffCashoutFromReport(options: SyncStaffCashoutOption
   try {
     const config = readConfig(sqlite, options.teamId);
     const client = createReportClient(config);
-    const params = {
-      startDateIso: options.startDateIso,
-      endDateIso: options.endDateIso,
-      organisationId: options.organisationId,
-      locationId: options.locationId ?? null,
-      staffId: options.staffId ?? null,
-    };
-
-    const parameterDefinitions = await client.getParameters(
-      reportRegistry.staffCashout.reportType,
-      reportRegistry.staffCashout.buildParameterDiscovery(params, config.apiKey),
-    );
-    const instanceId = await client.createInstance(
-      reportRegistry.staffCashout.reportType,
-      reportRegistry.staffCashout.buildInstanceParams(params),
-    );
-    const document = await client.createDocument(instanceId, reportRegistry.staffCashout.preferredFormat);
-    await client.waitForDocument(instanceId, document.documentId);
-    const file = await client.fetchDocument(instanceId, document.documentId);
-    const parsed = reportRegistry.staffCashout.parseDocument(file.buffer, parameterDefinitions);
-
     const lastUpdatedAt = new Date().toISOString();
     const upsert = sqlite.prepare(`
       INSERT INTO staff_cashout_facts (
@@ -92,34 +77,70 @@ export async function syncStaffCashoutFromReport(options: SyncStaffCashoutOption
         bank_to_bank_amount = excluded.bank_to_bank_amount,
         last_updated_at = excluded.last_updated_at
     `);
+    const deleteDay = sqlite.prepare(
+      `DELETE FROM staff_cashout_facts WHERE team_id = ? AND date = ?`,
+    );
 
+    // The Staff Cashout report aggregates by date range and emits no per-row
+    // date column — every parsed row gets `date: null`. If we called the
+    // report once for a multi-day range and stamped each row with `startDate`
+    // (the previous behavior), all 5+ days of data would land on one date.
+    // Loop per day so each call's report = exactly that one date's data,
+    // which lets us stamp the correct date on each row.
+    let rowsSeen = 0;
     let rowsWritten = 0;
-    const writeAll = sqlite.transaction((rows: StaffCashoutResult['rows']) => {
-      // Wipe existing rows for this date range so deletions on YOT side are reflected.
-      sqlite.prepare(`DELETE FROM staff_cashout_facts WHERE team_id = ? AND date BETWEEN ? AND ?`)
-        .run(options.teamId, startDate, endDate);
-      for (const row of rows) {
-        if (!row.staffName) continue;
-        const date = row.date || startDate;
-        upsert.run(
-          options.teamId,
-          date,
-          row.locationName || 'Unknown location',
-          row.staffName,
-          null,
-          null,
-          row.serviceRevenue,
-          row.productRevenue,
-          row.tips,
-          row.totalRevenue,
-          row.totalCashReceived,
-          row.bankToBankAmount,
-          lastUpdatedAt,
-        );
-        rowsWritten += 1;
-      }
-    });
-    writeAll(parsed.rows);
+    let lastParsed: StaffCashoutResult = { sheetName: null, headerRow: [], parameters: [], rows: [] };
+    let cursor = startDate;
+    while (cursor <= endDate) {
+      const dayParams = {
+        startDateIso: `${cursor}T00:00:00`,
+        endDateIso: `${cursor}T00:00:00`,
+        organisationId: options.organisationId,
+        locationId: options.locationId ?? null,
+        staffId: options.staffId ?? null,
+      };
+      const parameterDefinitions = await client.getParameters(
+        reportRegistry.staffCashout.reportType,
+        reportRegistry.staffCashout.buildParameterDiscovery(dayParams, config.apiKey),
+      );
+      const instanceId = await client.createInstance(
+        reportRegistry.staffCashout.reportType,
+        reportRegistry.staffCashout.buildInstanceParams(dayParams),
+      );
+      const document = await client.createDocument(instanceId, reportRegistry.staffCashout.preferredFormat);
+      await client.waitForDocument(instanceId, document.documentId);
+      const file = await client.fetchDocument(instanceId, document.documentId);
+      const parsed = reportRegistry.staffCashout.parseDocument(file.buffer, parameterDefinitions);
+      lastParsed = parsed;
+      rowsSeen += parsed.rows.length;
+
+      const cursorDay = cursor;
+      const writeDay = sqlite.transaction((rows: StaffCashoutResult['rows']) => {
+        // Wipe the day's existing rows first so YOT-side deletions reflect.
+        deleteDay.run(options.teamId, cursorDay);
+        for (const row of rows) {
+          if (!row.staffName) continue;
+          upsert.run(
+            options.teamId,
+            cursorDay,
+            row.locationName || 'Unknown location',
+            row.staffName,
+            null,
+            null,
+            row.serviceRevenue,
+            row.productRevenue,
+            row.tips,
+            row.totalRevenue,
+            row.totalCashReceived,
+            row.bankToBankAmount,
+            lastUpdatedAt,
+          );
+          rowsWritten += 1;
+        }
+      });
+      writeDay(parsed.rows);
+      cursor = addDaysIso(cursor, 1);
+    }
 
     sqlite.prepare(`
       INSERT INTO sync_state (team_id, resource, last_synced_at, last_success_at, row_count, last_error)
@@ -135,9 +156,9 @@ export async function syncStaffCashoutFromReport(options: SyncStaffCashoutOption
       UPDATE sync_runs
       SET status = 'success', completed_at = ?, rows_seen = ?, rows_written = ?
       WHERE id = ?
-    `).run(new Date().toISOString(), parsed.rows.length, rowsWritten, runId);
+    `).run(new Date().toISOString(), rowsSeen, rowsWritten, runId);
 
-    return { startDate, endDate, rowsSeen: parsed.rows.length, rowsWritten, parsed };
+    return { startDate, endDate, rowsSeen, rowsWritten, parsed: lastParsed };
   } catch (error: any) {
     sqlite.prepare(`
       INSERT INTO sync_state (team_id, resource, last_synced_at, last_error)
