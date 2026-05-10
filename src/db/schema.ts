@@ -211,9 +211,42 @@ export const revenueFacts = sqliteTable('revenue_facts', {
    *  runs for that date. Always <= appointmentCount because one sale can
    *  bundle multiple service line items. */
   salesCount: integer('sales_count'),
+  // Per-(location, date) totals from YOT's DailySalesSummaryTotals report.
+  // Populated by the DSS Totals sync; null on dates not yet synced.
+  cashSales: real('cash_sales'),
+  totalSales: real('total_sales'),
+  servicesPerSale: real('services_per_sale'),
+  avgSaleValue: real('avg_sale_value'),
+  commissionTotal: real('commission_total'),
+  commissionNet: real('commission_net'),
+  grossIncome: real('gross_income'),
+  pctCostOfSale: real('pct_cost_of_sale'),
   lastUpdatedAt: text('last_updated_at').notNull(),
 }, (t) => ({
   pk: primaryKey({ columns: [t.teamId, t.locationId, t.date] }),
+}));
+
+export const monthlyPerformanceFacts = sqliteTable('monthly_performance_facts', {
+  teamId: text('team_id').notNull(),
+  locationId: text('location_id').notNull(),
+  yearMonth: text('year_month').notNull(), // "2026-05"
+  appointments: integer('appointments'),
+  cancelled: integer('cancelled'),
+  noShows: integer('no_shows'),
+  onlineBookings: integer('online_bookings'),
+  newClients: integer('new_clients'),
+  totalClients: integer('total_clients'),
+  salesCount: integer('sales_count'),
+  salesPerDay: real('sales_per_day'),
+  voucherCount: integer('voucher_count'),
+  productSales: real('product_sales'),
+  serviceSales: real('service_sales'),
+  totalSales: real('total_sales'),
+  yoyAmount: real('yoy_amount'),
+  yoyPct: real('yoy_pct'),
+  lastUpdatedAt: text('last_updated_at').notNull(),
+}, (t) => ({
+  pk: primaryKey({ columns: [t.teamId, t.locationId, t.yearMonth] }),
 }));
 
 export const staffCashoutFacts = sqliteTable('staff_cashout_facts', {

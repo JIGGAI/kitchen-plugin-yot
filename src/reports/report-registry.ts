@@ -16,6 +16,22 @@ import {
   parseDailySalesSummaryWorkbook,
 } from './reports/daily-sales-summary';
 import {
+  DAILY_SALES_SUMMARY_TOTALS_REPORT,
+  type DailySalesSummaryTotalsParams,
+  type DailySalesSummaryTotalsResult,
+  buildDailySalesSummaryTotalsInstanceParams,
+  buildDailySalesSummaryTotalsParameterDiscovery,
+  parseDailySalesSummaryTotalsWorkbook,
+} from './reports/daily-sales-summary-totals';
+import {
+  MONTHLY_PERFORMANCE_SUMMARY_REPORT,
+  type MonthlyPerformanceSummaryParams,
+  type MonthlyPerformanceSummaryResult,
+  buildMonthlyPerformanceSummaryInstanceParams,
+  buildMonthlyPerformanceSummaryParameterDiscovery,
+  parseMonthlyPerformanceSummaryWorkbook,
+} from './reports/monthly-performance-summary';
+import {
   PROMOTION_USAGE_REPORT,
   type PromotionUsageParams,
   type PromotionUsageResult,
@@ -79,6 +95,24 @@ export const reportRegistry = {
     buildInstanceParams: buildDailySalesSummaryInstanceParams,
     parseDocument: parseDailySalesSummaryWorkbook,
   } satisfies YotReportDefinition<DailySalesSummaryParams, DailySalesSummaryResult>,
+  dailySalesSummaryTotals: {
+    key: DAILY_SALES_SUMMARY_TOTALS_REPORT.key,
+    reportName: DAILY_SALES_SUMMARY_TOTALS_REPORT.reportName,
+    reportType: DAILY_SALES_SUMMARY_TOTALS_REPORT.reportType,
+    preferredFormat: DAILY_SALES_SUMMARY_TOTALS_REPORT.preferredFormat,
+    buildParameterDiscovery: buildDailySalesSummaryTotalsParameterDiscovery,
+    buildInstanceParams: buildDailySalesSummaryTotalsInstanceParams,
+    parseDocument: parseDailySalesSummaryTotalsWorkbook,
+  } satisfies YotReportDefinition<DailySalesSummaryTotalsParams, DailySalesSummaryTotalsResult>,
+  monthlyPerformanceSummary: {
+    key: MONTHLY_PERFORMANCE_SUMMARY_REPORT.key,
+    reportName: MONTHLY_PERFORMANCE_SUMMARY_REPORT.reportName,
+    reportType: MONTHLY_PERFORMANCE_SUMMARY_REPORT.reportType,
+    preferredFormat: MONTHLY_PERFORMANCE_SUMMARY_REPORT.preferredFormat,
+    buildParameterDiscovery: buildMonthlyPerformanceSummaryParameterDiscovery,
+    buildInstanceParams: buildMonthlyPerformanceSummaryInstanceParams,
+    parseDocument: parseMonthlyPerformanceSummaryWorkbook,
+  } satisfies YotReportDefinition<MonthlyPerformanceSummaryParams, MonthlyPerformanceSummaryResult>,
 };
 
 export type ReportRegistry = typeof reportRegistry;
