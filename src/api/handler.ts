@@ -16,6 +16,8 @@ import { runStaffCashoutReport } from '../reports/run-staff-cashout';
 import { listStaffCashoutFacts, syncStaffCashoutFromReport } from '../reports/sync-staff-cashout';
 import { syncPromotionUsageRange } from '../reports/sync-promotion-usage';
 import { syncRevenueFactsRangeFromDailyRevenueSummary } from '../reports/sync-revenue-facts';
+import { reportRegistry } from '../reports/report-registry';
+import { createReportClient } from '../reports/client';
 import type { KitchenPluginContext } from './types-kitchen';
 import type {
   ApiError,
@@ -197,6 +199,18 @@ type RevenueLocationAccumulator = {
   uniqueClientCount: number;
   dayKeys: Set<string>;
   lastUpdatedAt: string | null;
+  // Per-location totals from the DSS Totals report. Sums are valid across any
+  // window (additive). Ratio fields hold the last-seen non-null value — only
+  // meaningful when the window is a single day (which is the daily-ops case).
+  salesCount: number;
+  cashSales: number;
+  totalSales: number;
+  commissionTotal: number;
+  commissionNet: number;
+  grossIncome: number;
+  servicesPerSale: number | null;
+  avgSaleValue: number | null;
+  pctCostOfSale: number | null;
 };
 type PromotionUsageRow = schema.PromotionUsage & {
   locationName: string | null;
@@ -719,12 +733,30 @@ function buildRevenueByLocation(rows: RevenueFactRow[]) {
       uniqueClientCount: 0,
       dayKeys: new Set<string>(),
       lastUpdatedAt: null,
+      salesCount: 0,
+      cashSales: 0,
+      totalSales: 0,
+      commissionTotal: 0,
+      commissionNet: 0,
+      grossIncome: 0,
+      servicesPerSale: null,
+      avgSaleValue: null,
+      pctCostOfSale: null,
     };
     bucket.grossAmount += asNumber(row.grossAmount);
     bucket.discountAmount += asNumber(row.discountAmount);
     bucket.netAmount += asNumber(row.netAmount);
     bucket.appointmentCount += asNumber(row.appointmentCount);
     bucket.uniqueClientCount += asNumber(row.uniqueClientCount);
+    bucket.salesCount += asNumber((row as any).salesCount);
+    bucket.cashSales += asNumber((row as any).cashSales);
+    bucket.totalSales += asNumber((row as any).totalSales);
+    bucket.commissionTotal += asNumber((row as any).commissionTotal);
+    bucket.commissionNet += asNumber((row as any).commissionNet);
+    bucket.grossIncome += asNumber((row as any).grossIncome);
+    if ((row as any).servicesPerSale != null) bucket.servicesPerSale = Number((row as any).servicesPerSale);
+    if ((row as any).avgSaleValue != null) bucket.avgSaleValue = Number((row as any).avgSaleValue);
+    if ((row as any).pctCostOfSale != null) bucket.pctCostOfSale = Number((row as any).pctCostOfSale);
     bucket.dayKeys.add(row.date);
     bucket.lastUpdatedAt = mostRecentIso(bucket.lastUpdatedAt, row.lastUpdatedAt || null);
     if (!bucket.locationName && row.locationName) bucket.locationName = row.locationName;
@@ -745,6 +777,15 @@ function buildRevenueByLocation(rows: RevenueFactRow[]) {
       uniqueClientCount: bucket.uniqueClientCount,
       dayCount: bucket.dayKeys.size,
       lastUpdatedAt: bucket.lastUpdatedAt,
+      salesCount: bucket.salesCount || null,
+      cashSales: bucket.cashSales || null,
+      totalSales: bucket.totalSales || null,
+      commissionTotal: bucket.commissionTotal || null,
+      commissionNet: bucket.commissionNet || null,
+      grossIncome: bucket.grossIncome || null,
+      servicesPerSale: bucket.servicesPerSale,
+      avgSaleValue: bucket.avgSaleValue,
+      pctCostOfSale: bucket.pctCostOfSale,
     }));
 }
 
@@ -1659,6 +1700,130 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       return { status: 200, data: { ok: true, ...result } };
     } catch (error: any) {
       return apiError(502, 'YOT_ERROR', error?.message || 'Failed to sync revenue facts');
+    }
+  }
+
+  // ─── Monthly Performance Summary ────────────────────────────────────────
+  // GET /monthly-performance?yearMonth=YYYY-MM (default = current month, UTC)
+  // → returns { yearMonth, locations: [...], totals: {...} } from cache.
+  if (req.path === '/monthly-performance' && req.method === 'GET') {
+    try {
+      const { db, sqlite } = initializeDatabase(teamId);
+      const yearMonth = cleanString(req.query.yearMonth || req.query.month) || new Date().toISOString().slice(0, 7);
+      if (!/^\d{4}-\d{2}$/.test(yearMonth)) return apiError(400, 'BAD_REQUEST', 'yearMonth must be YYYY-MM');
+      const locations = db.select().from(schema.locations).where(eq(schema.locations.teamId, teamId)).all() as schema.Location[];
+      const nameById = new Map<string, string | null>(locations.map((l) => [l.id, l.name ?? null]));
+      const rows = sqlite.prepare(
+        `SELECT location_id AS locationId, year_month AS yearMonth,
+          appointments, cancelled, no_shows AS noShows, online_bookings AS onlineBookings,
+          new_clients AS newClients, total_clients AS totalClients,
+          sales_count AS salesCount, sales_per_day AS salesPerDay, voucher_count AS voucherCount,
+          product_sales AS productSales, service_sales AS serviceSales, total_sales AS totalSales,
+          yoy_amount AS yoyAmount, yoy_pct AS yoyPct, last_updated_at AS lastUpdatedAt
+         FROM monthly_performance_facts WHERE team_id = ? AND year_month = ?
+         ORDER BY total_sales DESC`,
+      ).all(teamId, yearMonth) as Array<Record<string, any>>;
+      const enriched = rows.map((r) => ({ ...r, locationName: nameById.get(r.locationId) ?? null }));
+      const lastUpdatedAt = enriched.reduce<string | null>((acc, r) => mostRecentIso(acc, r.lastUpdatedAt || null), null);
+      return { status: 200, data: { ok: true, yearMonth, locationCount: enriched.length, lastUpdatedAt, locations: enriched } };
+    } catch (error: any) {
+      return apiError(500, 'INTERNAL', error?.message || 'Failed to read monthly performance facts');
+    }
+  }
+
+  // POST /monthly-performance/sync?yearMonth=YYYY-MM
+  // Pulls the YOT MonthlyPerformanceSummary report for the given month and
+  // upserts per-location facts. Sync is per-location-resolved by name.
+  if (req.path === '/monthly-performance/sync' && req.method === 'POST') {
+    const config = readYotConfig(teamId);
+    if (!config) return apiError(400, 'NOT_CONFIGURED', 'YOT apiKey not set for this team. POST /config first.');
+    try {
+      const yearMonth = cleanString(req.query.yearMonth || req.query.month) || new Date().toISOString().slice(0, 7);
+      if (!/^\d{4}-\d{2}$/.test(yearMonth)) return apiError(400, 'BAD_REQUEST', 'yearMonth must be YYYY-MM');
+      const [yearStr, monthStr] = yearMonth.split('-');
+      const year = Number(yearStr); const month = Number(monthStr);
+      const startDate = `${yearMonth}-01`;
+      const endDate = new Date(Date.UTC(year, month, 0)).toISOString().slice(0, 10);
+      const organisationId = Number(cleanString(req.query.organisationId || req.query.org) || String(DEFAULT_REVENUE_ORGANISATION_ID));
+      if (!Number.isFinite(organisationId)) return apiError(400, 'BAD_REQUEST', 'organisationId must be a number');
+
+      const params = {
+        startDateIso: `${startDate}T00:00:00`,
+        endDateIso: `${endDate}T00:00:00`,
+        organisationId,
+        locationId: null,
+        staffId: null,
+      };
+      const client = createReportClient(config);
+      const r = reportRegistry.monthlyPerformanceSummary;
+      const defs = await client.getParameters(r.reportType, r.buildParameterDiscovery(params, config.apiKey));
+      const inst = await client.createInstance(r.reportType, r.buildInstanceParams(params));
+      const doc = await client.createDocument(inst, r.preferredFormat);
+      await client.waitForDocument(inst, doc.documentId);
+      const file = await client.fetchDocument(inst, doc.documentId);
+      const parsed = r.parseDocument(file.buffer, defs);
+
+      const { db, sqlite } = initializeDatabase(teamId);
+      const locations = db.select().from(schema.locations).where(eq(schema.locations.teamId, teamId)).all() as schema.Location[];
+      const lookup = new Map<string, schema.Location[]>();
+      for (const loc of locations) {
+        const key = normalizeNameForLookup(loc.name);
+        if (!key) continue;
+        const bucket = lookup.get(key) || [];
+        bucket.push(loc); lookup.set(key, bucket);
+      }
+      function resolveLocationId(name: string): string | null {
+        const key = normalizeNameForLookup(name);
+        if (!key) return null;
+        const matches = lookup.get(key) || [];
+        if (matches.length === 1) return matches[0]!.id;
+        return matches.find((l) => cleanString(l.name) === cleanString(name))?.id || null;
+      }
+
+      const upsert = sqlite.prepare(
+        `INSERT INTO monthly_performance_facts (
+          team_id, location_id, year_month,
+          appointments, cancelled, no_shows, online_bookings, new_clients, total_clients,
+          sales_count, sales_per_day, voucher_count,
+          product_sales, service_sales, total_sales,
+          yoy_amount, yoy_pct, last_updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT (team_id, location_id, year_month) DO UPDATE SET
+          appointments = excluded.appointments,
+          cancelled = excluded.cancelled,
+          no_shows = excluded.no_shows,
+          online_bookings = excluded.online_bookings,
+          new_clients = excluded.new_clients,
+          total_clients = excluded.total_clients,
+          sales_count = excluded.sales_count,
+          sales_per_day = excluded.sales_per_day,
+          voucher_count = excluded.voucher_count,
+          product_sales = excluded.product_sales,
+          service_sales = excluded.service_sales,
+          total_sales = excluded.total_sales,
+          yoy_amount = excluded.yoy_amount,
+          yoy_pct = excluded.yoy_pct,
+          last_updated_at = excluded.last_updated_at`,
+      );
+
+      const startedAt = new Date().toISOString();
+      let rowsWritten = 0; let unmatched = 0;
+      for (const row of parsed.rows) {
+        if (row.rowKind !== 'monthDetail' || !row.locationName) continue;
+        const locationId = resolveLocationId(row.locationName);
+        if (!locationId) { unmatched += 1; continue; }
+        upsert.run(
+          teamId, locationId, yearMonth,
+          row.appointments, row.cancelled, row.noShows, row.onlineBookings, row.newClients, row.totalClients,
+          row.salesCount, row.salesPerDay, row.voucherCount,
+          row.productSales, row.serviceSales, row.totalSales,
+          row.yoyAmount, row.yoyPct, startedAt,
+        );
+        rowsWritten += 1;
+      }
+      return { status: 200, data: { ok: true, yearMonth, startDate, endDate, rowsWritten, unmatched, locationCount: parsed.locations.length, startedAt, completedAt: new Date().toISOString() } };
+    } catch (error: any) {
+      return apiError(502, 'YOT_ERROR', error?.message || 'Failed to sync monthly performance');
     }
   }
 

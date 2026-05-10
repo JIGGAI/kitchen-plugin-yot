@@ -382,6 +382,59 @@ export async function syncRevenueFactsFromDailyRevenueSummary(options: SyncReven
       dssError = (dssErr?.message || String(dssErr)).slice(0, 120);
     }
 
+    // Phase 3: pull DailySalesSummaryTotals one day at a time and stamp the
+    // 8 sales-totals columns onto revenue_facts. The Totals report aggregates
+    // across the whole date range, so we loop per-day to keep per-(location,
+    // date) granularity. Best-effort like Phase 2.
+    let totalsRowsUpdated = 0;
+    let totalsUnmatched = 0;
+    let totalsError: string | null = null;
+    try {
+      const updateTotals = sqlite.prepare(
+        `UPDATE revenue_facts SET
+          cash_sales = ?, total_sales = ?, services_per_sale = ?, avg_sale_value = ?,
+          commission_total = ?, commission_net = ?, gross_income = ?, pct_cost_of_sale = ?,
+          last_updated_at = ?
+         WHERE team_id = ? AND location_id = ? AND date = ?`,
+      );
+      const startDateOnly = isoDateOnly(options.startDateIso);
+      const endDateOnly = isoDateOnly(options.endDateIso);
+      let cursor = startDateOnly;
+      while (cursor <= endDateOnly) {
+        const dayParams = {
+          ...params,
+          startDateIso: `${cursor}T00:00:00`,
+          endDateIso: `${cursor}T00:00:00`,
+        };
+        const totalsParamDefs = await client.getParameters(
+          reportRegistry.dailySalesSummaryTotals.reportType,
+          reportRegistry.dailySalesSummaryTotals.buildParameterDiscovery(dayParams as any, config.apiKey),
+        );
+        const totalsInstance = await client.createInstance(
+          reportRegistry.dailySalesSummaryTotals.reportType,
+          reportRegistry.dailySalesSummaryTotals.buildInstanceParams(dayParams as any),
+        );
+        const totalsDoc = await client.createDocument(totalsInstance, reportRegistry.dailySalesSummaryTotals.preferredFormat);
+        await client.waitForDocument(totalsInstance, totalsDoc.documentId);
+        const totalsFile = await client.fetchDocument(totalsInstance, totalsDoc.documentId);
+        const totalsParsed = reportRegistry.dailySalesSummaryTotals.parseDocument(totalsFile.buffer, totalsParamDefs);
+        for (const tRow of totalsParsed.rows) {
+          if (tRow.rowKind !== 'locationTotal' || !tRow.locationName) continue;
+          const locationId = resolveLocationId(locationLookup, tRow.locationName);
+          if (!locationId) { totalsUnmatched += 1; continue; }
+          const result = updateTotals.run(
+            tRow.cashSales, tRow.totalSales, tRow.servicesPerSale, tRow.avgSaleValue,
+            tRow.commissionTotal, tRow.commissionNet, tRow.grossIncome, tRow.pctCostOfSale,
+            startedAt, options.teamId, locationId, cursor,
+          );
+          if (result.changes > 0) totalsRowsUpdated += 1;
+        }
+        cursor = addDaysToDateOnly(cursor, 1);
+      }
+    } catch (totalsErr: any) {
+      totalsError = (totalsErr?.message || String(totalsErr)).slice(0, 120);
+    }
+
     const completedAt = new Date().toISOString();
     const noteParts = [
       `start=${options.startDateIso}`,
@@ -395,6 +448,9 @@ export async function syncRevenueFactsFromDailyRevenueSummary(options: SyncReven
     if (salesRowsUpdated) noteParts.push(`salesRowsUpdated=${salesRowsUpdated}`);
     if (salesUnmatched) noteParts.push(`salesUnmatched=${salesUnmatched}`);
     if (dssError) noteParts.push(`dssError=${dssError}`);
+    if (totalsRowsUpdated) noteParts.push(`totalsRowsUpdated=${totalsRowsUpdated}`);
+    if (totalsUnmatched) noteParts.push(`totalsUnmatched=${totalsUnmatched}`);
+    if (totalsError) noteParts.push(`totalsError=${totalsError}`);
 
     upsertSyncState(sqlite, options.teamId, {
       lastSyncedAt: completedAt,
