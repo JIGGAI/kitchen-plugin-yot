@@ -1846,6 +1846,89 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     }
   }
 
+  // ─── Weekly Performance (MonthlyPerformanceSummary, on-demand) ─────────
+  // GET /weekly-performance?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
+  // Reuses the MonthlyPerformanceSummary YOT report — it accepts arbitrary
+  // date ranges and returns per-(location, month) detail rows. We aggregate
+  // per location across whatever month-detail rows fall in the requested
+  // range so a week that crosses a month boundary still returns one row
+  // per location. Fetched fresh each call (no DB cache yet); takes ~30-60s
+  // because it's a Telerik report fetch. Powers /weekly-marketing's new
+  // Location Performance Ranking section on the dashboard.
+  if (req.path === '/weekly-performance' && req.method === 'GET') {
+    const config = readYotConfig(teamId);
+    if (!config) return apiError(400, 'NOT_CONFIGURED', 'YOT apiKey not set for this team. POST /config first.');
+    try {
+      const startDate = toDateOnlyInput(req.query.startDate || req.query.start);
+      const endDate = toDateOnlyInput(req.query.endDate || req.query.end);
+      if (!startDate || !endDate) return apiError(400, 'BAD_REQUEST', 'startDate and endDate required (YYYY-MM-DD)');
+      const organisationId = Number(cleanString(req.query.organisationId || req.query.org) || String(DEFAULT_REVENUE_ORGANISATION_ID));
+      if (!Number.isFinite(organisationId)) return apiError(400, 'BAD_REQUEST', 'organisationId must be a number');
+
+      const params = {
+        startDateIso: `${startDate}T00:00:00`,
+        endDateIso: `${endDate}T00:00:00`,
+        organisationId,
+        locationId: null,
+        staffId: null,
+      };
+      const client = createReportClient(config);
+      const r = reportRegistry.monthlyPerformanceSummary;
+      const defs = await client.getParameters(r.reportType, r.buildParameterDiscovery(params, config.apiKey));
+      const inst = await client.createInstance(r.reportType, r.buildInstanceParams(params));
+      const doc = await client.createDocument(inst, r.preferredFormat);
+      await client.waitForDocument(inst, doc.documentId);
+      const file = await client.fetchDocument(inst, doc.documentId);
+      const parsed = r.parseDocument(file.buffer, defs);
+
+      // Aggregate per location across any monthDetail rows that fall in the
+      // requested range. For week ranges that fit inside one month each
+      // location has 1 row; for week ranges that cross a month boundary
+      // (e.g. Apr 27 - May 3) each location has 2 rows that we sum.
+      type Acc = {
+        locationName: string;
+        appointments: number; cancelled: number; noShows: number;
+        salesCount: number; productSales: number; serviceSales: number;
+        totalSales: number; yoyAmount: number;
+        // YoY % is already a percent on each row — when a week crosses a
+        // month, prefer the latest month's value (last row wins) since
+        // there's no clean way to combine two YoY percents.
+        yoyPct: number | null;
+      };
+      const buckets = new Map<string, Acc>();
+      for (const row of parsed.rows) {
+        if (row.rowKind !== 'monthDetail' || !row.locationName) continue;
+        const acc = buckets.get(row.locationName) || {
+          locationName: row.locationName,
+          appointments: 0, cancelled: 0, noShows: 0,
+          salesCount: 0, productSales: 0, serviceSales: 0,
+          totalSales: 0, yoyAmount: 0, yoyPct: null,
+        };
+        acc.appointments += Number(row.appointments || 0);
+        acc.cancelled += Number(row.cancelled || 0);
+        acc.noShows += Number(row.noShows || 0);
+        acc.salesCount += Number(row.salesCount || 0);
+        acc.productSales += Number(row.productSales || 0);
+        acc.serviceSales += Number(row.serviceSales || 0);
+        acc.totalSales += Number(row.totalSales || 0);
+        acc.yoyAmount += Number(row.yoyAmount || 0);
+        if (row.yoyPct != null) acc.yoyPct = Number(row.yoyPct);
+        buckets.set(row.locationName, acc);
+      }
+      const dayMs = 24 * 60 * 60 * 1000;
+      const dayCount = Math.max(1, Math.round((Date.parse(`${endDate}T00:00:00Z`) - Date.parse(`${startDate}T00:00:00Z`)) / dayMs) + 1);
+      const rows = Array.from(buckets.values()).map((a) => ({
+        ...a,
+        // Recompute sales/day from the actual day count of the requested
+        // range — the report's own salesPerDay is per the response's window.
+        salesPerDay: a.salesCount > 0 ? Math.round(a.salesCount / dayCount) : 0,
+      })).sort((a, b) => b.totalSales - a.totalSales);
+      return { status: 200, data: { ok: true, startDate, endDate, dayCount, rowCount: rows.length, rows } };
+    } catch (error: any) {
+      return apiError(502, 'YOT_ERROR', error?.message || 'Failed to fetch weekly performance');
+    }
+  }
+
   // ─── Staff Performance (StaffPerformance_2121 report) ──────────────────
   // GET /staff-performance?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
   // Aggregates per (location, staff) across the requested date range from
