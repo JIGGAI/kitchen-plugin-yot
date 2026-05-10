@@ -1713,6 +1713,25 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       if (!/^\d{4}-\d{2}$/.test(yearMonth)) return apiError(400, 'BAD_REQUEST', 'yearMonth must be YYYY-MM');
       const locations = db.select().from(schema.locations).where(eq(schema.locations.teamId, teamId)).all() as schema.Location[];
       const nameById = new Map<string, string | null>(locations.map((l) => [l.id, l.name ?? null]));
+      type MpsRow = {
+        locationId: string;
+        yearMonth: string;
+        appointments: number | null;
+        cancelled: number | null;
+        noShows: number | null;
+        onlineBookings: number | null;
+        newClients: number | null;
+        totalClients: number | null;
+        salesCount: number | null;
+        salesPerDay: number | null;
+        voucherCount: number | null;
+        productSales: number | null;
+        serviceSales: number | null;
+        totalSales: number | null;
+        yoyAmount: number | null;
+        yoyPct: number | null;
+        lastUpdatedAt: string | null;
+      };
       const rows = sqlite.prepare(
         `SELECT location_id AS locationId, year_month AS yearMonth,
           appointments, cancelled, no_shows AS noShows, online_bookings AS onlineBookings,
@@ -1722,7 +1741,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
           yoy_amount AS yoyAmount, yoy_pct AS yoyPct, last_updated_at AS lastUpdatedAt
          FROM monthly_performance_facts WHERE team_id = ? AND year_month = ?
          ORDER BY total_sales DESC`,
-      ).all(teamId, yearMonth) as Array<Record<string, any>>;
+      ).all(teamId, yearMonth) as MpsRow[];
       const enriched = rows.map((r) => ({ ...r, locationName: nameById.get(r.locationId) ?? null }));
       const lastUpdatedAt = enriched.reduce<string | null>((acc, r) => mostRecentIso(acc, r.lastUpdatedAt || null), null);
       return { status: 200, data: { ok: true, yearMonth, locationCount: enriched.length, lastUpdatedAt, locations: enriched } };
