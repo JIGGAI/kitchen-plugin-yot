@@ -47,6 +47,14 @@ import {
   buildStaffCashoutParameterDiscovery,
   parseStaffCashoutWorkbook,
 } from './reports/staff-cashout';
+import {
+  STAFF_PERFORMANCE_REPORT,
+  type StaffPerformanceParams,
+  type StaffPerformanceResult,
+  buildStaffPerformanceInstanceParams,
+  buildStaffPerformanceParameterDiscovery,
+  parseStaffPerformanceWorkbook,
+} from './reports/staff-performance';
 
 export type YotReportDefinition<TParams, TResult> = {
   key: string;
@@ -113,6 +121,15 @@ export const reportRegistry = {
     buildInstanceParams: buildMonthlyPerformanceSummaryInstanceParams,
     parseDocument: parseMonthlyPerformanceSummaryWorkbook,
   } satisfies YotReportDefinition<MonthlyPerformanceSummaryParams, MonthlyPerformanceSummaryResult>,
+  staffPerformance: {
+    key: STAFF_PERFORMANCE_REPORT.key,
+    reportName: STAFF_PERFORMANCE_REPORT.reportName,
+    reportType: STAFF_PERFORMANCE_REPORT.reportType,
+    preferredFormat: STAFF_PERFORMANCE_REPORT.preferredFormat,
+    buildParameterDiscovery: buildStaffPerformanceParameterDiscovery,
+    buildInstanceParams: buildStaffPerformanceInstanceParams,
+    parseDocument: parseStaffPerformanceWorkbook,
+  } satisfies YotReportDefinition<StaffPerformanceParams, StaffPerformanceResult>,
 };
 
 export type ReportRegistry = typeof reportRegistry;

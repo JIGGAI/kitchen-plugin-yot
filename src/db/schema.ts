@@ -226,6 +226,30 @@ export const revenueFacts = sqliteTable('revenue_facts', {
   pk: primaryKey({ columns: [t.teamId, t.locationId, t.date] }),
 }));
 
+export const staffPerformanceFacts = sqliteTable('staff_performance_facts', {
+  teamId: text('team_id').notNull(),
+  locationName: text('location_name').notNull(),
+  staffName: text('staff_name').notNull(),
+  date: text('date').notNull(),
+  totalSalesCount: integer('total_sales_count'),
+  serviceSold: integer('service_sold'),
+  servicesValue: real('services_value'),
+  servicesPerSale: real('services_per_sale'),
+  averageTip: real('average_tip'),
+  productsSold: integer('products_sold'),
+  productsValue: real('products_value'),
+  totalSalesValue: real('total_sales_value'),
+  pointsEarned: real('points_earned'),
+  clientsPerPoint: real('clients_per_point'),
+  commissionTipsTotal: real('commission_tips_total'),
+  avgSaleValue: real('avg_sale_value'),
+  hoursWorkedRaw: text('hours_worked_raw'),
+  totalPerHour: real('total_per_hour'),
+  lastUpdatedAt: text('last_updated_at').notNull(),
+}, (t) => ({
+  pk: primaryKey({ columns: [t.teamId, t.locationName, t.staffName, t.date] }),
+}));
+
 export const monthlyPerformanceFacts = sqliteTable('monthly_performance_facts', {
   teamId: text('team_id').notNull(),
   locationId: text('location_id').notNull(),

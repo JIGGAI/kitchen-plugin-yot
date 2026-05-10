@@ -1846,6 +1846,151 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     }
   }
 
+  // ─── Staff Performance (StaffPerformance_2121 report) ──────────────────
+  // GET /staff-performance?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
+  // Aggregates per (location, staff) across the requested date range from
+  // staff_performance_facts. Sums additive columns; ratios are recomputed
+  // from sums. Default range = today (single day) in UTC.
+  if (req.path === '/staff-performance' && req.method === 'GET') {
+    try {
+      const { sqlite } = initializeDatabase(teamId);
+      const today = dateOnlyNow();
+      const startDate = toDateOnlyInput(req.query.startDate || req.query.start || req.query.date) || today;
+      const endDate = toDateOnlyInput(req.query.endDate || req.query.end || req.query.date) || startDate;
+      type StaffPerfFact = {
+        locationName: string; staffName: string; date: string;
+        totalSalesCount: number | null; serviceSold: number | null; servicesValue: number | null;
+        servicesPerSale: number | null; productsSold: number | null; productsValue: number | null;
+        totalSalesValue: number | null; pointsEarned: number | null; clientsPerPoint: number | null;
+        commissionTipsTotal: number | null; avgSaleValue: number | null;
+        lastUpdatedAt: string | null;
+      };
+      const facts = sqlite.prepare(
+        `SELECT location_name AS locationName, staff_name AS staffName, date,
+          total_sales_count AS totalSalesCount, service_sold AS serviceSold,
+          services_value AS servicesValue, services_per_sale AS servicesPerSale,
+          products_sold AS productsSold, products_value AS productsValue,
+          total_sales_value AS totalSalesValue, points_earned AS pointsEarned,
+          clients_per_point AS clientsPerPoint, commission_tips_total AS commissionTipsTotal,
+          avg_sale_value AS avgSaleValue, last_updated_at AS lastUpdatedAt
+         FROM staff_performance_facts WHERE team_id = ? AND date BETWEEN ? AND ?`,
+      ).all(teamId, startDate, endDate) as StaffPerfFact[];
+
+      type Acc = {
+        locationName: string; staffName: string;
+        totalSalesCount: number; serviceSold: number; servicesValue: number;
+        productsSold: number; productsValue: number; totalSalesValue: number;
+        pointsEarned: number; commissionTipsTotal: number;
+      };
+      const buckets = new Map<string, Acc>();
+      let lastUpdatedAt: string | null = null;
+      for (const f of facts) {
+        const key = `${f.locationName}::${f.staffName}`;
+        const acc = buckets.get(key) || {
+          locationName: f.locationName, staffName: f.staffName,
+          totalSalesCount: 0, serviceSold: 0, servicesValue: 0,
+          productsSold: 0, productsValue: 0, totalSalesValue: 0,
+          pointsEarned: 0, commissionTipsTotal: 0,
+        };
+        acc.totalSalesCount += Number(f.totalSalesCount || 0);
+        acc.serviceSold += Number(f.serviceSold || 0);
+        acc.servicesValue += Number(f.servicesValue || 0);
+        acc.productsSold += Number(f.productsSold || 0);
+        acc.productsValue += Number(f.productsValue || 0);
+        acc.totalSalesValue += Number(f.totalSalesValue || 0);
+        acc.pointsEarned += Number(f.pointsEarned || 0);
+        acc.commissionTipsTotal += Number(f.commissionTipsTotal || 0);
+        buckets.set(key, acc);
+        lastUpdatedAt = mostRecentIso(lastUpdatedAt, f.lastUpdatedAt);
+      }
+      const rows = Array.from(buckets.values()).map((a) => ({
+        ...a,
+        // Recompute ratios from sums so multi-day ranges aggregate correctly.
+        servicesPerSale: a.totalSalesCount > 0 ? a.serviceSold / a.totalSalesCount : null,
+        avgSaleValue: a.totalSalesCount > 0 ? a.totalSalesValue / a.totalSalesCount : null,
+        clientsPerPoint: a.pointsEarned > 0 ? a.totalSalesCount / a.pointsEarned : null,
+      })).sort((a, b) => b.totalSalesValue - a.totalSalesValue);
+      return { status: 200, data: { ok: true, startDate, endDate, rowCount: rows.length, lastUpdatedAt, rows } };
+    } catch (error: any) {
+      return apiError(500, 'INTERNAL', error?.message || 'Failed to read staff performance facts');
+    }
+  }
+
+  // POST /staff-performance/sync?date=YYYY-MM-DD (default today)
+  // Pulls the YOT StaffPerformance_2121 report for a single day and upserts
+  // per-(location, staff) facts. To sync a range, call once per day.
+  if (req.path === '/staff-performance/sync' && req.method === 'POST') {
+    const config = readYotConfig(teamId);
+    if (!config) return apiError(400, 'NOT_CONFIGURED', 'YOT apiKey not set for this team. POST /config first.');
+    try {
+      const date = toDateOnlyInput(req.query.date || req.query.startDate || req.query.start) || dateOnlyNow();
+      const organisationId = Number(cleanString(req.query.organisationId || req.query.org) || String(DEFAULT_REVENUE_ORGANISATION_ID));
+      if (!Number.isFinite(organisationId)) return apiError(400, 'BAD_REQUEST', 'organisationId must be a number');
+
+      const params = {
+        startDateIso: `${date}T00:00:00`,
+        endDateIso: `${date}T00:00:00`,
+        organisationId,
+        locationId: null,
+        staffId: null,
+      };
+      const client = createReportClient(config);
+      const r = reportRegistry.staffPerformance;
+      const defs = await client.getParameters(r.reportType, r.buildParameterDiscovery(params, config.apiKey));
+      const inst = await client.createInstance(r.reportType, r.buildInstanceParams(params));
+      const doc = await client.createDocument(inst, r.preferredFormat);
+      await client.waitForDocument(inst, doc.documentId);
+      const file = await client.fetchDocument(inst, doc.documentId);
+      const parsed = r.parseDocument(file.buffer, defs);
+
+      const { sqlite } = initializeDatabase(teamId);
+      const startedAt = new Date().toISOString();
+      const upsert = sqlite.prepare(
+        `INSERT INTO staff_performance_facts (
+          team_id, location_name, staff_name, date,
+          total_sales_count, service_sold, services_value, services_per_sale,
+          average_tip, products_sold, products_value, total_sales_value,
+          points_earned, clients_per_point, commission_tips_total, avg_sale_value,
+          hours_worked_raw, total_per_hour, last_updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT (team_id, location_name, staff_name, date) DO UPDATE SET
+          total_sales_count = excluded.total_sales_count,
+          service_sold = excluded.service_sold,
+          services_value = excluded.services_value,
+          services_per_sale = excluded.services_per_sale,
+          average_tip = excluded.average_tip,
+          products_sold = excluded.products_sold,
+          products_value = excluded.products_value,
+          total_sales_value = excluded.total_sales_value,
+          points_earned = excluded.points_earned,
+          clients_per_point = excluded.clients_per_point,
+          commission_tips_total = excluded.commission_tips_total,
+          avg_sale_value = excluded.avg_sale_value,
+          hours_worked_raw = excluded.hours_worked_raw,
+          total_per_hour = excluded.total_per_hour,
+          last_updated_at = excluded.last_updated_at`,
+      );
+
+      // Wipe the day's existing rows first so deletions on YOT side are reflected.
+      sqlite.prepare('DELETE FROM staff_performance_facts WHERE team_id = ? AND date = ?').run(teamId, date);
+      let rowsWritten = 0;
+      for (const row of parsed.rows) {
+        if (row.rowKind !== 'staff' || !row.locationName || !row.staffName) continue;
+        upsert.run(
+          teamId, row.locationName, row.staffName, date,
+          row.totalSalesCount, row.serviceSold, row.servicesValue, row.servicesPerSale,
+          row.averageTip, row.productsSold, row.productsValue, row.totalSalesValue,
+          row.pointsEarned, row.clientsPerPoint, row.commissionTipsTotal, row.avgSaleValue,
+          row.hoursWorkedRaw, row.totalPerHour, startedAt,
+        );
+        rowsWritten += 1;
+      }
+      return { status: 200, data: { ok: true, date, rowsWritten, locationCount: parsed.locations.length, startedAt, completedAt: new Date().toISOString() } };
+    } catch (error: any) {
+      return apiError(502, 'YOT_ERROR', error?.message || 'Failed to sync staff performance');
+    }
+  }
+
   if (req.path === '/promotion-usage' && req.method === 'GET') {
     try {
       const { db } = initializeDatabase(teamId);
