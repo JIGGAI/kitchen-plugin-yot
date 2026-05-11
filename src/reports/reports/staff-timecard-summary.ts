@@ -263,6 +263,14 @@ export function parseStaffTimecardSummaryWorkbook(
 
     // --- Shift data row ---
     if (isShiftRow(row)) {
+      // Phantom row: stylist appears in this location's block but did not work
+      // here on this date (no clock-in). The StaffTimeCard report lists every
+      // stylist in every location block, so 90%+ of shift rows are phantoms.
+      // We only care about real clock-ins for late-arrival tracking.
+      const clockInRaw = row[COL.clockIn];
+      const clockInStr = clockInRaw == null ? '' : String(clockInRaw).trim();
+      if (!clockInStr) continue;
+
       const shiftDate = excelSerialToIsoDate(row[COL.shiftDate]);
       const arrivedMinutes = parseIntOrNull(row[COL.arrivedMinutes]);
 

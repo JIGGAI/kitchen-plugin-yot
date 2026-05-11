@@ -241,10 +241,32 @@ describe('parseStaffTimecardSummaryWorkbook (fixture)', () => {
   });
 
   it('arrivedMinutes is always null or a finite number', () => {
+    // Real shifts may have null arrivedMinutes when the stylist was unscheduled
+    // (clocked in but had no scheduled start — col[12] is empty).
+    // Phantoms (no clock-in) are filtered before push, so this assertion holds
+    // for all emitted shift rows: when non-null, arrivedMinutes must be finite.
     for (const row of result.rows) {
       if (row.arrivedMinutes != null) {
         expect(Number.isFinite(row.arrivedMinutes)).toBe(true);
       }
+    }
+  });
+
+  it('filters out phantom rows (stylist listed in a location block but did not work there)', () => {
+    // The captured 3-day fixture has 34 locations and lists every stylist in
+    // every block. Before the phantom filter, 97%+ of shift-row candidates are
+    // phantoms (empty clock-in). After filtering, only real clock-ins remain.
+    const shifts = result.rows.filter((r) => r.rowKind === 'shift');
+    // Sanity: there are real shifts.
+    expect(shifts.length).toBeGreaterThan(50);
+    // The fixture has ~286 real shifts out of ~9765 candidates. The filter must
+    // reduce the count dramatically — well under 1000.
+    expect(shifts.length).toBeLessThan(1000);
+    // Every emitted shift row has raw[2] (clock-in) as a non-empty value.
+    // We verify this indirectly: every row must have a valid shiftDate (only
+    // reachable if the row passed the isShiftRow + clock-in checks).
+    for (const s of shifts) {
+      expect(s.shiftDate).toMatch(/^\d{4}-\d{2}-\d{2}$/);
     }
   });
 

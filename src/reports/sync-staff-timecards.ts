@@ -45,12 +45,14 @@ function readConfig(sqlite: SqliteDb, teamId: string): YotConfig {
 }
 
 /**
- * Stable row ID: SHA-1(team::staffName::shiftDate) truncated to 32 hex chars.
- * Uniquely identifies a (team, stylist, day) fact.
+ * Stable row ID: SHA-1(team::location::staffName::shiftDate) truncated to 32 hex chars.
+ * Uniquely identifies a (team, location, stylist, day) fact.
+ * Location is included so multi-location stylists (same shift echoed in multiple
+ * location blocks) each get their own row rather than clobbering each other.
  */
-function factId(teamId: string, staffName: string, shiftDate: string): string {
+function factId(teamId: string, locationName: string | null, staffName: string, shiftDate: string): string {
   return createHash('sha1')
-    .update(`${teamId}::${staffName}::${shiftDate}`)
+    .update(`${teamId}::${locationName ?? ''}::${staffName}::${shiftDate}`)
     .digest('hex')
     .slice(0, 32);
 }
@@ -170,7 +172,7 @@ export async function syncStaffTimecards(
         rowsSkipped += 1;
         continue;
       }
-      const id = factId(teamId, row.staffName, row.shiftDate);
+      const id = factId(teamId, row.locationName, row.staffName, row.shiftDate);
       const exists = checkExists.get(id) != null;
       upsert.run({
         id,
