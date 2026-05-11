@@ -95,15 +95,25 @@ export async function loginToMvc(config: YotConfig): Promise<string> {
     throw new MvcLoginRejectedError('mvcUserName, mvcPassword, and mvcOrganisation must all be set');
   }
   const baseUrl = resolveBaseUrl(config);
+  // YOT gates /Account/Login on User-Agent: the default Node fetch UA gets
+  // bounced to /home/error with no Set-Cookie. Sending a real browser UA +
+  // Origin + Referer makes the redirect resolve to /Appointment/Home and
+  // carry the auth cookies. Verified empirically 2026-05-11.
   const res = await fetch(`${baseUrl}/Account/Login`, {
     method: 'POST',
     redirect: 'manual',
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    headers: {
+      'content-type': 'application/x-www-form-urlencoded',
+      'user-agent':
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36',
+      origin: baseUrl,
+      referer: `${baseUrl}/Account/Login`,
+    },
     body: new URLSearchParams({
       UserName: config.mvcUserName,
       Password: config.mvcPassword,
       Organisation: config.mvcOrganisation,
-      ReturnUrl: '',
+      ReturnUrl: '/Appointment/Home',
     }).toString(),
   });
 

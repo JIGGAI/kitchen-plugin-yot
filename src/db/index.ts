@@ -26,6 +26,19 @@ function createDatabase(teamId: string) {
   if (!existsSync(dbDir)) mkdirSync(dbDir, { recursive: true });
   const dbFile = join(dbDir, `yot-${teamId}.db`);
 
+  // Refuse to silently bootstrap a missing DB. better-sqlite3's default is to
+  // create the file if it doesn't exist, which masks an upstream problem (the
+  // file got deleted, renamed, or path-mismatched) and silently strands the
+  // team on an empty cache. Fail loud instead; require an explicit opt-in for
+  // legitimate first-time setup.
+  if (!existsSync(dbFile) && process.env.YOT_ALLOW_DB_AUTOCREATE !== '1') {
+    throw new Error(
+      `kitchen-plugin-yot DB missing at ${dbFile}. ` +
+        `Refusing to auto-create — this usually means data was lost or the path is wrong. ` +
+        `If this is intentional first-time setup, re-run with YOT_ALLOW_DB_AUTOCREATE=1.`,
+    );
+  }
+
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const Database = require('better-sqlite3');
   // eslint-disable-next-line @typescript-eslint/no-require-imports
