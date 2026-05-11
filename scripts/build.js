@@ -55,6 +55,20 @@ try {
     }
   }
 
+  // Bundle CLI scripts (scripts/*.ts → dist/scripts/*.js)
+  const scriptsDir = path.join(root, 'scripts');
+  const distScriptsDir = path.join(distDir, 'scripts');
+  fs.mkdirSync(distScriptsDir, { recursive: true });
+  const scriptFiles = fs.readdirSync(scriptsDir).filter((f) => f.endsWith('.ts'));
+  for (const scriptFile of scriptFiles) {
+    const name = scriptFile.replace('.ts', '');
+    execSync(
+      `${esbuildBin} scripts/${scriptFile} --bundle --platform=node --target=node18 --format=cjs --outfile=dist/scripts/${name}.js --sourcemap ${externals}`,
+      { cwd: root, stdio: 'inherit' }
+    );
+    console.log(`✓ Built dist/scripts/${name}.js`);
+  }
+
   // Copy migrations
   const migSrc = path.join(root, 'db/migrations');
   const migDest = path.join(distDir, 'db/migrations');

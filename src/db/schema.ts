@@ -329,6 +329,17 @@ export const syncRuns = sqliteTable('sync_runs', {
   error: text('error'),
 });
 
+export const staffTimecardFacts = sqliteTable('staff_timecard_facts', {
+  id: text('id').primaryKey(),                  // hash of (team_id, staff_name, shift_date)
+  teamId: text('team_id').notNull(),
+  locationName: text('location_name'),
+  staffName: text('staff_name').notNull(),
+  shiftDate: text('shift_date').notNull(),      // YYYY-MM-DD
+  arrivedMinutes: integer('arrived_minutes'),   // + late, - early, 0 on time, NULL = no clock-in
+  rawRow: text('raw_row'),                       // JSON of source row
+  syncedAt: text('synced_at').notNull(),
+});
+
 export type Client = typeof clients.$inferSelect;
 export type NewClient = typeof clients.$inferInsert;
 export type Location = typeof locations.$inferSelect;

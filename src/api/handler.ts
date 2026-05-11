@@ -2074,6 +2074,134 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     }
   }
 
+  // ─── Staff Timecards (StaffTimeCardSummary report) ────────────────────
+  // GET /staff-timecards?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
+  // Aggregates staff_timecard_facts over the requested window. Returns
+  // per-location stylist rows plus a flagged subset for stylists with
+  // more than LATE_THRESHOLD late arrivals.
+  if (req.path === '/staff-timecards' && req.method === 'GET') {
+    const LATE_THRESHOLD = 4;
+    try {
+      const { sqlite } = initializeDatabase(teamId);
+      const today = dateOnlyNow();
+      const firstOfMonth = today.slice(0, 8) + '01';
+      const startDate = toDateOnlyInput(req.query.startDate || req.query.start) || firstOfMonth;
+      const endDate = toDateOnlyInput(req.query.endDate || req.query.end) || today;
+
+      type ShiftFact = {
+        locationName: string | null;
+        staffName: string;
+        shiftDate: string;
+        arrivedMinutes: number | null;
+        syncedAt: string;
+      };
+      const facts = sqlite.prepare(
+        `SELECT location_name AS locationName, staff_name AS staffName,
+                shift_date AS shiftDate, arrived_minutes AS arrivedMinutes,
+                synced_at AS syncedAt
+         FROM staff_timecard_facts
+         WHERE team_id = ? AND shift_date BETWEEN ? AND ?`
+      ).all(teamId, startDate, endDate) as ShiftFact[];
+
+      type StylistAgg = {
+        locationName: string | null;
+        staffName: string;
+        lateCount: number;
+        totalShifts: number;
+        totalLateMinutes: number;
+        lastLateDate: string | null;
+      };
+      const buckets = new Map<string, StylistAgg>();
+      let lastSyncedAt: string | null = null;
+
+      for (const f of facts) {
+        const key = `${f.locationName ?? ''}::${f.staffName}`;
+        const agg = buckets.get(key) || {
+          locationName: f.locationName,
+          staffName: f.staffName,
+          lateCount: 0,
+          totalShifts: 0,
+          totalLateMinutes: 0,
+          lastLateDate: null,
+        };
+        agg.totalShifts += 1;
+        if (f.arrivedMinutes != null && f.arrivedMinutes > 0) {
+          agg.lateCount += 1;
+          agg.totalLateMinutes += f.arrivedMinutes;
+          if (!agg.lastLateDate || f.shiftDate > agg.lastLateDate) {
+            agg.lastLateDate = f.shiftDate;
+          }
+        }
+        buckets.set(key, agg);
+        if (!lastSyncedAt || f.syncedAt > lastSyncedAt) lastSyncedAt = f.syncedAt;
+      }
+
+      // Group by location.
+      const locationsMap = new Map<string, { locationName: string; stylists: Array<StylistAgg & { flagged: boolean }> }>();
+      for (const agg of buckets.values()) {
+        const locKey = agg.locationName ?? '(no location)';
+        const bucket = locationsMap.get(locKey) || { locationName: agg.locationName ?? '(no location)', stylists: [] };
+        bucket.stylists.push({ ...agg, flagged: agg.lateCount > LATE_THRESHOLD });
+        locationsMap.set(locKey, bucket);
+      }
+
+      const locations = Array.from(locationsMap.values())
+        .sort((a, b) => a.locationName.localeCompare(b.locationName))
+        .map((loc) => ({
+          ...loc,
+          stylists: loc.stylists.sort((a, b) => {
+            if (a.flagged !== b.flagged) return a.flagged ? -1 : 1;
+            if (a.lateCount !== b.lateCount) return b.lateCount - a.lateCount;
+            return a.staffName.localeCompare(b.staffName);
+          }),
+        }));
+
+      const flaggedStylists = Array.from(buckets.values())
+        .filter((a) => a.lateCount > LATE_THRESHOLD)
+        .sort((a, b) => b.lateCount - a.lateCount)
+        .map((a) => ({
+          staffName: a.staffName,
+          locationName: a.locationName,
+          lateCount: a.lateCount,
+          totalLateMinutes: a.totalLateMinutes,
+          lastLateDate: a.lastLateDate,
+        }));
+
+      return {
+        status: 200,
+        data: {
+          ok: true,
+          scope: { startDate, endDate },
+          lateThreshold: LATE_THRESHOLD,
+          lastSyncedAt,
+          locations,
+          flaggedStylists,
+        },
+      };
+    } catch (error: any) {
+      return apiError(500, 'INTERNAL', error?.message || 'Failed to read staff timecard facts');
+    }
+  }
+
+  // POST /staff-timecards/sync?startDate=&endDate=
+  // Triggers the sync library. Wraps options in the same way the other
+  // /sync endpoints do.
+  if (req.path === '/staff-timecards/sync' && req.method === 'POST') {
+    try {
+      const today = dateOnlyNow();
+      const firstOfMonth = today.slice(0, 8) + '01';
+      const startDate = toDateOnlyInput(req.query.startDate || req.query.start) || firstOfMonth;
+      const endDate = toDateOnlyInput(req.query.endDate || req.query.end) || today;
+      const organisationId = Number(cleanString(req.query.organisationId || req.query.org) || String(DEFAULT_REVENUE_ORGANISATION_ID));
+      if (!Number.isFinite(organisationId)) return apiError(400, 'BAD_REQUEST', 'organisationId must be a number');
+      const { syncStaffTimecards } = await import('../reports/sync-staff-timecards');
+      const result = await syncStaffTimecards({ teamId, startDate, endDate, organisationId });
+      return { status: 200, data: result };
+    } catch (error: any) {
+      return apiError(500, 'INTERNAL', error?.message || 'Failed to sync staff timecards');
+    }
+  }
+
   if (req.path === '/promotion-usage' && req.method === 'GET') {
     try {
       const { db } = initializeDatabase(teamId);
