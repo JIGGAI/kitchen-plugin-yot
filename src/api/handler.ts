@@ -2202,6 +2202,177 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     }
   }
 
+  // ─── Staff Retention (StaffRetentionDay report) ───────────────────────
+  // GET /staff-retention?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
+  // Returns the most-recently-synced retention rows whose period overlaps
+  // the requested window. Each row is per (location, staff) and carries
+  // counts/percentages for the window plus the trailing-3-month retention.
+  if (req.path === '/staff-retention' && req.method === 'GET') {
+    try {
+      const { sqlite } = initializeDatabase(teamId);
+      const today = dateOnlyNow();
+      const firstOfMonth = today.slice(0, 8) + '01';
+      const startDate = toDateOnlyInput(req.query.startDate || req.query.start) || firstOfMonth;
+      const endDate = toDateOnlyInput(req.query.endDate || req.query.end) || today;
+
+      // Match exact window first (the common case after a sync); fall back
+      // to the most recent window that contains either endpoint.
+      type RetentionRow = {
+        periodStart: string;
+        periodEnd: string;
+        locationName: string;
+        staffName: string;
+        totalSales: number;
+        returnedToStaffCount: number | null;
+        returnedToStaffPct: number | null;
+        returnedToBusinessCount: number | null;
+        returnedToBusinessPct: number | null;
+        newClientsCount: number | null;
+        newClientsPct: number | null;
+        totalRebookedCount: number | null;
+        totalRebookedPct: number | null;
+        newClientsRebookedCount: number | null;
+        newClientsRebookedPct: number | null;
+        retentionM1Count: number | null;
+        retentionM1Pct: number | null;
+        retentionM1Label: string | null;
+        retentionM2Count: number | null;
+        retentionM2Pct: number | null;
+        retentionM2Label: string | null;
+        retentionM3Count: number | null;
+        retentionM3Pct: number | null;
+        retentionM3Label: string | null;
+        syncedAt: string;
+      };
+
+      let rows = sqlite.prepare(
+        `SELECT period_start AS periodStart, period_end AS periodEnd,
+                location_name AS locationName, staff_name AS staffName,
+                total_sales AS totalSales,
+                returned_to_staff_count AS returnedToStaffCount,
+                returned_to_staff_pct AS returnedToStaffPct,
+                returned_to_business_count AS returnedToBusinessCount,
+                returned_to_business_pct AS returnedToBusinessPct,
+                new_clients_count AS newClientsCount,
+                new_clients_pct AS newClientsPct,
+                total_rebooked_count AS totalRebookedCount,
+                total_rebooked_pct AS totalRebookedPct,
+                new_clients_rebooked_count AS newClientsRebookedCount,
+                new_clients_rebooked_pct AS newClientsRebookedPct,
+                retention_m1_count AS retentionM1Count,
+                retention_m1_pct AS retentionM1Pct,
+                retention_m1_label AS retentionM1Label,
+                retention_m2_count AS retentionM2Count,
+                retention_m2_pct AS retentionM2Pct,
+                retention_m2_label AS retentionM2Label,
+                retention_m3_count AS retentionM3Count,
+                retention_m3_pct AS retentionM3Pct,
+                retention_m3_label AS retentionM3Label,
+                synced_at AS syncedAt
+         FROM staff_retention_facts
+         WHERE team_id = ? AND period_start = ? AND period_end = ?`,
+      ).all(teamId, startDate, endDate) as RetentionRow[];
+
+      let matchedWindow: { startDate: string; endDate: string } | null = rows.length
+        ? { startDate, endDate }
+        : null;
+
+      if (!rows.length) {
+        // Fallback: pick the most recently synced window
+        const latest = sqlite.prepare(
+          `SELECT period_start AS startDate, period_end AS endDate
+           FROM staff_retention_facts
+           WHERE team_id = ?
+           ORDER BY synced_at DESC
+           LIMIT 1`,
+        ).get(teamId) as { startDate: string; endDate: string } | undefined;
+        if (latest) {
+          matchedWindow = latest;
+          rows = sqlite.prepare(
+            `SELECT period_start AS periodStart, period_end AS periodEnd,
+                    location_name AS locationName, staff_name AS staffName,
+                    total_sales AS totalSales,
+                    returned_to_staff_count AS returnedToStaffCount,
+                    returned_to_staff_pct AS returnedToStaffPct,
+                    returned_to_business_count AS returnedToBusinessCount,
+                    returned_to_business_pct AS returnedToBusinessPct,
+                    new_clients_count AS newClientsCount,
+                    new_clients_pct AS newClientsPct,
+                    total_rebooked_count AS totalRebookedCount,
+                    total_rebooked_pct AS totalRebookedPct,
+                    new_clients_rebooked_count AS newClientsRebookedCount,
+                    new_clients_rebooked_pct AS newClientsRebookedPct,
+                    retention_m1_count AS retentionM1Count,
+                    retention_m1_pct AS retentionM1Pct,
+                    retention_m1_label AS retentionM1Label,
+                    retention_m2_count AS retentionM2Count,
+                    retention_m2_pct AS retentionM2Pct,
+                    retention_m2_label AS retentionM2Label,
+                    retention_m3_count AS retentionM3Count,
+                    retention_m3_pct AS retentionM3Pct,
+                    retention_m3_label AS retentionM3Label,
+                    synced_at AS syncedAt
+             FROM staff_retention_facts
+             WHERE team_id = ? AND period_start = ? AND period_end = ?`,
+          ).all(teamId, latest.startDate, latest.endDate) as RetentionRow[];
+        }
+      }
+
+      // Group rows by location
+      const locMap = new Map<string, { locationName: string; staff: RetentionRow[] }>();
+      let lastSyncedAt: string | null = null;
+      const trailingMonthLabels = { m1: null as string | null, m2: null as string | null, m3: null as string | null };
+      for (const r of rows) {
+        const bucket = locMap.get(r.locationName) || { locationName: r.locationName, staff: [] };
+        bucket.staff.push(r);
+        locMap.set(r.locationName, bucket);
+        if (!lastSyncedAt || r.syncedAt > lastSyncedAt) lastSyncedAt = r.syncedAt;
+        if (!trailingMonthLabels.m1 && r.retentionM1Label) trailingMonthLabels.m1 = r.retentionM1Label;
+        if (!trailingMonthLabels.m2 && r.retentionM2Label) trailingMonthLabels.m2 = r.retentionM2Label;
+        if (!trailingMonthLabels.m3 && r.retentionM3Label) trailingMonthLabels.m3 = r.retentionM3Label;
+      }
+
+      const locations = Array.from(locMap.values())
+        .sort((a, b) => a.locationName.localeCompare(b.locationName))
+        .map((loc) => ({
+          locationName: loc.locationName,
+          staff: loc.staff.sort((a, b) => (b.totalSales - a.totalSales) || a.staffName.localeCompare(b.staffName)),
+        }));
+
+      return {
+        status: 200,
+        data: {
+          ok: true,
+          scope: { startDate, endDate },
+          matchedWindow,
+          trailingMonthLabels,
+          lastSyncedAt,
+          locations,
+          rowCount: rows.length,
+        },
+      };
+    } catch (error: any) {
+      return apiError(500, 'INTERNAL', error?.message || 'Failed to read staff retention facts');
+    }
+  }
+
+  // POST /staff-retention/sync?startDate=&endDate=&organisationId=
+  if (req.path === '/staff-retention/sync' && req.method === 'POST') {
+    try {
+      const today = dateOnlyNow();
+      const firstOfMonth = today.slice(0, 8) + '01';
+      const startDate = toDateOnlyInput(req.query.startDate || req.query.start) || firstOfMonth;
+      const endDate = toDateOnlyInput(req.query.endDate || req.query.end) || today;
+      const organisationId = Number(cleanString(req.query.organisationId || req.query.org) || String(DEFAULT_REVENUE_ORGANISATION_ID));
+      if (!Number.isFinite(organisationId)) return apiError(400, 'BAD_REQUEST', 'organisationId must be a number');
+      const { syncStaffRetention } = await import('../reports/sync-staff-retention');
+      const result = await syncStaffRetention({ teamId, startDate, endDate, organisationId });
+      return { status: 200, data: result };
+    } catch (error: any) {
+      return apiError(500, 'INTERNAL', error?.message || 'Failed to sync staff retention');
+    }
+  }
+
   if (req.path === '/promotion-usage' && req.method === 'GET') {
     try {
       const { db } = initializeDatabase(teamId);
