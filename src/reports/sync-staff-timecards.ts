@@ -132,7 +132,9 @@ export async function syncStaffTimecards(
   options: SyncStaffTimecardsOptions,
 ): Promise<SyncStaffTimecardsResult> {
   const { teamId, startDate, endDate, organisationId } = options;
-  const chunkDays = Math.max(1, Math.min(Math.trunc(options.chunkDays ?? 7), 14));
+  // Telerik's render times out (200 polls = ~5 min) on 7-day full-org pulls.
+  // 3-day chunks fit comfortably under that limit.
+  const chunkDays = Math.max(1, Math.min(Math.trunc(options.chunkDays ?? 3), 14));
 
   const { sqlite } = initializeDatabase(teamId);
   const config = readConfig(sqlite, teamId);
