@@ -2192,8 +2192,10 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       const firstOfMonth = today.slice(0, 8) + '01';
       const startDate = toDateOnlyInput(req.query.startDate || req.query.start) || firstOfMonth;
       const endDate = toDateOnlyInput(req.query.endDate || req.query.end) || today;
+      const organisationId = Number(cleanString(req.query.organisationId || req.query.org) || String(DEFAULT_REVENUE_ORGANISATION_ID));
+      if (!Number.isFinite(organisationId)) return apiError(400, 'BAD_REQUEST', 'organisationId must be a number');
       const { syncStaffTimecards } = await import('../reports/sync-staff-timecards');
-      const result = await syncStaffTimecards({ teamId, startDate, endDate });
+      const result = await syncStaffTimecards({ teamId, startDate, endDate, organisationId });
       return { status: 200, data: result };
     } catch (error: any) {
       return apiError(500, 'INTERNAL', error?.message || 'Failed to sync staff timecards');
