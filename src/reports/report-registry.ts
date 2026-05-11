@@ -55,6 +55,14 @@ import {
   buildStaffPerformanceParameterDiscovery,
   parseStaffPerformanceWorkbook,
 } from './reports/staff-performance';
+import {
+  STAFF_TIMECARD_SUMMARY_REPORT,
+  type StaffTimecardSummaryParams,
+  type StaffTimecardSummaryResult,
+  buildStaffTimecardSummaryInstanceParams,
+  buildStaffTimecardSummaryParameterDiscovery,
+  parseStaffTimecardSummaryWorkbook,
+} from './reports/staff-timecard-summary';
 
 export type YotReportDefinition<TParams, TResult> = {
   key: string;
@@ -130,6 +138,15 @@ export const reportRegistry = {
     buildInstanceParams: buildStaffPerformanceInstanceParams,
     parseDocument: parseStaffPerformanceWorkbook,
   } satisfies YotReportDefinition<StaffPerformanceParams, StaffPerformanceResult>,
+  staffTimecardSummary: {
+    key: STAFF_TIMECARD_SUMMARY_REPORT.key,
+    reportName: STAFF_TIMECARD_SUMMARY_REPORT.reportName,
+    reportType: STAFF_TIMECARD_SUMMARY_REPORT.reportType,
+    preferredFormat: STAFF_TIMECARD_SUMMARY_REPORT.preferredFormat,
+    buildParameterDiscovery: buildStaffTimecardSummaryParameterDiscovery,
+    buildInstanceParams: buildStaffTimecardSummaryInstanceParams,
+    parseDocument: parseStaffTimecardSummaryWorkbook,
+  } satisfies YotReportDefinition<StaffTimecardSummaryParams, StaffTimecardSummaryResult>,
 };
 
 export type ReportRegistry = typeof reportRegistry;
