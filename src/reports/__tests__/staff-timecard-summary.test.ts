@@ -100,9 +100,9 @@ describe('buildStaffTimecardSummaryParameterDiscovery', () => {
     expect(result.FrameView).toBe('True');
   });
 
-  it('sets LateArrivals, EarlyLeavers, DoNothing to empty strings', () => {
+  it('sets LateArrivals to -14 (YOT UI threshold the business uses) and leaves EarlyLeavers/DoNothing empty', () => {
     const result = buildStaffTimecardSummaryParameterDiscovery(params, apiKey);
-    expect(result.LateArrivals).toBe('');
+    expect(result.LateArrivals).toBe('-14');
     expect(result.EarlyLeavers).toBe('');
     expect(result.DoNothing).toBe('');
   });
@@ -171,7 +171,7 @@ describe('buildStaffTimecardSummaryInstanceParams', () => {
     expect(result.LocationId).toBeNull();
   });
 
-  it('sets FranchiseId, LateArrivals, EarlyLeavers to null', () => {
+  it('sets LateArrivals to -14 and leaves FranchiseId/EarlyLeavers null', () => {
     const params = {
       startDateIso: '2026-05-08T00:00:00.000Z',
       endDateIso: '2026-05-10T23:59:59.000Z',
@@ -179,7 +179,7 @@ describe('buildStaffTimecardSummaryInstanceParams', () => {
     };
     const result = buildStaffTimecardSummaryInstanceParams(params);
     expect(result.FranchiseId).toBeNull();
-    expect(result.LateArrivals).toBeNull();
+    expect(result.LateArrivals).toBe(-14);
     expect(result.EarlyLeavers).toBeNull();
   });
 });

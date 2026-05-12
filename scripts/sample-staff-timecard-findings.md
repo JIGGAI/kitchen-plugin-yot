@@ -26,8 +26,10 @@ Raw XLSX size: ~11.5 MB (embedded PNG images per location header inflate the fil
 | EarlyLeavers | System.Int64 | hidden |
 
 > `FranchiseId`, `LateArrivals`, `EarlyLeavers`, `DoNothing` are sent in the parameter discovery
-> payload but not returned by the server. They appear to be ignored. `LateArrivals` / `EarlyLeavers`
-> may be filter flags — pass `null` (instance params) to get all shifts.
+> payload but not returned by the server. They are accepted as hidden filter params:
+> `LateArrivals = -14` is the value confirmed in the YOT UI as the threshold the business runs the
+> late-arrivals report at (matches the figures shown in YOT itself). Pass `-14` here so our sync
+> mirrors what managers see in YOT. `EarlyLeavers` left null/empty.
 
 ---
 
