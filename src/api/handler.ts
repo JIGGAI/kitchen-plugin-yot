@@ -2092,23 +2092,23 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         locationName: string | null;
         staffName: string;
         shiftDate: string;
-        arrivedMinutes: number | null;
         syncedAt: string;
       };
       const facts = sqlite.prepare(
         `SELECT location_name AS locationName, staff_name AS staffName,
-                shift_date AS shiftDate, arrived_minutes AS arrivedMinutes,
-                synced_at AS syncedAt
+                shift_date AS shiftDate, synced_at AS syncedAt
          FROM staff_timecard_facts
          WHERE team_id = ? AND shift_date BETWEEN ? AND ?`
       ).all(teamId, startDate, endDate) as ShiftFact[];
 
+      // The YOT report is pre-filtered server-side with LateArrivals=-14, so every
+      // row coming out of staff_timecard_facts is by definition a late arrival
+      // (15+ min past scheduled). No per-row late/on-time recompute is needed —
+      // count the rows and take the most recent shift_date as the last-late date.
       type StylistAgg = {
         locationName: string | null;
         staffName: string;
         lateCount: number;
-        totalShifts: number;
-        totalLateMinutes: number;
         lastLateDate: string | null;
       };
       const buckets = new Map<string, StylistAgg>();
@@ -2120,17 +2120,11 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
           locationName: f.locationName,
           staffName: f.staffName,
           lateCount: 0,
-          totalShifts: 0,
-          totalLateMinutes: 0,
           lastLateDate: null,
         };
-        agg.totalShifts += 1;
-        if (f.arrivedMinutes != null && f.arrivedMinutes > 0) {
-          agg.lateCount += 1;
-          agg.totalLateMinutes += f.arrivedMinutes;
-          if (!agg.lastLateDate || f.shiftDate > agg.lastLateDate) {
-            agg.lastLateDate = f.shiftDate;
-          }
+        agg.lateCount += 1;
+        if (!agg.lastLateDate || f.shiftDate > agg.lastLateDate) {
+          agg.lastLateDate = f.shiftDate;
         }
         buckets.set(key, agg);
         if (!lastSyncedAt || f.syncedAt > lastSyncedAt) lastSyncedAt = f.syncedAt;
@@ -2163,7 +2157,6 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
           staffName: a.staffName,
           locationName: a.locationName,
           lateCount: a.lateCount,
-          totalLateMinutes: a.totalLateMinutes,
           lastLateDate: a.lastLateDate,
         }));
 
