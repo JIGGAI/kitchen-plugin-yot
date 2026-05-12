@@ -340,6 +340,40 @@ export const staffTimecardFacts = sqliteTable('staff_timecard_facts', {
   syncedAt: text('synced_at').notNull(),
 });
 
+export const staffRetentionFacts = sqliteTable('staff_retention_facts', {
+  id: text('id').primaryKey(),                        // hash of (team, window, location, staff)
+  teamId: text('team_id').notNull(),
+  periodStart: text('period_start').notNull(),         // YYYY-MM-DD
+  periodEnd: text('period_end').notNull(),             // YYYY-MM-DD
+  locationName: text('location_name').notNull(),
+  staffName: text('staff_name').notNull(),
+
+  totalSales: integer('total_sales').notNull().default(0),
+
+  returnedToStaffCount: integer('returned_to_staff_count'),
+  returnedToStaffPct: integer('returned_to_staff_pct'),
+  returnedToBusinessCount: integer('returned_to_business_count'),
+  returnedToBusinessPct: integer('returned_to_business_pct'),
+  newClientsCount: integer('new_clients_count'),
+  newClientsPct: integer('new_clients_pct'),
+  totalRebookedCount: integer('total_rebooked_count'),
+  totalRebookedPct: integer('total_rebooked_pct'),
+  newClientsRebookedCount: integer('new_clients_rebooked_count'),
+  newClientsRebookedPct: integer('new_clients_rebooked_pct'),
+
+  retentionM1Count: integer('retention_m1_count'),
+  retentionM1Pct: integer('retention_m1_pct'),
+  retentionM1Label: text('retention_m1_label'),
+  retentionM2Count: integer('retention_m2_count'),
+  retentionM2Pct: integer('retention_m2_pct'),
+  retentionM2Label: text('retention_m2_label'),
+  retentionM3Count: integer('retention_m3_count'),
+  retentionM3Pct: integer('retention_m3_pct'),
+  retentionM3Label: text('retention_m3_label'),
+
+  syncedAt: text('synced_at').notNull(),
+});
+
 export type Client = typeof clients.$inferSelect;
 export type NewClient = typeof clients.$inferInsert;
 export type Location = typeof locations.$inferSelect;
