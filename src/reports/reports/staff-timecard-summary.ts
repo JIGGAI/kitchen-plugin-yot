@@ -190,7 +190,7 @@ export function buildStaffTimecardSummaryParameterDiscovery(
     FranchiseId: '',
     LocationId: params.locationId == null ? '' : String(params.locationId),
     StaffId: params.staffId == null ? '' : String(params.staffId),
-    LateArrivals: '',
+    LateArrivals: '-14',
     EarlyLeavers: '',
     DoNothing: '',
     Title: 'Staff Hours Summary Report',
@@ -212,7 +212,7 @@ export function buildStaffTimecardSummaryInstanceParams(
     LocationId: params.locationId ?? null,
     StaffId: params.staffId ?? null,
     FranchiseId: null,
-    LateArrivals: null,
+    LateArrivals: -14,
     EarlyLeavers: null,
   };
 }

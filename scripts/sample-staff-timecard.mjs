@@ -293,7 +293,7 @@ const paramDiscovery = {
   FranchiseId: '',
   LocationId: '',
   StaffId: '',
-  LateArrivals: '',
+  LateArrivals: '-14',
   EarlyLeavers: '',
   DoNothing: '',
   Title: 'Staff Hours Summary Report',
@@ -327,7 +327,7 @@ const instanceParams = {
   LocationId: null,
   StaffId: null,
   FranchiseId: null,
-  LateArrivals: null,
+  LateArrivals: -14,
   EarlyLeavers: null,
 };
 
