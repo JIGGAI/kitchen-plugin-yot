@@ -3440,6 +3440,168 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     return { status: 200, data: { date: cached.date, computedAt: cached.computedAt, windows } };
   }
 
+  // Per-location daily summary across a date range. Uses the same per-DOW
+  // 90-day historical average that powers the single-day coverage heatmap,
+  // so weekly and daily views agree on "expected demand". Per cell:
+  //   appts      = averageByDow[dowOf(date)]      (decimal, expected demand)
+  //   stylists   = COUNT(DISTINCT stylist_id) from appointments that day
+  //                (actual workers — best available proxy for past rosters)
+  //   required   = round(appts / ratio(dayOfWeek))
+  //   lightHours = number of business hours during which the per-hour distinct
+  //                stylist count fell below the day's `required` value
+  //   underCover = lightHours >= LIGHT_HOURS_RED_THRESHOLD (3)
+  // Locations with zero appointments across the entire window are omitted.
+  if (req.path === '/coverage/history' && req.method === 'GET') {
+    const start = cleanString(req.query.start);
+    const end = cleanString(req.query.end);
+    if (!start || !end) return apiError(400, 'BAD_REQUEST', 'start and end required (YYYY-MM-DD)');
+    const { ratioForDate, DEFAULT_RATIOS, DEFAULT_AVERAGING_DAYS, DOW_KEYS } = await import('../coverage/types');
+    const { averageDailyAppointmentsByDow } = await import('../coverage/sync');
+    const ratios = {
+      weekday: Number(req.query.weekdayRatio) || DEFAULT_RATIOS.weekday,
+      saturday: Number(req.query.saturdayRatio) || DEFAULT_RATIOS.saturday,
+      sunday: Number(req.query.sundayRatio) || DEFAULT_RATIOS.sunday,
+    };
+    const averagingDays = Number(req.query.averagingDays) || DEFAULT_AVERAGING_DAYS;
+    const { db, sqlite } = initializeDatabase(teamId);
+
+    type ActualRow = { locationId: string; date: string; stylists: number };
+    const actualRows = sqlite.prepare(
+      `SELECT location_id AS locationId,
+              substr(start_at, 1, 10) AS date,
+              COUNT(DISTINCT stylist_id) AS stylists
+         FROM appointments
+        WHERE team_id = ?
+          AND start_at IS NOT NULL
+          AND substr(start_at, 1, 10) BETWEEN ? AND ?
+          AND stylist_id IS NOT NULL
+          AND stylist_id <> ''
+        GROUP BY location_id, date`
+    ).all(teamId, start, end) as ActualRow[];
+
+    // Read the daily coverage cache. slot_payload already has the per-slot
+    // `light` flag the daily heatmap renders — counting those directly here
+    // guarantees the weekly view and the drill-down modal can never disagree
+    // on whether a given hour was under-covered. rostered_payload still
+    // provides the day's distinct-scheduled-stylist headcount.
+    type CacheRow = { locationId: string; date: string; slot_payload: string | null; rostered_payload: string | null };
+    const cacheRows = sqlite.prepare(
+      `SELECT location_id AS locationId, date, slot_payload, rostered_payload
+         FROM location_coverage_facts
+        WHERE team_id = ?
+          AND date BETWEEN ? AND ?`
+    ).all(teamId, start, end) as CacheRow[];
+
+    const LIGHT_HOURS_RED_THRESHOLD = 3;
+    type DayMeta = { lightHours: number; rosteredStylists: number; cachedRequired: number | null };
+    const cacheByLocDate = new Map<string, Map<string, DayMeta>>();
+    for (const r of cacheRows) {
+      let lightHours = 0;
+      let cachedRequired: number | null = null;
+      if (r.slot_payload) {
+        try {
+          const parsed = JSON.parse(r.slot_payload) as {
+            slots?: Array<{ light?: boolean }>;
+            requiredStylists?: number;
+          };
+          for (const s of parsed.slots ?? []) if (s.light) lightHours += 1;
+          if (typeof parsed.requiredStylists === 'number') cachedRequired = parsed.requiredStylists;
+        } catch { /* leave defaults */ }
+      }
+      let rosteredStylists = 0;
+      if (r.rostered_payload) {
+        try {
+          const parsed = JSON.parse(r.rostered_payload) as {
+            rows?: Array<{ stylistId?: string; status?: string }>;
+          };
+          const scheduled = new Set<string>();
+          for (const row of parsed.rows ?? []) {
+            if (row.status === 'scheduled' && row.stylistId) scheduled.add(row.stylistId);
+          }
+          rosteredStylists = scheduled.size;
+        } catch { /* leave 0 */ }
+      }
+      let byDate = cacheByLocDate.get(r.locationId);
+      if (!byDate) { byDate = new Map(); cacheByLocDate.set(r.locationId, byDate); }
+      byDate.set(r.date, { lightHours, rosteredStylists, cachedRequired });
+    }
+
+    // Enumerate every day in the window once so we know what columns to emit.
+    const days: string[] = [];
+    {
+      const cursor = new Date(`${start}T00:00:00`);
+      const stop = new Date(`${end}T00:00:00`);
+      while (cursor <= stop) {
+        const yyyy = cursor.getFullYear();
+        const mm = String(cursor.getMonth() + 1).padStart(2, '0');
+        const dd = String(cursor.getDate()).padStart(2, '0');
+        days.push(`${yyyy}-${mm}-${dd}`);
+        cursor.setDate(cursor.getDate() + 1);
+      }
+    }
+    function dowOf(dateIso: string) {
+      const [y, m, d] = dateIso.split('-').map(Number);
+      return DOW_KEYS[new Date(y, (m ?? 1) - 1, d ?? 1).getDay()];
+    }
+
+    // Build per-location actual-stylist lookup + the set of locations with
+    // any appointments in the window (so we omit dormant admin locations).
+    const actualByLoc = new Map<string, Map<string, number>>();
+    for (const r of actualRows) {
+      let inner = actualByLoc.get(r.locationId);
+      if (!inner) { inner = new Map(); actualByLoc.set(r.locationId, inner); }
+      inner.set(r.date, r.stylists);
+    }
+
+    // Union: any location with appointments OR cached coverage in the
+    // window. Forward-looking windows often have no bookings yet, so the
+    // cache is the primary signal for which locations have data.
+    const locationIds = new Set<string>([
+      ...actualByLoc.keys(),
+      ...cacheByLocDate.keys(),
+    ]);
+
+    const data = Array.from(locationIds).map((locationId) => {
+      const stylistsByDate = actualByLoc.get(locationId) ?? new Map();
+      const { averageByDow, closedByDow } = averageDailyAppointmentsByDow(
+        db, sqlite, teamId, locationId, end, averagingDays,
+      );
+      const cacheByDate = cacheByLocDate.get(locationId);
+      const out = days.map((date) => {
+        const dow = dowOf(date);
+        if (closedByDow[dow]) {
+          return { date, stylists: 0, appts: 0, required: 0, lightHours: 0, underCover: false, closed: true, hasRoster: false };
+        }
+        const appts = averageByDow[dow] ?? 0;
+        const ratio = ratioForDate(date, ratios);
+        const meta = cacheByDate?.get(date);
+        // Prefer the cached requiredStylists so the weekly view matches the
+        // daily heatmap exactly even if the user has tweaked ratios since
+        // the last coverage sync. Fall back to our own computation when no
+        // cache exists for the day.
+        const required = meta?.cachedRequired ?? (ratio > 0 ? Math.round(appts / ratio) : 0);
+        // For days with a roster, use the rostered headcount (right for future
+        // days where bookings haven't rolled in yet). Otherwise fall back to
+        // distinct-stylist counts from appointments.
+        const stylists = meta ? meta.rosteredStylists : (stylistsByDate.get(date) ?? 0);
+        const lightHours = meta?.lightHours ?? 0;
+        const underCover = lightHours >= LIGHT_HOURS_RED_THRESHOLD;
+        return { date, stylists, appts, required, lightHours, underCover, closed: false, hasRoster: !!meta };
+      });
+      return { locationId, days: out };
+    });
+
+    // Mirror the daily heatmap's isRowInactive filter: drop locations where
+    // every day in the window is either DOW-closed or has no expected appts
+    // AND no rostered stylists. This hides retired/admin/test locations the
+    // hourly heatmap also suppresses by default.
+    const filtered = data.filter((loc) =>
+      loc.days.some((d) => !d.closed && (d.appts > 0 || d.stylists > 0))
+    );
+
+    return { status: 200, data: { start, end, ratios, averagingDays, data: filtered } };
+  }
+
   if (req.path === '/franchises/sync' && req.method === 'POST') {
     try {
       const { syncFranchises } = await import('../coverage/sync-franchises');

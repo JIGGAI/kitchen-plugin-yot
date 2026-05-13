@@ -125,7 +125,7 @@ function readAppointmentsForDay(
  *   - averageByDow: mean appts/day for each DOW the store was ever open
  *   - closedByDow: true for any DOW the store was never open in the window
  */
-function averageDailyAppointmentsByDow(
+export function averageDailyAppointmentsByDow(
   db: ReturnType<typeof initializeDatabase>['db'],
   sqlite: SqliteDb,
   teamId: string,
