@@ -3479,33 +3479,44 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         GROUP BY location_id, date`
     ).all(teamId, start, end) as ActualRow[];
 
-    // Per-hour distinct-stylist counts so we can flag days that had 3+ hours
-    // under the required threshold. "Hour" buckets by the appointment's start
-    // hour-of-day, which is a close-enough proxy for "stylists working during
-    // that hour" for short-service barbershop appointments.
-    type HourRow = { locationId: string; date: string; hour: string; stylists: number };
-    const hourRows = sqlite.prepare(
-      `SELECT location_id AS locationId,
-              substr(start_at, 1, 10) AS date,
-              substr(start_at, 12, 2) AS hour,
-              COUNT(DISTINCT stylist_id) AS stylists
-         FROM appointments
+    // Per-hour rostered-stylist counts from the daily coverage cache. Each
+    // location_coverage_facts row stores the parsed YOT roster for that day
+    // (one entry per stylist with startsAt/endsAt). A stylist counts as
+    // "present" for every hour their shift spans, even if they had no
+    // appointments — idle minutes still mean they were on the floor.
+    type RosterRow = { locationId: string; date: string; rostered_payload: string };
+    const rosterRows = sqlite.prepare(
+      `SELECT location_id AS locationId, date, rostered_payload
+         FROM location_coverage_facts
         WHERE team_id = ?
-          AND start_at IS NOT NULL
-          AND substr(start_at, 1, 10) BETWEEN ? AND ?
-          AND stylist_id IS NOT NULL
-          AND stylist_id <> ''
-        GROUP BY location_id, date, hour`
-    ).all(teamId, start, end) as HourRow[];
+          AND date BETWEEN ? AND ?`
+    ).all(teamId, start, end) as RosterRow[];
 
     const LIGHT_HOURS_RED_THRESHOLD = 3;
-    const hourlyByLocDate = new Map<string, Map<string, Map<string, number>>>();
-    for (const r of hourRows) {
+    function hourOf(iso: string): number {
+      const h = parseInt(iso.slice(11, 13), 10);
+      return Number.isFinite(h) ? h : 0;
+    }
+    const hourlyByLocDate = new Map<string, Map<string, number[]>>();
+    for (const r of rosterRows) {
+      if (!r.rostered_payload) continue;
+      let parsed: { rows?: Array<{ status?: string; startsAt?: string | null; endsAt?: string | null }> };
+      try { parsed = JSON.parse(r.rostered_payload); } catch { continue; }
+      const hours = new Array(24).fill(0);
+      for (const row of parsed.rows ?? []) {
+        if (row.status !== 'scheduled' || !row.startsAt || !row.endsAt) continue;
+        const firstHour = hourOf(row.startsAt);
+        // A shift ending at 16:00 covers 15:00-16:00 but not 16:00-17:00, so
+        // subtract one when endsAt lands exactly on the hour. (10:00→16:00
+        // means 6 hours: hours 10..15 inclusive.)
+        const endMinutes = parseInt(row.endsAt.slice(14, 16), 10) || 0;
+        const rawLastHour = hourOf(row.endsAt);
+        const lastHour = endMinutes === 0 ? rawLastHour - 1 : rawLastHour;
+        for (let h = firstHour; h <= lastHour; h++) hours[h] += 1;
+      }
       let byDate = hourlyByLocDate.get(r.locationId);
       if (!byDate) { byDate = new Map(); hourlyByLocDate.set(r.locationId, byDate); }
-      let byHour = byDate.get(r.date);
-      if (!byHour) { byHour = new Map(); byDate.set(r.date, byHour); }
-      byHour.set(r.hour, r.stylists);
+      byDate.set(r.date, hours);
     }
 
     // Enumerate every day in the window once so we know what columns to emit.
@@ -3550,11 +3561,15 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         const ratio = ratioForDate(date, ratios);
         const required = ratio > 0 ? Math.round(appts / ratio) : 0;
         const stylists = stylistsByDate.get(date) ?? 0;
-        const byHour = hoursByDate?.get(date);
+        const hours = hoursByDate?.get(date);
         let lightHours = 0;
-        if (required > 0 && byHour) {
-          for (const stylistsInHour of byHour.values()) {
-            if (stylistsInHour < required) lightHours += 1;
+        if (required > 0 && hours) {
+          // Only count hours the store was actually open (had ≥1 stylist
+          // rostered for at least part of the hour). Empty pre-open / post-
+          // close hours shouldn't count as "in the red" — there's no one to
+          // be light vs.
+          for (const stylistsInHour of hours) {
+            if (stylistsInHour > 0 && stylistsInHour < required) lightHours += 1;
           }
         }
         const underCover = lightHours >= LIGHT_HOURS_RED_THRESHOLD;
