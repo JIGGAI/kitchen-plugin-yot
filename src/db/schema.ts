@@ -413,6 +413,9 @@ export const SYNC_RESOURCES = [
   'promotion_usage',
   'revenue_facts',
   'staff_cashout_facts',
+  'staff_performance_facts',
+  'staff_retention_facts',
+  'staff_timecard_facts',
   'location_coverage_facts',
 ] as const;
 export type SyncResource = typeof SYNC_RESOURCES[number];
