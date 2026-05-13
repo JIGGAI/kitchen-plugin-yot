@@ -3479,47 +3479,51 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         GROUP BY location_id, date`
     ).all(teamId, start, end) as ActualRow[];
 
-    // Per-hour rostered-stylist counts from the daily coverage cache. Each
-    // location_coverage_facts row stores the parsed YOT roster for that day
-    // (one entry per stylist with startsAt/endsAt). A stylist counts as
-    // "present" for every hour their shift spans, even if they had no
-    // appointments — idle minutes still mean they were on the floor.
-    type RosterRow = { locationId: string; date: string; rostered_payload: string };
-    const rosterRows = sqlite.prepare(
-      `SELECT location_id AS locationId, date, rostered_payload
+    // Read the daily coverage cache. slot_payload already has the per-slot
+    // `light` flag the daily heatmap renders — counting those directly here
+    // guarantees the weekly view and the drill-down modal can never disagree
+    // on whether a given hour was under-covered. rostered_payload still
+    // provides the day's distinct-scheduled-stylist headcount.
+    type CacheRow = { locationId: string; date: string; slot_payload: string | null; rostered_payload: string | null };
+    const cacheRows = sqlite.prepare(
+      `SELECT location_id AS locationId, date, slot_payload, rostered_payload
          FROM location_coverage_facts
         WHERE team_id = ?
           AND date BETWEEN ? AND ?`
-    ).all(teamId, start, end) as RosterRow[];
+    ).all(teamId, start, end) as CacheRow[];
 
     const LIGHT_HOURS_RED_THRESHOLD = 3;
-    function hourOf(iso: string): number {
-      const h = parseInt(iso.slice(11, 13), 10);
-      return Number.isFinite(h) ? h : 0;
-    }
-    type RosterMeta = { hours: number[]; rosteredStylists: number };
-    const rosterByLocDate = new Map<string, Map<string, RosterMeta>>();
-    for (const r of rosterRows) {
-      if (!r.rostered_payload) continue;
-      let parsed: { rows?: Array<{ stylistId?: string; status?: string; startsAt?: string | null; endsAt?: string | null }> };
-      try { parsed = JSON.parse(r.rostered_payload); } catch { continue; }
-      const hours = new Array(24).fill(0);
-      const scheduled = new Set<string>();
-      for (const row of parsed.rows ?? []) {
-        if (row.status !== 'scheduled' || !row.startsAt || !row.endsAt) continue;
-        if (row.stylistId) scheduled.add(row.stylistId);
-        const firstHour = hourOf(row.startsAt);
-        // A shift ending at 16:00 covers 15:00-16:00 but not 16:00-17:00, so
-        // subtract one when endsAt lands exactly on the hour. (10:00→16:00
-        // means 6 hours: hours 10..15 inclusive.)
-        const endMinutes = parseInt(row.endsAt.slice(14, 16), 10) || 0;
-        const rawLastHour = hourOf(row.endsAt);
-        const lastHour = endMinutes === 0 ? rawLastHour - 1 : rawLastHour;
-        for (let h = firstHour; h <= lastHour; h++) hours[h] += 1;
+    type DayMeta = { lightHours: number; rosteredStylists: number; cachedRequired: number | null };
+    const cacheByLocDate = new Map<string, Map<string, DayMeta>>();
+    for (const r of cacheRows) {
+      let lightHours = 0;
+      let cachedRequired: number | null = null;
+      if (r.slot_payload) {
+        try {
+          const parsed = JSON.parse(r.slot_payload) as {
+            slots?: Array<{ light?: boolean }>;
+            requiredStylists?: number;
+          };
+          for (const s of parsed.slots ?? []) if (s.light) lightHours += 1;
+          if (typeof parsed.requiredStylists === 'number') cachedRequired = parsed.requiredStylists;
+        } catch { /* leave defaults */ }
       }
-      let byDate = rosterByLocDate.get(r.locationId);
-      if (!byDate) { byDate = new Map(); rosterByLocDate.set(r.locationId, byDate); }
-      byDate.set(r.date, { hours, rosteredStylists: scheduled.size });
+      let rosteredStylists = 0;
+      if (r.rostered_payload) {
+        try {
+          const parsed = JSON.parse(r.rostered_payload) as {
+            rows?: Array<{ stylistId?: string; status?: string }>;
+          };
+          const scheduled = new Set<string>();
+          for (const row of parsed.rows ?? []) {
+            if (row.status === 'scheduled' && row.stylistId) scheduled.add(row.stylistId);
+          }
+          rosteredStylists = scheduled.size;
+        } catch { /* leave 0 */ }
+      }
+      let byDate = cacheByLocDate.get(r.locationId);
+      if (!byDate) { byDate = new Map(); cacheByLocDate.set(r.locationId, byDate); }
+      byDate.set(r.date, { lightHours, rosteredStylists, cachedRequired });
     }
 
     // Enumerate every day in the window once so we know what columns to emit.
@@ -3549,12 +3553,12 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       inner.set(r.date, r.stylists);
     }
 
-    // Union: any location with appointments OR cached roster in the window.
-    // Forward-looking windows often have no bookings yet, so the roster is
-    // the primary signal for which locations have data.
+    // Union: any location with appointments OR cached coverage in the
+    // window. Forward-looking windows often have no bookings yet, so the
+    // cache is the primary signal for which locations have data.
     const locationIds = new Set<string>([
       ...actualByLoc.keys(),
-      ...rosterByLocDate.keys(),
+      ...cacheByLocDate.keys(),
     ]);
 
     const data = Array.from(locationIds).map((locationId) => {
@@ -3562,7 +3566,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       const { averageByDow, closedByDow } = averageDailyAppointmentsByDow(
         db, sqlite, teamId, locationId, end, averagingDays,
       );
-      const rosterByDate = rosterByLocDate.get(locationId);
+      const cacheByDate = cacheByLocDate.get(locationId);
       const out = days.map((date) => {
         const dow = dowOf(date);
         if (closedByDow[dow]) {
@@ -3570,24 +3574,19 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         }
         const appts = averageByDow[dow] ?? 0;
         const ratio = ratioForDate(date, ratios);
-        const required = ratio > 0 ? Math.round(appts / ratio) : 0;
-        const roster = rosterByDate?.get(date);
-        // Prefer the rostered stylist count when we have it (correct for
-        // future days where appointments are still rolling in); fall back to
-        // the distinct-stylist count from appointments for older days where
-        // the roster cache has aged out.
-        const stylists = roster ? roster.rosteredStylists : (stylistsByDate.get(date) ?? 0);
-        let lightHours = 0;
-        if (required > 0 && roster) {
-          // Only count hours the store was actually open (≥1 stylist rostered
-          // for at least part of the hour). Empty pre-open / post-close hours
-          // shouldn't count toward the under-cover flag.
-          for (const stylistsInHour of roster.hours) {
-            if (stylistsInHour > 0 && stylistsInHour < required) lightHours += 1;
-          }
-        }
+        const meta = cacheByDate?.get(date);
+        // Prefer the cached requiredStylists so the weekly view matches the
+        // daily heatmap exactly even if the user has tweaked ratios since
+        // the last coverage sync. Fall back to our own computation when no
+        // cache exists for the day.
+        const required = meta?.cachedRequired ?? (ratio > 0 ? Math.round(appts / ratio) : 0);
+        // For days with a roster, use the rostered headcount (right for future
+        // days where bookings haven't rolled in yet). Otherwise fall back to
+        // distinct-stylist counts from appointments.
+        const stylists = meta ? meta.rosteredStylists : (stylistsByDate.get(date) ?? 0);
+        const lightHours = meta?.lightHours ?? 0;
         const underCover = lightHours >= LIGHT_HOURS_RED_THRESHOLD;
-        return { date, stylists, appts, required, lightHours, underCover, closed: false, hasRoster: !!roster };
+        return { date, stylists, appts, required, lightHours, underCover, closed: false, hasRoster: !!meta };
       });
       return { locationId, days: out };
     });
