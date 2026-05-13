@@ -3591,7 +3591,15 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       return { locationId, days: out };
     });
 
-    return { status: 200, data: { start, end, ratios, averagingDays, data } };
+    // Mirror the daily heatmap's isRowInactive filter: drop locations where
+    // every day in the window is either DOW-closed or has no expected appts
+    // AND no rostered stylists. This hides retired/admin/test locations the
+    // hourly heatmap also suppresses by default.
+    const filtered = data.filter((loc) =>
+      loc.days.some((d) => !d.closed && (d.appts > 0 || d.stylists > 0))
+    );
+
+    return { status: 200, data: { start, end, ratios, averagingDays, data: filtered } };
   }
 
   if (req.path === '/franchises/sync' && req.method === 'POST') {
