@@ -3440,6 +3440,55 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     return { status: 200, data: { date: cached.date, computedAt: cached.computedAt, windows } };
   }
 
+  // Per-location daily summary across a date range. Computed live from the
+  // appointments table so historical days don't require a roster backfill.
+  //   stylists = COUNT(DISTINCT stylist_id) of appointments that day
+  //   appts    = COUNT(*) of appointments that day
+  //   underCover = appts > stylists * ratio(dayOfWeek)
+  // Returns one entry per (location, day) in the requested window. Locations
+  // with zero appointments across the entire window are omitted.
+  if (req.path === '/coverage/history' && req.method === 'GET') {
+    const start = cleanString(req.query.start);
+    const end = cleanString(req.query.end);
+    if (!start || !end) return apiError(400, 'BAD_REQUEST', 'start and end required (YYYY-MM-DD)');
+    const { ratioForDate, DEFAULT_RATIOS } = await import('../coverage/types');
+    const ratios = {
+      weekday: Number(req.query.weekdayRatio) || DEFAULT_RATIOS.weekday,
+      saturday: Number(req.query.saturdayRatio) || DEFAULT_RATIOS.saturday,
+      sunday: Number(req.query.sundayRatio) || DEFAULT_RATIOS.sunday,
+    };
+    const { sqlite } = initializeDatabase(teamId);
+
+    type AggRow = { locationId: string; date: string; stylists: number; appts: number };
+    const rows = sqlite.prepare(
+      `SELECT location_id AS locationId,
+              substr(start_at, 1, 10) AS date,
+              COUNT(DISTINCT stylist_id) AS stylists,
+              COUNT(*) AS appts
+         FROM appointments
+        WHERE team_id = ?
+          AND start_at IS NOT NULL
+          AND substr(start_at, 1, 10) BETWEEN ? AND ?
+          AND stylist_id IS NOT NULL
+          AND stylist_id <> ''
+        GROUP BY location_id, date
+        ORDER BY location_id, date`
+    ).all(teamId, start, end) as AggRow[];
+
+    const byLocation = new Map<string, Array<{ date: string; stylists: number; appts: number; underCover: boolean }>>();
+    for (const r of rows) {
+      const ratio = ratioForDate(r.date, ratios);
+      const capacity = r.stylists * ratio;
+      const underCover = capacity > 0 && r.appts > capacity;
+      const list = byLocation.get(r.locationId) ?? [];
+      list.push({ date: r.date, stylists: r.stylists, appts: r.appts, underCover });
+      byLocation.set(r.locationId, list);
+    }
+
+    const data = Array.from(byLocation.entries()).map(([locationId, days]) => ({ locationId, days }));
+    return { status: 200, data: { start, end, ratios, data } };
+  }
+
   if (req.path === '/franchises/sync' && req.method === 'POST') {
     try {
       const { syncFranchises } = await import('../coverage/sync-franchises');
