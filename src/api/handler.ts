@@ -3497,14 +3497,17 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       const h = parseInt(iso.slice(11, 13), 10);
       return Number.isFinite(h) ? h : 0;
     }
-    const hourlyByLocDate = new Map<string, Map<string, number[]>>();
+    type RosterMeta = { hours: number[]; rosteredStylists: number };
+    const rosterByLocDate = new Map<string, Map<string, RosterMeta>>();
     for (const r of rosterRows) {
       if (!r.rostered_payload) continue;
-      let parsed: { rows?: Array<{ status?: string; startsAt?: string | null; endsAt?: string | null }> };
+      let parsed: { rows?: Array<{ stylistId?: string; status?: string; startsAt?: string | null; endsAt?: string | null }> };
       try { parsed = JSON.parse(r.rostered_payload); } catch { continue; }
       const hours = new Array(24).fill(0);
+      const scheduled = new Set<string>();
       for (const row of parsed.rows ?? []) {
         if (row.status !== 'scheduled' || !row.startsAt || !row.endsAt) continue;
+        if (row.stylistId) scheduled.add(row.stylistId);
         const firstHour = hourOf(row.startsAt);
         // A shift ending at 16:00 covers 15:00-16:00 but not 16:00-17:00, so
         // subtract one when endsAt lands exactly on the hour. (10:00→16:00
@@ -3514,9 +3517,9 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         const lastHour = endMinutes === 0 ? rawLastHour - 1 : rawLastHour;
         for (let h = firstHour; h <= lastHour; h++) hours[h] += 1;
       }
-      let byDate = hourlyByLocDate.get(r.locationId);
-      if (!byDate) { byDate = new Map(); hourlyByLocDate.set(r.locationId, byDate); }
-      byDate.set(r.date, hours);
+      let byDate = rosterByLocDate.get(r.locationId);
+      if (!byDate) { byDate = new Map(); rosterByLocDate.set(r.locationId, byDate); }
+      byDate.set(r.date, { hours, rosteredStylists: scheduled.size });
     }
 
     // Enumerate every day in the window once so we know what columns to emit.
@@ -3546,34 +3549,45 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       inner.set(r.date, r.stylists);
     }
 
-    const data = Array.from(actualByLoc.keys()).map((locationId) => {
+    // Union: any location with appointments OR cached roster in the window.
+    // Forward-looking windows often have no bookings yet, so the roster is
+    // the primary signal for which locations have data.
+    const locationIds = new Set<string>([
+      ...actualByLoc.keys(),
+      ...rosterByLocDate.keys(),
+    ]);
+
+    const data = Array.from(locationIds).map((locationId) => {
       const stylistsByDate = actualByLoc.get(locationId) ?? new Map();
       const { averageByDow, closedByDow } = averageDailyAppointmentsByDow(
         db, sqlite, teamId, locationId, end, averagingDays,
       );
-      const hoursByDate = hourlyByLocDate.get(locationId);
+      const rosterByDate = rosterByLocDate.get(locationId);
       const out = days.map((date) => {
         const dow = dowOf(date);
         if (closedByDow[dow]) {
-          return { date, stylists: 0, appts: 0, required: 0, lightHours: 0, underCover: false, closed: true };
+          return { date, stylists: 0, appts: 0, required: 0, lightHours: 0, underCover: false, closed: true, hasRoster: false };
         }
         const appts = averageByDow[dow] ?? 0;
         const ratio = ratioForDate(date, ratios);
         const required = ratio > 0 ? Math.round(appts / ratio) : 0;
-        const stylists = stylistsByDate.get(date) ?? 0;
-        const hours = hoursByDate?.get(date);
+        const roster = rosterByDate?.get(date);
+        // Prefer the rostered stylist count when we have it (correct for
+        // future days where appointments are still rolling in); fall back to
+        // the distinct-stylist count from appointments for older days where
+        // the roster cache has aged out.
+        const stylists = roster ? roster.rosteredStylists : (stylistsByDate.get(date) ?? 0);
         let lightHours = 0;
-        if (required > 0 && hours) {
-          // Only count hours the store was actually open (had ≥1 stylist
-          // rostered for at least part of the hour). Empty pre-open / post-
-          // close hours shouldn't count as "in the red" — there's no one to
-          // be light vs.
-          for (const stylistsInHour of hours) {
+        if (required > 0 && roster) {
+          // Only count hours the store was actually open (≥1 stylist rostered
+          // for at least part of the hour). Empty pre-open / post-close hours
+          // shouldn't count toward the under-cover flag.
+          for (const stylistsInHour of roster.hours) {
             if (stylistsInHour > 0 && stylistsInHour < required) lightHours += 1;
           }
         }
         const underCover = lightHours >= LIGHT_HOURS_RED_THRESHOLD;
-        return { date, stylists, appts, required, lightHours, underCover, closed: false };
+        return { date, stylists, appts, required, lightHours, underCover, closed: false, hasRoster: !!roster };
       });
       return { locationId, days: out };
     });
