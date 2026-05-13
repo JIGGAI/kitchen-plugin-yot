@@ -3447,7 +3447,9 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
   //   stylists   = COUNT(DISTINCT stylist_id) from appointments that day
   //                (actual workers — best available proxy for past rosters)
   //   required   = round(appts / ratio(dayOfWeek))
-  //   underCover = stylists < required
+  //   lightHours = number of business hours during which the per-hour distinct
+  //                stylist count fell below the day's `required` value
+  //   underCover = lightHours >= LIGHT_HOURS_RED_THRESHOLD (3)
   // Locations with zero appointments across the entire window are omitted.
   if (req.path === '/coverage/history' && req.method === 'GET') {
     const start = cleanString(req.query.start);
@@ -3476,6 +3478,35 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
           AND stylist_id <> ''
         GROUP BY location_id, date`
     ).all(teamId, start, end) as ActualRow[];
+
+    // Per-hour distinct-stylist counts so we can flag days that had 3+ hours
+    // under the required threshold. "Hour" buckets by the appointment's start
+    // hour-of-day, which is a close-enough proxy for "stylists working during
+    // that hour" for short-service barbershop appointments.
+    type HourRow = { locationId: string; date: string; hour: string; stylists: number };
+    const hourRows = sqlite.prepare(
+      `SELECT location_id AS locationId,
+              substr(start_at, 1, 10) AS date,
+              substr(start_at, 12, 2) AS hour,
+              COUNT(DISTINCT stylist_id) AS stylists
+         FROM appointments
+        WHERE team_id = ?
+          AND start_at IS NOT NULL
+          AND substr(start_at, 1, 10) BETWEEN ? AND ?
+          AND stylist_id IS NOT NULL
+          AND stylist_id <> ''
+        GROUP BY location_id, date, hour`
+    ).all(teamId, start, end) as HourRow[];
+
+    const LIGHT_HOURS_RED_THRESHOLD = 3;
+    const hourlyByLocDate = new Map<string, Map<string, Map<string, number>>>();
+    for (const r of hourRows) {
+      let byDate = hourlyByLocDate.get(r.locationId);
+      if (!byDate) { byDate = new Map(); hourlyByLocDate.set(r.locationId, byDate); }
+      let byHour = byDate.get(r.date);
+      if (!byHour) { byHour = new Map(); byDate.set(r.date, byHour); }
+      byHour.set(r.hour, r.stylists);
+    }
 
     // Enumerate every day in the window once so we know what columns to emit.
     const days: string[] = [];
@@ -3509,17 +3540,25 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       const { averageByDow, closedByDow } = averageDailyAppointmentsByDow(
         db, sqlite, teamId, locationId, end, averagingDays,
       );
+      const hoursByDate = hourlyByLocDate.get(locationId);
       const out = days.map((date) => {
         const dow = dowOf(date);
         if (closedByDow[dow]) {
-          return { date, stylists: 0, appts: 0, required: 0, underCover: false, closed: true };
+          return { date, stylists: 0, appts: 0, required: 0, lightHours: 0, underCover: false, closed: true };
         }
         const appts = averageByDow[dow] ?? 0;
         const ratio = ratioForDate(date, ratios);
         const required = ratio > 0 ? Math.round(appts / ratio) : 0;
         const stylists = stylistsByDate.get(date) ?? 0;
-        const underCover = required > 0 && stylists < required;
-        return { date, stylists, appts, required, underCover, closed: false };
+        const byHour = hoursByDate?.get(date);
+        let lightHours = 0;
+        if (required > 0 && byHour) {
+          for (const stylistsInHour of byHour.values()) {
+            if (stylistsInHour < required) lightHours += 1;
+          }
+        }
+        const underCover = lightHours >= LIGHT_HOURS_RED_THRESHOLD;
+        return { date, stylists, appts, required, lightHours, underCover, closed: false };
       });
       return { locationId, days: out };
     });
