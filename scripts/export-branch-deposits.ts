@@ -200,11 +200,54 @@ function firstToken(value: string): string {
   return normalizeText(value).split(' ').filter(Boolean)[0] || '';
 }
 
+// Damerau-Levenshtein: counts substitution, insertion, deletion, AND
+// adjacent transposition each as 1 edit. Lets us recognise typos like
+// "Krisitn" ↔ "Kristin" (a single transposition) as a near-match without
+// being so loose that we collide unrelated names.
+function damerauLevenshtein(a: string, b: string): number {
+  if (a === b) return 0;
+  const m = a.length;
+  const n = b.length;
+  if (!m) return n;
+  if (!n) return m;
+  const d: number[][] = Array.from({ length: m + 1 }, () => new Array<number>(n + 1).fill(0));
+  for (let i = 0; i <= m; i++) d[i]![0] = i;
+  for (let j = 0; j <= n; j++) d[0]![j] = j;
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      d[i]![j] = Math.min(
+        d[i - 1]![j]! + 1,
+        d[i]![j - 1]! + 1,
+        d[i - 1]![j - 1]! + cost,
+      );
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) {
+        d[i]![j] = Math.min(d[i]![j]!, d[i - 2]![j - 2]! + 1);
+      }
+    }
+  }
+  return d[m]![n]!;
+}
+
 function fuzzyFirstNameMatch(a: string, b: string): boolean {
+  return firstNameMatchKind(a, b) !== 'none';
+}
+
+// Returns the strongest match kind between two first names:
+//   exact   — identical after normalization
+//   prefix  — one is a prefix of the other (handles nicknames like "Matt"↔"Matthew")
+//   typo    — Damerau-Levenshtein distance ≤1 on names of ≥4 chars
+//   none    — no match
+// "typo" matches are reported in the diagnostics so the watchdog can email
+// RJ about Branch-sheet spelling drift without blocking today's deposit.
+function firstNameMatchKind(a: string, b: string): 'exact' | 'prefix' | 'typo' | 'none' {
   const aa = firstToken(a);
   const bb = firstToken(b);
-  if (!aa || !bb) return false;
-  return aa === bb || aa.startsWith(bb) || bb.startsWith(aa);
+  if (!aa || !bb) return 'none';
+  if (aa === bb) return 'exact';
+  if (aa.startsWith(bb) || bb.startsWith(aa)) return 'prefix';
+  if (aa.length >= 4 && bb.length >= 4 && damerauLevenshtein(aa, bb) <= 1) return 'typo';
+  return 'none';
 }
 
 function formatCsvCell(value: string | number): string {
@@ -452,19 +495,33 @@ function scoreReportCandidate(branch: BranchDailyRow, report: StaffCashoutRow): 
   return score;
 }
 
-function matchBranchRowToReport(branch: BranchDailyRow, rows: StaffCashoutRow[], indexes: ReturnType<typeof buildReportIndexes>): StaffCashoutRow | null {
+type MatchResult = { row: StaffCashoutRow; kind: 'exact' | 'prefix' | 'typo' };
+
+function matchBranchRowToReport(branch: BranchDailyRow, _rows: StaffCashoutRow[], indexes: ReturnType<typeof buildReportIndexes>): MatchResult | null {
   const exactKey = normalizeText(`${branch.firstName} ${branch.lastName}`);
   const exactHits = indexes.byExactName.get(exactKey) || [];
-  if (exactHits.length === 1) return exactHits[0]!;
+  if (exactHits.length === 1) return { row: exactHits[0]!, kind: 'exact' };
   if (exactHits.length > 1) {
-    return [...exactHits].sort((a, b) => scoreReportCandidate(branch, b) - scoreReportCandidate(branch, a))[0] || null;
+    const row = [...exactHits].sort((a, b) => scoreReportCandidate(branch, b) - scoreReportCandidate(branch, a))[0];
+    return row ? { row, kind: 'exact' } : null;
   }
 
   const branchParts = splitName(`${branch.firstName} ${branch.lastName}`);
   const lastHits = indexes.byLastName.get(branchParts.last) || [];
-  const fuzzyHits = lastHits.filter((candidate) => fuzzyFirstNameMatch(branchParts.first, splitName(candidate.staffName || '').first));
+  const fuzzyHits = lastHits
+    .map((candidate) => ({ candidate, kind: firstNameMatchKind(branchParts.first, splitName(candidate.staffName || '').first) }))
+    .filter((entry) => entry.kind !== 'none');
   if (!fuzzyHits.length) return null;
-  return [...fuzzyHits].sort((a, b) => scoreReportCandidate(branch, b) - scoreReportCandidate(branch, a))[0] || null;
+  // Prefer exact > prefix > typo when multiple last-name hits qualify.
+  const ranked = [...fuzzyHits].sort((a, b) => {
+    const order = { exact: 0, prefix: 1, typo: 2 } as const;
+    const ak = order[a.kind as 'exact' | 'prefix' | 'typo'];
+    const bk = order[b.kind as 'exact' | 'prefix' | 'typo'];
+    if (ak !== bk) return ak - bk;
+    return scoreReportCandidate(branch, b.candidate) - scoreReportCandidate(branch, a.candidate);
+  });
+  const best = ranked[0]!;
+  return { row: best.candidate, kind: best.kind as 'exact' | 'prefix' | 'typo' };
 }
 
 async function main() {
@@ -488,12 +545,33 @@ async function main() {
   const unmatchedBranchRows: BranchDailyRow[] = [];
   const skippedNonPositiveReportMatches: MatchDiagnostics['skippedNonPositiveReportMatches'] = [];
   const garnishmentPayoutRows: GarnishmentPayoutRow[] = [];
+  // Rows we matched via a loose first-name comparison rather than an exact
+  // string equality. The watchdog reads this list and emails RJ so the
+  // Branch sheet's spelling drift gets corrected upstream — they're paid
+  // tonight either way, but we don't want typos to silently accumulate.
+  const fuzzyMatchedRows: Array<{
+    branchStaffId: string;
+    branchName: string;
+    reportName: string;
+    locationName: string | null;
+    matchKind: 'prefix' | 'typo';
+  }> = [];
 
   for (const branchRow of branchRows) {
-    const match = matchBranchRowToReport(branchRow, report.rows, reportIndexes);
-    if (!match) {
+    const matchResult = matchBranchRowToReport(branchRow, report.rows, reportIndexes);
+    if (!matchResult) {
       unmatchedBranchRows.push(branchRow);
       continue;
+    }
+    const match = matchResult.row;
+    if (matchResult.kind !== 'exact') {
+      fuzzyMatchedRows.push({
+        branchStaffId: branchRow.staffId,
+        branchName: `${branchRow.firstName} ${branchRow.lastName}`.trim(),
+        reportName: match.staffName || '',
+        locationName: match.locationName,
+        matchKind: matchResult.kind,
+      });
     }
     matchedReportRows.add(match);
 
