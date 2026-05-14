@@ -2005,6 +2005,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
   if (req.path === '/staff-performance/sync' && req.method === 'POST') {
     const config = readYotConfig(teamId);
     if (!config) return apiError(400, 'NOT_CONFIGURED', 'YOT apiKey not set for this team. POST /config first.');
+    const { db: perfDb } = initializeDatabase(teamId);
     try {
       const date = toDateOnlyInput(req.query.date || req.query.startDate || req.query.start) || dateOnlyNow();
       const organisationId = Number(cleanString(req.query.organisationId || req.query.org) || String(DEFAULT_REVENUE_ORGANISATION_ID));
@@ -2068,8 +2069,14 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         );
         rowsWritten += 1;
       }
-      return { status: 200, data: { ok: true, date, rowsWritten, locationCount: parsed.locations.length, startedAt, completedAt: new Date().toISOString() } };
+      const completedAt = new Date().toISOString();
+      upsertSyncState(perfDb, teamId, 'staff_performance_facts', {
+        lastSyncedAt: completedAt, lastSuccessAt: completedAt, lastError: null, rowCount: rowsWritten,
+      });
+      return { status: 200, data: { ok: true, date, rowsWritten, locationCount: parsed.locations.length, startedAt, completedAt } };
     } catch (error: any) {
+      const now = new Date().toISOString();
+      upsertSyncState(perfDb, teamId, 'staff_performance_facts', { lastSyncedAt: now, lastError: error?.message || String(error) });
       return apiError(502, 'YOT_ERROR', error?.message || 'Failed to sync staff performance');
     }
   }
@@ -2180,6 +2187,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
   // Triggers the sync library. Wraps options in the same way the other
   // /sync endpoints do.
   if (req.path === '/staff-timecards/sync' && req.method === 'POST') {
+    const { db } = initializeDatabase(teamId);
     try {
       const today = dateOnlyNow();
       const firstOfMonth = today.slice(0, 8) + '01';
@@ -2189,8 +2197,16 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       if (!Number.isFinite(organisationId)) return apiError(400, 'BAD_REQUEST', 'organisationId must be a number');
       const { syncStaffTimecards } = await import('../reports/sync-staff-timecards');
       const result = await syncStaffTimecards({ teamId, startDate, endDate, organisationId });
+      const now = new Date().toISOString();
+      const rowsWritten = ((result as any)?.rowsInserted || 0) + ((result as any)?.rowsUpdated || 0);
+      upsertSyncState(db, teamId, 'staff_timecard_facts', {
+        lastSyncedAt: now, lastSuccessAt: now, lastError: null,
+        rowCount: rowsWritten || null,
+      });
       return { status: 200, data: result };
     } catch (error: any) {
+      const now = new Date().toISOString();
+      upsertSyncState(db, teamId, 'staff_timecard_facts', { lastSyncedAt: now, lastError: error?.message || String(error) });
       return apiError(500, 'INTERNAL', error?.message || 'Failed to sync staff timecards');
     }
   }
@@ -2351,17 +2367,25 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
 
   // POST /staff-retention/sync?startDate=&endDate=&organisationId=
   if (req.path === '/staff-retention/sync' && req.method === 'POST') {
+    const { db } = initializeDatabase(teamId);
+    const today = dateOnlyNow();
+    const firstOfMonth = today.slice(0, 8) + '01';
+    const startDate = toDateOnlyInput(req.query.startDate || req.query.start) || firstOfMonth;
+    const endDate = toDateOnlyInput(req.query.endDate || req.query.end) || today;
     try {
-      const today = dateOnlyNow();
-      const firstOfMonth = today.slice(0, 8) + '01';
-      const startDate = toDateOnlyInput(req.query.startDate || req.query.start) || firstOfMonth;
-      const endDate = toDateOnlyInput(req.query.endDate || req.query.end) || today;
       const organisationId = Number(cleanString(req.query.organisationId || req.query.org) || String(DEFAULT_REVENUE_ORGANISATION_ID));
       if (!Number.isFinite(organisationId)) return apiError(400, 'BAD_REQUEST', 'organisationId must be a number');
       const { syncStaffRetention } = await import('../reports/sync-staff-retention');
       const result = await syncStaffRetention({ teamId, startDate, endDate, organisationId });
+      const now = new Date().toISOString();
+      upsertSyncState(db, teamId, 'staff_retention_facts', {
+        lastSyncedAt: now, lastSuccessAt: now, lastError: null,
+        rowCount: (result as any)?.rowsWritten ?? (result as any)?.rowsUpserted ?? null,
+      });
       return { status: 200, data: result };
     } catch (error: any) {
+      const now = new Date().toISOString();
+      upsertSyncState(db, teamId, 'staff_retention_facts', { lastSyncedAt: now, lastError: error?.message || String(error) });
       return apiError(500, 'INTERNAL', error?.message || 'Failed to sync staff retention');
     }
   }
@@ -3382,6 +3406,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
   // ============================================================
 
   if (req.path === '/coverage/sync' && req.method === 'POST') {
+    const { db: covDb, sqlite: covSqlite } = initializeDatabase(teamId);
     try {
       const body = (req.body || {}) as {
         locationId?: string;
@@ -3410,9 +3435,22 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         averagingDays: body.averagingDays,
         slotMinutes,
       });
+      const now = new Date().toISOString();
+      // Row count = current cached rows for this team (multiple location-days
+      // accumulate; the per-call result rebuilds one week of one location).
+      let rowCount: number | null = null;
+      try {
+        const r = covSqlite.prepare('SELECT COUNT(*) AS c FROM location_coverage_facts WHERE team_id = ?').get(teamId) as { c: number };
+        rowCount = r?.c ?? null;
+      } catch { /* tolerate missing table */ }
+      upsertSyncState(covDb, teamId, 'location_coverage_facts', {
+        lastSyncedAt: now, lastSuccessAt: now, lastError: null, rowCount,
+      });
       return { status: 200, data: result };
     } catch (err: any) {
       const msg = err?.message || 'Coverage sync failed';
+      const now = new Date().toISOString();
+      upsertSyncState(covDb, teamId, 'location_coverage_facts', { lastSyncedAt: now, lastError: msg });
       if (err?.name === 'MvcAuthMissingError') return apiError(412, 'MVC_AUTH_MISSING', msg);
       if (err?.name === 'MvcAuthExpiredError') return apiError(401, 'MVC_AUTH_EXPIRED', msg);
       return apiError(500, 'COVERAGE_SYNC_FAILED', msg);
