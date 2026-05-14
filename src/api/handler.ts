@@ -2282,50 +2282,14 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
          WHERE team_id = ? AND period_start = ? AND period_end = ?`,
       ).all(teamId, startDate, endDate) as RetentionRow[];
 
-      let matchedWindow: { startDate: string; endDate: string } | null = rows.length
+      // No fallback to most-recently-synced: if the exact window isn't
+      // cached, return hasData=false so the dashboard can prompt the user
+      // to trigger a fresh sync rather than silently showing stale numbers
+      // from a different window.
+      const matchedWindow: { startDate: string; endDate: string } | null = rows.length
         ? { startDate, endDate }
         : null;
-
-      if (!rows.length) {
-        // Fallback: pick the most recently synced window
-        const latest = sqlite.prepare(
-          `SELECT period_start AS startDate, period_end AS endDate
-           FROM staff_retention_facts
-           WHERE team_id = ?
-           ORDER BY synced_at DESC
-           LIMIT 1`,
-        ).get(teamId) as { startDate: string; endDate: string } | undefined;
-        if (latest) {
-          matchedWindow = latest;
-          rows = sqlite.prepare(
-            `SELECT period_start AS periodStart, period_end AS periodEnd,
-                    location_name AS locationName, staff_name AS staffName,
-                    total_sales AS totalSales,
-                    returned_to_staff_count AS returnedToStaffCount,
-                    returned_to_staff_pct AS returnedToStaffPct,
-                    returned_to_business_count AS returnedToBusinessCount,
-                    returned_to_business_pct AS returnedToBusinessPct,
-                    new_clients_count AS newClientsCount,
-                    new_clients_pct AS newClientsPct,
-                    total_rebooked_count AS totalRebookedCount,
-                    total_rebooked_pct AS totalRebookedPct,
-                    new_clients_rebooked_count AS newClientsRebookedCount,
-                    new_clients_rebooked_pct AS newClientsRebookedPct,
-                    retention_m1_count AS retentionM1Count,
-                    retention_m1_pct AS retentionM1Pct,
-                    retention_m1_label AS retentionM1Label,
-                    retention_m2_count AS retentionM2Count,
-                    retention_m2_pct AS retentionM2Pct,
-                    retention_m2_label AS retentionM2Label,
-                    retention_m3_count AS retentionM3Count,
-                    retention_m3_pct AS retentionM3Pct,
-                    retention_m3_label AS retentionM3Label,
-                    synced_at AS syncedAt
-             FROM staff_retention_facts
-             WHERE team_id = ? AND period_start = ? AND period_end = ?`,
-          ).all(teamId, latest.startDate, latest.endDate) as RetentionRow[];
-        }
-      }
+      const hasData = rows.length > 0;
 
       // Group rows by location
       const locMap = new Map<string, { locationName: string; staff: RetentionRow[] }>();
@@ -2354,6 +2318,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
           ok: true,
           scope: { startDate, endDate },
           matchedWindow,
+          hasData,
           trailingMonthLabels,
           lastSyncedAt,
           locations,
