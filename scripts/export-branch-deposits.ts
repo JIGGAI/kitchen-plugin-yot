@@ -1,3 +1,26 @@
+// Nightly Branch deposit export.
+//
+// Produces /Users/hairmx/hmx-reports/branch-deposits-<date>.csv (the file
+// the operator uploads to branchapp.com) plus a diagnostics JSON. Triggered
+// every night at 21:00 ET by the OpenClaw cron job
+// `branch-deposit-export-nightly` (jobs.json id 028128b0-…); the
+// branch-deposit-watchdog at 22:00 ET reads our diagnostics to email RJ
+// about anything that needs human follow-up.
+//
+// Source of truth shape (post-cutover 2026-05-14):
+//   - YOT StaffCashoutReport for the target date → who got paid, how much
+//   - "CSV MASTER" tab on the Branch Daily Totals sheet → roster of staff
+//     known to Branch (staffId, first, last, location)
+//
+// We iterate YOT positives and look each up in CSV MASTER. A match emits
+// an export row with the YOT bank-to-bank amount minus any garnishment;
+// the transaction id is rebuilt in the format Branch has been receiving
+// (<LastName><StaffId><AmountInteger>12/30/1899). When YOT pays someone
+// who isn't on CSV MASTER, the watchdog appends a placeholder row to the
+// sheet and emails RJ.
+//
+// Per-day tab handling (the old `5/13/26` tab flow) is intentionally gone.
+
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
@@ -15,26 +38,16 @@ type Args = {
   outputDir: string;
 };
 
-type SheetMetadata = {
-  sheets?: Array<{
-    properties?: {
-      title?: string;
-    };
-  }>;
-};
-
 type SheetValuesResponse = {
   values?: string[][];
 };
 
-type BranchDailyRow = {
+type MasterRow = {
+  rowNumber: number;
   staffId: string;
   firstName: string;
   lastName: string;
-  type: 'Deposit';
-  transactionId: string;
   location: string;
-  sourceAmount: string;
 };
 
 type ExportRow = {
@@ -70,27 +83,35 @@ type GarnishmentPayoutRow = {
   date: string;
 };
 
+type FuzzyMatchedRow = {
+  csvMasterRowNumber: number;
+  csvMasterName: string;
+  reportName: string;
+  locationName: string | null;
+  matchKind: 'prefix' | 'typo';
+};
+
+type UnmatchedReportRow = {
+  staffName: string | null;
+  locationName: string | null;
+  bankToBankAmount: number;
+  // true when the YOT row's location appears in CSV MASTER (so this is
+  // likely a new hire at a Branch-served shop that needs to be added),
+  // false when the entire location is out of scope for Branch (e.g.
+  // Bethel Park, Clearwater — paid through another system).
+  inScope: boolean;
+};
+
 type MatchDiagnostics = {
   date: string;
-  branchSheetTab: string;
+  source: 'csv-master';
+  sourceLabel: string;
   generatedAt: string;
   reportRowCount: number;
-  branchRowCount: number;
+  masterRowCount: number;
   exportRowCount: number;
-  unmatchedBranchRows: BranchDailyRow[];
-  reportRowsWithPositiveAmountButNoBranchMatch: Array<{
-    staffName: string | null;
-    locationName: string | null;
-    bankToBankAmount: number;
-  }>;
-  skippedNonPositiveReportMatches: Array<{
-    staffId: string;
-    firstName: string;
-    lastName: string;
-    transactionId: string;
-    location: string;
-    amount: number | null;
-  }>;
+  reportRowsWithPositiveAmountButNoBranchMatch: UnmatchedReportRow[];
+  fuzzyMatchedRows: FuzzyMatchedRow[];
   garnishmentRuleCount: number;
   garnishmentAdjustedRowCount: number;
   garnishmentPayoutRows: GarnishmentPayoutRow[];
@@ -103,6 +124,7 @@ const DEFAULT_TEAM_ID = 'hmx-marketing-team';
 const DEFAULT_ORGANISATION_ID = 11082;
 const DEFAULT_OUTPUT_DIR = '/Users/hairmx/hmx-reports';
 const NEW_YORK_TZ = 'America/New_York';
+const CSV_MASTER_TAB = 'CSV MASTER';
 
 function parseArgs(argv: string[]): Args {
   const map = new Map<string, string>();
@@ -149,19 +171,6 @@ function todayIsoInTimezone(timeZone: string): string {
   return `${byType.year}-${byType.month}-${byType.day}`;
 }
 
-function isoToShortUs(dateIso: string): string {
-  const [year, month, day] = dateIso.split('-').map(Number);
-  return `${month}/${day}/${String(year).slice(-2)}`;
-}
-
-function gogJson(args: string[]): any {
-  const out = execFileSync('gog', [...args, '--account', DEFAULT_ACCOUNT, '--json', '--no-input'], {
-    encoding: 'utf8',
-    maxBuffer: 20 * 1024 * 1024,
-  });
-  return JSON.parse(out);
-}
-
 function gogJsonForAccount(account: string, args: string[]): any {
   const out = execFileSync('gog', [...args, '--account', account, '--json', '--no-input'], {
     encoding: 'utf8',
@@ -200,11 +209,45 @@ function firstToken(value: string): string {
   return normalizeText(value).split(' ').filter(Boolean)[0] || '';
 }
 
-function fuzzyFirstNameMatch(a: string, b: string): boolean {
+// Damerau-Levenshtein: counts substitution, insertion, deletion, AND
+// adjacent transposition each as 1 edit. Lets us recognise typos like
+// "Krisitn" ↔ "Kristin" (a single transposition) as a near-match without
+// being so loose that we collide unrelated names.
+function damerauLevenshtein(a: string, b: string): number {
+  if (a === b) return 0;
+  const m = a.length;
+  const n = b.length;
+  if (!m) return n;
+  if (!n) return m;
+  const d: number[][] = Array.from({ length: m + 1 }, () => new Array<number>(n + 1).fill(0));
+  for (let i = 0; i <= m; i++) d[i]![0] = i;
+  for (let j = 0; j <= n; j++) d[0]![j] = j;
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      d[i]![j] = Math.min(
+        d[i - 1]![j]! + 1,
+        d[i]![j - 1]! + 1,
+        d[i - 1]![j - 1]! + cost,
+      );
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) {
+        d[i]![j] = Math.min(d[i]![j]!, d[i - 2]![j - 2]! + 1);
+      }
+    }
+  }
+  return d[m]![n]!;
+}
+
+type FirstNameMatchKind = 'exact' | 'prefix' | 'typo' | 'none';
+
+function firstNameMatchKind(a: string, b: string): FirstNameMatchKind {
   const aa = firstToken(a);
   const bb = firstToken(b);
-  if (!aa || !bb) return false;
-  return aa === bb || aa.startsWith(bb) || bb.startsWith(aa);
+  if (!aa || !bb) return 'none';
+  if (aa === bb) return 'exact';
+  if (aa.startsWith(bb) || bb.startsWith(aa)) return 'prefix';
+  if (aa.length >= 4 && bb.length >= 4 && damerauLevenshtein(aa, bb) <= 1) return 'typo';
+  return 'none';
 }
 
 function formatCsvCell(value: string | number): string {
@@ -247,122 +290,88 @@ function toSheetValues(rows: GarnishmentPayoutRow[]): string[][] {
   ];
 }
 
-function parseSheetTabDateCandidates(title: string): string[] {
-  const clean = title.trim();
-  const sameMonthRange = clean.match(/^(\d{1,2})\/(\d{1,2})-(\d{1,2})\/(\d{2,4})$/)
-    || clean.match(/^(\d{1,2})\/(\d{1,2})-(\d{1,2})-(\d{2,4})$/);
-  if (sameMonthRange) {
-    const [, monthRaw, startDayRaw, endDayRaw, yearRaw] = sameMonthRange;
-    const month = Number(monthRaw);
-    const startDay = Number(startDayRaw);
-    const endDay = Number(endDayRaw);
-    const year = Number(yearRaw.length === 2 ? `20${yearRaw}` : yearRaw);
-    return rangeDates(year, month, startDay, year, month, endDay);
-  }
-
-  const crossMonthRange = clean.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})-(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
-  if (crossMonthRange) {
-    const [, startMonthRaw, startDayRaw, startYearRaw, endMonthRaw, endDayRaw, endYearRaw] = crossMonthRange;
-    const startYear = Number(startYearRaw.length === 2 ? `20${startYearRaw}` : startYearRaw);
-    const endYear = Number(endYearRaw.length === 2 ? `20${endYearRaw}` : endYearRaw);
-    return rangeDates(startYear, Number(startMonthRaw), Number(startDayRaw), endYear, Number(endMonthRaw), Number(endDayRaw));
-  }
-
-  const single = clean.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
-  if (single) {
-    const [, monthRaw, dayRaw, yearRaw] = single;
-    const year = Number(yearRaw.length === 2 ? `20${yearRaw}` : yearRaw);
-    return [isoDate(year, Number(monthRaw), Number(dayRaw))];
-  }
-
-  return [];
+// Branch's TRANSACTION ID convention, mirrored from the per-day tabs the
+// operator used to maintain by hand: lastName + staffId + integer amount
+// (truncated, not rounded — matches what operators typed historically)
+// + literal "12/30/1899" (Sheets' epoch placeholder).
+function buildTransactionId(lastName: string, staffId: string, amount: number): string {
+  return `${lastName}${staffId}${Math.floor(amount)}12/30/1899`;
 }
 
-function isoDate(year: number, month: number, day: number): string {
-  return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-}
-
-function rangeDates(startYear: number, startMonth: number, startDay: number, endYear: number, endMonth: number, endDay: number): string[] {
-  const result: string[] = [];
-  const cursor = new Date(Date.UTC(startYear, startMonth - 1, startDay));
-  const end = new Date(Date.UTC(endYear, endMonth - 1, endDay));
-  while (cursor <= end) {
-    result.push(isoDate(cursor.getUTCFullYear(), cursor.getUTCMonth() + 1, cursor.getUTCDate()));
-    cursor.setUTCDate(cursor.getUTCDate() + 1);
-  }
-  return result;
-}
-
-function resolveSheetTabForDate(sheetId: string, account: string, targetDateIso: string): string {
-  const metadata = gogJsonForAccount(account, ['sheets', 'metadata', sheetId]) as SheetMetadata;
-  const directLabel = isoToShortUs(targetDateIso);
-  for (const sheet of metadata.sheets || []) {
-    const title = sheet.properties?.title?.trim();
-    if (!title) continue;
-    if (title === directLabel) return title;
-    if (parseSheetTabDateCandidates(title).includes(targetDateIso)) return title;
-  }
-  throw new Error(`Could not find a Branch Daily Totals tab for ${targetDateIso}`);
-}
-
-function parseBranchDailyRows(values: string[][]): BranchDailyRow[] {
-  const rows: BranchDailyRow[] = [];
-  let currentHeaderLocation = '';
-  for (const row of values) {
-    const colA = String(row[0] || '').trim();
-    const colD = String(row[3] || '').trim();
-    if (!colA && !colD) continue;
-    if (colA === 'STAFF ID') {
-      currentHeaderLocation = String(row[6] || '').trim();
-      continue;
-    }
-    if (colD.toUpperCase() === 'TOTAL') continue;
-    if (!colA) continue;
-
-    rows.push({
-      staffId: colA,
-      firstName: String(row[1] || '').trim(),
-      lastName: String(row[2] || '').trim(),
-      type: 'Deposit',
-      sourceAmount: String(row[4] || '').trim(),
-      transactionId: String(row[5] || '').trim(),
-      location: String(row[9] || row[6] || currentHeaderLocation || '').trim(),
-    });
+function loadCsvMasterRows(sheetId: string, account: string): MasterRow[] {
+  const response = gogJsonForAccount(account, ['sheets', 'get', sheetId, `'${CSV_MASTER_TAB}'!A1:G500`]) as SheetValuesResponse;
+  const values = response.values || [];
+  const rows: MasterRow[] = [];
+  for (let i = 1; i < values.length; i++) {
+    const row = values[i] || [];
+    const staffId = String(row[0] || '').trim();
+    const firstName = String(row[1] || '').trim();
+    const lastName = String(row[2] || '').trim();
+    const location = String(row[6] || '').trim();
+    // Skip section header rows ("STAFF ID" in col A) and footer ("TOTAL")
+    // and rows with no identifying content.
+    if (staffId.toUpperCase() === 'STAFF ID') continue;
+    if (!staffId && !firstName && !lastName) continue;
+    if (lastName.toUpperCase() === 'TOTAL' || firstName.toUpperCase() === 'TOTAL') continue;
+    rows.push({ rowNumber: i + 1, staffId, firstName, lastName, location });
   }
   return rows;
 }
 
-function branchRowQuality(row: BranchDailyRow): number {
-  let score = 0;
-  if (row.sourceAmount) score += 50;
-  if (row.sourceAmount && row.transactionId.includes(row.sourceAmount)) score += 20;
-  if (row.transactionId) score += 10;
-  if (row.location) score += 5;
-  if (row.firstName && row.lastName) score += 2;
-  return score;
-}
-
-function dedupeBranchRows(rows: BranchDailyRow[]): BranchDailyRow[] {
-  const byKey = new Map<string, BranchDailyRow>();
+function buildMasterIndexes(rows: MasterRow[]) {
+  const byExactName = new Map<string, MasterRow[]>();
+  const byLastName = new Map<string, MasterRow[]>();
   for (const row of rows) {
-    const key = `${row.staffId}|${normalizeLocation(row.location)}`;
-    const current = byKey.get(key);
-    if (!current || branchRowQuality(row) > branchRowQuality(current)) {
-      byKey.set(key, row);
+    const fullName = normalizeText(`${row.firstName} ${row.lastName}`);
+    if (fullName) {
+      if (!byExactName.has(fullName)) byExactName.set(fullName, []);
+      byExactName.get(fullName)!.push(row);
+    }
+    const last = normalizeText(row.lastName);
+    if (last) {
+      if (!byLastName.has(last)) byLastName.set(last, []);
+      byLastName.get(last)!.push(row);
     }
   }
-
-  const deduped = [...byKey.values()];
-  const staffIdsWithExplicitAmounts = new Set(
-    deduped.filter((row) => row.sourceAmount).map((row) => row.staffId),
-  );
-
-  return deduped.filter((row) => !staffIdsWithExplicitAmounts.has(row.staffId) || Boolean(row.sourceAmount));
+  return { byExactName, byLastName };
 }
 
-function loadBranchDailyRows(sheetId: string, account: string, tabTitle: string): BranchDailyRow[] {
-  const response = gogJsonForAccount(account, ['sheets', 'get', sheetId, `'${tabTitle}'!A1:J1200`]) as SheetValuesResponse;
-  return dedupeBranchRows(parseBranchDailyRows(response.values || []));
+type MasterMatchResult = { row: MasterRow; kind: 'exact' | 'prefix' | 'typo' };
+
+function matchYotRowToMaster(yot: StaffCashoutRow, indexes: ReturnType<typeof buildMasterIndexes>): MasterMatchResult | null {
+  const yotParts = splitName(yot.staffName || '');
+  if (!yotParts.last) return null;
+  const yotLoc = normalizeLocation(yot.locationName);
+
+  const tiebreak = (a: MasterRow, b: MasterRow) => {
+    const aLoc = normalizeLocation(a.location) === yotLoc ? 1 : 0;
+    const bLoc = normalizeLocation(b.location) === yotLoc ? 1 : 0;
+    if (aLoc !== bLoc) return bLoc - aLoc;
+    return 0;
+  };
+
+  const exactKey = normalizeText(yot.staffName || '');
+  const exactHits = indexes.byExactName.get(exactKey) || [];
+  if (exactHits.length === 1) return { row: exactHits[0]!, kind: 'exact' };
+  if (exactHits.length > 1) {
+    const row = [...exactHits].sort(tiebreak)[0]!;
+    return { row, kind: 'exact' };
+  }
+
+  const lastHits = indexes.byLastName.get(yotParts.last) || [];
+  const ranked = lastHits
+    .map((candidate) => ({ candidate, kind: firstNameMatchKind(yotParts.first, splitName(`${candidate.firstName} ${candidate.lastName}`).first) }))
+    .filter((entry) => entry.kind !== 'none');
+  if (!ranked.length) return null;
+  const order = { exact: 0, prefix: 1, typo: 2 } as const;
+  ranked.sort((a, b) => {
+    const ak = order[a.kind as 'exact' | 'prefix' | 'typo'];
+    const bk = order[b.kind as 'exact' | 'prefix' | 'typo'];
+    if (ak !== bk) return ak - bk;
+    return tiebreak(a.candidate, b.candidate);
+  });
+  const best = ranked[0]!;
+  return { row: best.candidate, kind: best.kind as 'exact' | 'prefix' | 'typo' };
 }
 
 function parsePercent(value: string | null | undefined): number | null {
@@ -418,55 +427,6 @@ function rewriteGarnishmentPayoutSheet(sheetId: string, account: string, rows: G
   });
 }
 
-function buildReportIndexes(rows: StaffCashoutRow[]) {
-  const byExactName = new Map<string, StaffCashoutRow[]>();
-  const byLastName = new Map<string, StaffCashoutRow[]>();
-
-  for (const row of rows) {
-    const name = normalizeText(row.staffName);
-    if (!name) continue;
-    if (!byExactName.has(name)) byExactName.set(name, []);
-    byExactName.get(name)!.push(row);
-
-    const split = splitName(row.staffName || '');
-    if (split.last) {
-      if (!byLastName.has(split.last)) byLastName.set(split.last, []);
-      byLastName.get(split.last)!.push(row);
-    }
-  }
-
-  return { byExactName, byLastName };
-}
-
-function scoreReportCandidate(branch: BranchDailyRow, report: StaffCashoutRow): number {
-  let score = 0;
-  const branchName = normalizeText(`${branch.firstName} ${branch.lastName}`);
-  const reportName = normalizeText(report.staffName);
-  if (branchName === reportName) score += 100;
-
-  const branchParts = splitName(`${branch.firstName} ${branch.lastName}`);
-  const reportParts = splitName(report.staffName || '');
-  if (branchParts.last && branchParts.last === reportParts.last) score += 20;
-  if (fuzzyFirstNameMatch(branchParts.first, reportParts.first)) score += 10;
-  if (normalizeLocation(branch.location) && normalizeLocation(branch.location) === normalizeLocation(report.locationName)) score += 5;
-  return score;
-}
-
-function matchBranchRowToReport(branch: BranchDailyRow, rows: StaffCashoutRow[], indexes: ReturnType<typeof buildReportIndexes>): StaffCashoutRow | null {
-  const exactKey = normalizeText(`${branch.firstName} ${branch.lastName}`);
-  const exactHits = indexes.byExactName.get(exactKey) || [];
-  if (exactHits.length === 1) return exactHits[0]!;
-  if (exactHits.length > 1) {
-    return [...exactHits].sort((a, b) => scoreReportCandidate(branch, b) - scoreReportCandidate(branch, a))[0] || null;
-  }
-
-  const branchParts = splitName(`${branch.firstName} ${branch.lastName}`);
-  const lastHits = indexes.byLastName.get(branchParts.last) || [];
-  const fuzzyHits = lastHits.filter((candidate) => fuzzyFirstNameMatch(branchParts.first, splitName(candidate.staffName || '').first));
-  if (!fuzzyHits.length) return null;
-  return [...fuzzyHits].sort((a, b) => scoreReportCandidate(branch, b) - scoreReportCandidate(branch, a))[0] || null;
-}
-
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   mkdirSync(args.outputDir, { recursive: true });
@@ -477,88 +437,85 @@ async function main() {
     endDateIso: args.date,
     organisationId: args.organisationId,
   });
-
-  const tabTitle = resolveSheetTabForDate(args.sheetId, args.account, args.date);
-  const branchRows = loadBranchDailyRows(args.sheetId, args.account, tabTitle);
+  const masterRows = loadCsvMasterRows(args.sheetId, args.account);
   const garnishmentRules = loadGarnishmentRules(args.garnishmentsSheetId, args.account);
-  const reportIndexes = buildReportIndexes(report.rows);
-  const matchedReportRows = new Set<StaffCashoutRow>();
+  const masterIndexes = buildMasterIndexes(masterRows);
+  // CSV MASTER is the authoritative list of which locations Branch handles
+  // — staff at any other location are paid through some other system and
+  // we deliberately skip them. The watchdog uses inScope to decide which
+  // unmatched YOT rows deserve an alert (likely new hire at a covered
+  // shop) versus a silent skip (out-of-scope shop entirely).
+  const supportedLocations = new Set<string>();
+  for (const row of masterRows) {
+    const norm = normalizeLocation(row.location);
+    if (norm) supportedLocations.add(norm);
+  }
 
   const exportRows: ExportRow[] = [];
-  const unmatchedBranchRows: BranchDailyRow[] = [];
-  const skippedNonPositiveReportMatches: MatchDiagnostics['skippedNonPositiveReportMatches'] = [];
+  const fuzzyMatchedRows: FuzzyMatchedRow[] = [];
+  const unmatchedReport: UnmatchedReportRow[] = [];
   const garnishmentPayoutRows: GarnishmentPayoutRow[] = [];
 
-  for (const branchRow of branchRows) {
-    const match = matchBranchRowToReport(branchRow, report.rows, reportIndexes);
-    if (!match) {
-      unmatchedBranchRows.push(branchRow);
-      continue;
-    }
-    matchedReportRows.add(match);
+  for (const yotRow of report.rows) {
+    const rawAmount = Number(yotRow.bankToBankAmount || 0);
+    if (rawAmount <= 0) continue;
 
-    const amount = match.bankToBankAmount;
-    if (amount == null || amount <= 0) {
-      skippedNonPositiveReportMatches.push({
-        staffId: branchRow.staffId,
-        firstName: branchRow.firstName,
-        lastName: branchRow.lastName,
-        transactionId: branchRow.transactionId,
-        location: branchRow.location,
-        amount,
+    const match = matchYotRowToMaster(yotRow, masterIndexes);
+    if (!match) {
+      unmatchedReport.push({
+        staffName: yotRow.staffName,
+        locationName: yotRow.locationName,
+        bankToBankAmount: rawAmount,
+        inScope: supportedLocations.has(normalizeLocation(yotRow.locationName)),
       });
       continue;
     }
+    if (match.kind !== 'exact') {
+      fuzzyMatchedRows.push({
+        csvMasterRowNumber: match.row.rowNumber,
+        csvMasterName: `${match.row.firstName} ${match.row.lastName}`.trim(),
+        reportName: yotRow.staffName || '',
+        locationName: yotRow.locationName,
+        matchKind: match.kind,
+      });
+    }
 
-    const garnishmentRule = garnishmentRules.get(branchRow.staffId) || null;
+    const garnishmentRule = garnishmentRules.get(match.row.staffId) || null;
     const garnishmentPercent = garnishmentRule?.percent ?? null;
-    const garnishmentAmount = garnishmentPercent ? Number((amount * garnishmentPercent).toFixed(2)) : 0;
-    const adjustedAmount = Number((amount - garnishmentAmount).toFixed(2));
+    const garnishmentAmount = garnishmentPercent ? Number((rawAmount * garnishmentPercent).toFixed(2)) : 0;
+    const adjustedAmount = Number((rawAmount - garnishmentAmount).toFixed(2));
+    const transactionId = buildTransactionId(match.row.lastName, match.row.staffId, adjustedAmount);
 
     exportRows.push({
-      staffId: branchRow.staffId,
-      firstName: branchRow.firstName,
-      lastName: branchRow.lastName,
+      staffId: match.row.staffId,
+      firstName: match.row.firstName,
+      lastName: match.row.lastName,
       type: 'Deposit',
       amount: adjustedAmount,
-      originalAmount: amount,
+      originalAmount: rawAmount,
       garnishmentPercent,
       garnishmentAmount,
-      transactionId: branchRow.transactionId,
-      location: branchRow.location,
-      matchedReportName: match.staffName || '',
-      matchedReportLocation: match.locationName,
+      transactionId,
+      location: yotRow.locationName || match.row.location || '',
+      matchedReportName: yotRow.staffName || '',
+      matchedReportLocation: yotRow.locationName,
     });
 
     if (garnishmentAmount > 0) {
       garnishmentPayoutRows.push({
-        staffId: branchRow.staffId,
-        firstName: branchRow.firstName,
-        lastName: branchRow.lastName,
+        staffId: match.row.staffId,
+        firstName: match.row.firstName,
+        lastName: match.row.lastName,
         type: 'GARNISHMENT',
         amount: garnishmentAmount,
-        transactionId: branchRow.transactionId,
-        location: branchRow.location,
+        transactionId: buildTransactionId(match.row.lastName, match.row.staffId, garnishmentAmount),
+        location: yotRow.locationName || match.row.location || '',
         date: args.date,
       });
     }
   }
 
   exportRows.sort((a, b) => a.location.localeCompare(b.location) || a.lastName.localeCompare(b.lastName) || a.firstName.localeCompare(b.firstName));
-
-  const coveredLocations = new Set(branchRows.map((row) => normalizeLocation(row.location)).filter(Boolean));
-  const unmatchedPositiveReportRows = report.rows
-    .filter((row) => (row.bankToBankAmount || 0) > 0)
-    .filter((row) => {
-      const location = normalizeLocation(row.locationName);
-      return !coveredLocations.size || coveredLocations.has(location);
-    })
-    .filter((row) => !matchedReportRows.has(row))
-    .map((row) => ({
-      staffName: row.staffName,
-      locationName: row.locationName,
-      bankToBankAmount: row.bankToBankAmount || 0,
-    }));
 
   const existingGarnishmentPayoutRows = loadExistingGarnishmentPayoutRows(args.garnishmentsSheetId, args.account)
     .filter((row) => row.date !== args.date);
@@ -572,29 +529,35 @@ async function main() {
   writeFileSync(csvPath, toCsv(exportRows), 'utf8');
   writeFileSync(diagnosticsPath, JSON.stringify({
     date: args.date,
-    branchSheetTab: tabTitle,
+    source: 'csv-master',
+    sourceLabel: CSV_MASTER_TAB,
     generatedAt: new Date().toISOString(),
     reportRowCount: report.rows.length,
-    branchRowCount: branchRows.length,
+    masterRowCount: masterRows.length,
     exportRowCount: exportRows.length,
-    unmatchedBranchRows,
-    reportRowsWithPositiveAmountButNoBranchMatch: unmatchedPositiveReportRows,
-    skippedNonPositiveReportMatches,
+    reportRowsWithPositiveAmountButNoBranchMatch: unmatchedReport,
+    fuzzyMatchedRows,
     garnishmentRuleCount: garnishmentRules.size,
     garnishmentAdjustedRowCount: garnishmentPayoutRows.length,
     garnishmentPayoutRows,
   } satisfies MatchDiagnostics, null, 2), 'utf8');
 
+  const unmatchedInScope = unmatchedReport.filter((r) => r.inScope).length;
+  const unmatchedOutOfScope = unmatchedReport.length - unmatchedInScope;
   console.log(JSON.stringify({
     ok: true,
     date: args.date,
-    branchSheetTab: tabTitle,
+    source: 'csv-master',
+    sourceLabel: CSV_MASTER_TAB,
     csvPath,
     diagnosticsPath,
     exportRowCount: exportRows.length,
-    unmatchedBranchRowCount: unmatchedBranchRows.length,
-    unmatchedPositiveReportRowCount: unmatchedPositiveReportRows.length,
-    skippedNonPositiveReportMatchCount: skippedNonPositiveReportMatches.length,
+    masterRowCount: masterRows.length,
+    supportedLocationCount: supportedLocations.size,
+    unmatchedPositiveReportRowCount: unmatchedReport.length,
+    unmatchedInScopeCount: unmatchedInScope,
+    unmatchedOutOfScopeCount: unmatchedOutOfScope,
+    fuzzyMatchedRowCount: fuzzyMatchedRows.length,
     garnishmentRuleCount: garnishmentRules.size,
     garnishmentAdjustedRowCount: garnishmentPayoutRows.length,
   }, null, 2));
