@@ -3522,16 +3522,28 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       if (r.slot_payload) {
         try {
           const parsed = JSON.parse(r.slot_payload) as {
-            slots?: Array<{ light?: boolean; scheduledStylists?: number }>;
+            slots?: Array<{ light?: boolean; scheduledStylists?: number; startsAt?: string; endsAt?: string }>;
             requiredStylists?: number;
             averageDailyAppointments?: number;
           };
+          let lightMinutes = 0;
           for (const s of parsed.slots ?? []) {
-            if (s.light) lightHours += 1;
             if (typeof s.scheduledStylists === 'number' && s.scheduledStylists > peakStylists) {
               peakStylists = s.scheduledStylists;
             }
+            if (!s.light) continue;
+            // Slot granularity isn't fixed across the cache: a 60-min sync
+            // and a 30-min sync can both write slots for different days at
+            // the same location. Count actual minutes per slot, then convert
+            // to hours so "lightHours" really means hours, not slot count.
+            const a = s.startsAt ? Date.parse(s.startsAt) : NaN;
+            const b = s.endsAt ? Date.parse(s.endsAt) : NaN;
+            const minutes = Number.isFinite(a) && Number.isFinite(b) && b > a
+              ? Math.round((b - a) / 60000)
+              : 60; // sensible default for legacy slots missing timestamps
+            lightMinutes += minutes;
           }
+          lightHours = Math.round((lightMinutes / 60) * 10) / 10;
           if (typeof parsed.requiredStylists === 'number') cachedRequired = parsed.requiredStylists;
           if (typeof parsed.averageDailyAppointments === 'number') {
             cachedAverageDailyAppts = parsed.averageDailyAppointments;
