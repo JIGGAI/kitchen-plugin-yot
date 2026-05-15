@@ -38,9 +38,17 @@ type Args = {
   outputDir: string;
   // When true, the CSV + diagnostics still land on disk but no Google
   // Sheets writes happen (GARNISHMENTS PAYOUTS rewrite, LOAN PAYMENTS
-  // rewrite, LOANS cell updates are all skipped). Useful for verifying
-  // a date's behavior against the live sheet state without touching it.
+  // rewrite, LOANS cell updates are all skipped) AND the disbursements
+  // email is NOT sent. Useful for verifying a date's behavior against
+  // the live sheet state without touching it or pinging Miranda.
   dryRun: boolean;
+  // Optional override for the disbursements email To: address. Defaults
+  // to Miranda; testing can redirect to e.g. rjdjohnston@gmail.com.
+  testRecipient: string | null;
+  // When true, the disbursements CSV is still written to disk but no
+  // email is sent (regardless of dryRun). Useful when you want to inspect
+  // the file but not bother Miranda.
+  skipEmail: boolean;
 };
 
 type SheetValuesResponse = {
@@ -174,6 +182,19 @@ const DEFAULT_ORGANISATION_ID = 11082;
 const DEFAULT_OUTPUT_DIR = '/Users/hairmx/hmx-reports';
 const NEW_YORK_TZ = 'America/New_York';
 const CSV_MASTER_TAB = 'CSV MASTER';
+// The Branch DISPURSEMENTS sheet — separate spreadsheet from the Branch
+// Daily Totals one. CSV BLANK MASTER tab carries the column layout for
+// Miranda's Branch processing; we only use its header for shape (the tab
+// has no data rows). Trailing space in the tab name is intentional — that's
+// how it's named on the sheet.
+const DISPURSEMENTS_SHEET_ID = '1Z9Ey0oaKAH1J4gy0JlL-m3HjLvy4PKbBYFno3dYjbH8';
+const DISPURSEMENTS_TEMPLATE_TAB = 'CSV BLANK MASTER ';
+const DEFAULT_DISPURSEMENTS_RECIPIENT = 'Miranda.hmx.corp@hairmx.net';
+// When the disbursements email to Miranda (or whoever the recipient is set
+// to) fails, we send a fallback alert to this address so the failure
+// doesn't sit silently in stdout. RJ's personal Gmail keeps the alert
+// path independent of the corporate inbox we just failed to reach.
+const DISPURSEMENTS_FAILURE_ALERT_TO = 'rjdjohnston@gmail.com';
 
 function parseArgs(argv: string[]): Args {
   const map = new Map<string, string>();
@@ -201,6 +222,8 @@ function parseArgs(argv: string[]): Args {
     account: map.get('account') || DEFAULT_ACCOUNT,
     outputDir: expandHome(map.get('outputDir') || DEFAULT_OUTPUT_DIR),
     dryRun: (map.get('dry-run') ?? 'false') !== 'false',
+    testRecipient: map.get('test-recipient') || null,
+    skipEmail: (map.get('skip-email') ?? 'false') !== 'false',
   };
 }
 
@@ -322,6 +345,97 @@ function toCsv(rows: ExportRow[]): string {
     ].map(formatCsvCell).join(','));
   }
   return `${lines.join('\n')}\n`;
+}
+
+// Builds the secondary CSV emailed to Miranda for Branch processing. Shape
+// matches the CSV BLANK MASTER tab on the Branch DISPURSEMENTS sheet:
+//   ID, First Name, Last Name, Type, Amount, Transaction ID, Location,
+//   Disbursement Date (YYYY-MM-DD), Description
+// First seven columns are sourced from our export rows (which already have
+// garnishment + loan withholdings applied); date is args.date; description
+// is left blank for Miranda to annotate as needed.
+function toDisbursementsCsv(rows: ExportRow[], date: string): string {
+  const lines = [
+    ['ID', 'First Name', 'Last Name', 'Type', 'Amount', 'Transaction ID', 'Location', 'Disbursement Date (YYYY-MM-DD)', 'Description'].join(','),
+  ];
+  for (const row of rows) {
+    lines.push([
+      row.staffId,
+      row.firstName,
+      row.lastName,
+      row.type,
+      Number.isInteger(row.amount) ? String(row.amount) : row.amount.toFixed(2),
+      row.transactionId,
+      row.location,
+      date,
+      '',
+    ].map(formatCsvCell).join(','));
+  }
+  return `${lines.join('\n')}\n`;
+}
+
+function emailDisbursementsCsv(filePath: string, account: string, recipient: string, subject: string, body: string): void {
+  execFileSync('gog', [
+    'gmail', 'send',
+    '--account', account,
+    '--from', account,
+    '--to', recipient,
+    '--subject', subject,
+    '--body', body,
+    '--attach', filePath,
+    '--no-input',
+  ], { encoding: 'utf8', maxBuffer: 20 * 1024 * 1024 });
+}
+
+// Fallback path: when the disbursements email to the configured recipient
+// fails (auth expired, attachment too big, address bounces, etc.), we
+// notify RJ directly so the failure doesn't get buried in cron stdout.
+// Returns whether the fallback itself delivered — both `false` outcomes
+// (e.g., gog auth entirely broken) just end up in stderr.
+function sendDisbursementsFailureAlert(
+  account: string,
+  intendedRecipient: string,
+  date: string,
+  disbursementsPath: string,
+  errorMessage: string,
+): boolean {
+  if (intendedRecipient === DISPURSEMENTS_FAILURE_ALERT_TO) {
+    // Don't alert RJ that the email to RJ failed — they'll just see stdout.
+    return false;
+  }
+  const subject = `[HMX] Disbursements email to ${intendedRecipient} FAILED for ${date}`;
+  const body = `The nightly disbursements email failed to deliver to ${intendedRecipient}.
+
+Date: ${date}
+Error: ${errorMessage}
+
+The CSV is still on disk:
+  ${disbursementsPath}
+
+To retry by hand:
+  /opt/homebrew/bin/gog gmail send \\
+    --account ${account} --from ${account} --to ${intendedRecipient} \\
+    --subject "HMX Disbursements ${date}" \\
+    --body "Attached." --attach ${disbursementsPath} --no-input
+
+To re-run the whole export (idempotent on sheet writes):
+  cd ~/kitchen-plugin-yot && npx tsx scripts/export-branch-deposits.ts --date=${date}
+`;
+  try {
+    execFileSync('gog', [
+      'gmail', 'send',
+      '--account', account,
+      '--from', account,
+      '--to', DISPURSEMENTS_FAILURE_ALERT_TO,
+      '--subject', subject,
+      '--body', body,
+      '--no-input',
+    ], { encoding: 'utf8', maxBuffer: 20 * 1024 * 1024 });
+    return true;
+  } catch (alertErr: any) {
+    console.error(`fallback alert email to ${DISPURSEMENTS_FAILURE_ALERT_TO} also failed: ${alertErr?.message || alertErr}`);
+    return false;
+  }
 }
 
 function toSheetValues(rows: GarnishmentPayoutRow[]): string[][] {
@@ -812,8 +926,10 @@ async function main() {
 
   const csvPath = path.join(args.outputDir, `branch-deposits-${args.date}.csv`);
   const diagnosticsPath = path.join(args.outputDir, `branch-deposits-${args.date}.diagnostics.json`);
+  const disbursementsPath = path.join(args.outputDir, `disbursements-${args.date}.csv`);
 
   writeFileSync(csvPath, toCsv(exportRows), 'utf8');
+  writeFileSync(disbursementsPath, toDisbursementsCsv(exportRows, args.date), 'utf8');
   writeFileSync(diagnosticsPath, JSON.stringify({
     date: args.date,
     source: 'csv-master',
@@ -835,6 +951,41 @@ async function main() {
 
   const unmatchedInScope = unmatchedReport.filter((r) => r.inScope).length;
   const unmatchedOutOfScope = unmatchedReport.length - unmatchedInScope;
+
+  // Email the disbursements CSV to Miranda (or wherever --test-recipient
+  // redirects). Suppressed on dry-run or --skip-email. Failure is logged but
+  // doesn't fail the whole export — the CSV is still on disk and the
+  // watchdog can surface any issues.
+  const recipient = args.testRecipient || DEFAULT_DISPURSEMENTS_RECIPIENT;
+  const totalAmount = exportRows.reduce((s, r) => s + r.amount, 0);
+  const subject = `HMX Disbursements ${args.date} — ${exportRows.length} deposits, $${totalAmount.toFixed(2)}`;
+  const body = `Disbursements file for ${args.date} is attached.
+
+  Deposits: ${exportRows.length}
+  Total: $${totalAmount.toFixed(2)}
+  Garnishments applied: ${garnishmentPayoutRows.length}
+  Loan withholdings: ${loanPaymentsThisRun.length}${loansPaidOffToday.length ? `
+  Loans paid off today: ${loansPaidOffToday.length}` : ''}
+
+Sourced from CSV MASTER on the Branch Daily Totals sheet, with garnishment + loan deductions already applied. Auto-generated by the nightly Branch deposit export.`;
+
+  let emailStatus: 'sent' | 'skipped' | 'failed' = 'skipped';
+  let failureAlertStatus: 'sent' | 'skipped' | 'failed' | 'not-needed' = 'not-needed';
+  if (args.dryRun || args.skipEmail) {
+    console.error(`[${args.dryRun ? 'dry-run' : 'skip-email'}] would email ${disbursementsPath} to ${recipient}: ${subject}`);
+  } else {
+    try {
+      emailDisbursementsCsv(disbursementsPath, args.account, recipient, subject, body);
+      emailStatus = 'sent';
+    } catch (err: any) {
+      emailStatus = 'failed';
+      const errMsg = err?.message || String(err);
+      console.error(`disbursements email to ${recipient} failed: ${errMsg}`);
+      const delivered = sendDisbursementsFailureAlert(args.account, recipient, args.date, disbursementsPath, errMsg);
+      failureAlertStatus = delivered ? 'sent' : (recipient === DISPURSEMENTS_FAILURE_ALERT_TO ? 'skipped' : 'failed');
+    }
+  }
+
   console.log(JSON.stringify({
     ok: true,
     date: args.date,
@@ -842,6 +993,10 @@ async function main() {
     sourceLabel: CSV_MASTER_TAB,
     csvPath,
     diagnosticsPath,
+    disbursementsPath,
+    disbursementsRecipient: recipient,
+    disbursementsEmailStatus: emailStatus,
+    disbursementsFailureAlertStatus: failureAlertStatus,
     exportRowCount: exportRows.length,
     masterRowCount: masterRows.length,
     supportedLocationCount: supportedLocations.size,
