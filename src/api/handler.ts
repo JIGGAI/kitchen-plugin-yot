@@ -3522,32 +3522,38 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       if (r.slot_payload) {
         try {
           const parsed = JSON.parse(r.slot_payload) as {
-            slots?: Array<{ light?: boolean; scheduledStylists?: number; startsAt?: string; endsAt?: string }>;
+            slots?: Array<{ light?: boolean; scheduledStylists?: number; requiredStylists?: number; startsAt?: string; endsAt?: string }>;
             requiredStylists?: number;
             averageDailyAppointments?: number;
           };
-          let lightMinutes = 0;
-          for (const s of parsed.slots ?? []) {
-            if (typeof s.scheduledStylists === 'number' && s.scheduledStylists > peakStylists) {
-              peakStylists = s.scheduledStylists;
-            }
-            if (!s.light) continue;
-            // Slot granularity isn't fixed across the cache: a 60-min sync
-            // and a 30-min sync can both write slots for different days at
-            // the same location. Count actual minutes per slot, then convert
-            // to hours so "lightHours" really means hours, not slot count.
-            const a = s.startsAt ? Date.parse(s.startsAt) : NaN;
-            const b = s.endsAt ? Date.parse(s.endsAt) : NaN;
-            const minutes = Number.isFinite(a) && Number.isFinite(b) && b > a
-              ? Math.round((b - a) / 60000)
-              : 60; // sensible default for legacy slots missing timestamps
-            lightMinutes += minutes;
-          }
-          lightHours = Math.round((lightMinutes / 60) * 10) / 10;
           if (typeof parsed.requiredStylists === 'number') cachedRequired = parsed.requiredStylists;
           if (typeof parsed.averageDailyAppointments === 'number') {
             cachedAverageDailyAppts = parsed.averageDailyAppointments;
           }
+          // PERSON-HOURS missing, not slot count. For each short slot we
+          // add `(required − scheduled) × slot_minutes / 60`. A 1-hour
+          // slot needing 5 with 3 on contributes 2 hours; a 30-min slot
+          // needing 5 with 3 on contributes 1 hour. This is what an
+          // operator means when they ask "how much staffing did we miss?"
+          let personMinutesShort = 0;
+          const dayRequired = parsed.requiredStylists ?? 0;
+          for (const s of parsed.slots ?? []) {
+            const scheduled = typeof s.scheduledStylists === 'number' ? s.scheduledStylists : 0;
+            if (scheduled > peakStylists) peakStylists = scheduled;
+            // Prefer the slot's own requiredStylists if the slot payload
+            // carries it (future-proofing for variable-by-hour staffing
+            // levels), else fall back to the day-level required.
+            const required = typeof s.requiredStylists === 'number' ? s.requiredStylists : dayRequired;
+            const deficit = Math.max(0, required - scheduled);
+            if (deficit === 0) continue;
+            const a = s.startsAt ? Date.parse(s.startsAt) : NaN;
+            const b = s.endsAt ? Date.parse(s.endsAt) : NaN;
+            const minutes = Number.isFinite(a) && Number.isFinite(b) && b > a
+              ? Math.round((b - a) / 60000)
+              : 60; // legacy slot fallback
+            personMinutesShort += deficit * minutes;
+          }
+          lightHours = Math.round((personMinutesShort / 60) * 10) / 10;
         } catch { /* leave defaults */ }
       }
       let rosteredStylists = 0;
