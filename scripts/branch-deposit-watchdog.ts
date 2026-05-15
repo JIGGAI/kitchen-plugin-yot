@@ -15,9 +15,11 @@
 //   3. YOT paid someone whose location IS represented on CSV MASTER but
 //        whose name isn't there at all (`reportRowsWithPositiveAmountBut
 //        NoBranchMatch` with `inScope: true`)
-//        → likely a new hire at a Branch-served shop. Auto-append a
-//        placeholder row to CSV MASTER (blank STAFF ID + AMOUNT, the
-//        operator fills it in) and email RJ what was added.
+//        → likely a new hire at a Branch-served shop. RJ pays them
+//        manually for today and adds them to CSV MASTER so tomorrow's
+//        export covers them. (We deliberately do NOT auto-append a
+//        placeholder — a blank STAFF ID row would escape into the next
+//        day's CSV upload to Branch as a degenerate deposit.)
 //
 // YOT-paid staff at locations NOT represented in CSV MASTER (Bethel
 // Park, Clearwater, etc.) are intentionally ignored — those locations
@@ -29,8 +31,6 @@ import path from 'node:path';
 
 const NEW_YORK_TZ = 'America/New_York';
 const EXPORT_DIR = '/Users/hairmx/hmx-reports';
-const BRANCH_SHEET_ID = '1jIFWOMmvMVbGULUbDpEqV2e6CsXy_DzhBrCorV9H-EA';
-const CSV_MASTER_TAB = 'CSV MASTER';
 const FROM_ACCOUNT = 'govna.assistant@gmail.com';
 const TO_ADDR = 'rjdjohnston@gmail.com';
 const LOG_PATH = `${process.env.HOME || ''}/.openclaw/logs/cron/branch-deposit-watchdog.log`;
@@ -38,7 +38,6 @@ const LOG_PATH = `${process.env.HOME || ''}/.openclaw/logs/cron/branch-deposit-w
 type Args = {
   targetDate: string;
   dryRun: boolean;
-  skipMasterAppend: boolean;
 };
 
 function parseArgs(argv: string[]): Args {
@@ -52,7 +51,6 @@ function parseArgs(argv: string[]): Args {
   return {
     targetDate: map.get('target-date') || todayInNyTz(),
     dryRun: (map.get('dry-run') ?? 'false') !== 'false',
-    skipMasterAppend: (map.get('skip-master-append') ?? 'false') !== 'false',
   };
 }
 
@@ -66,38 +64,6 @@ function log(line: string) {
     appendFileSync(LOG_PATH, `[${new Date().toISOString()}] ${line}\n`, 'utf8');
   } catch { /* best effort */ }
   console.log(line);
-}
-
-function splitName(fullName: string): { first: string; last: string } {
-  const normalized = String(fullName || '').normalize('NFKD').replace(/[’']/g, '').replace(/\s+/g, ' ').trim();
-  const parts = normalized.split(' ').filter(Boolean);
-  if (!parts.length) return { first: '', last: '' };
-  if (parts.length === 1) return { first: '', last: parts[0]! };
-  return { first: parts.slice(0, -1).join(' '), last: parts[parts.length - 1]! };
-}
-
-function titleCase(word: string): string {
-  return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
-}
-
-function appendPlaceholderToCsvMaster(staffName: string, locationName: string | null, dryRun: boolean): string[] {
-  const parts = splitName(staffName);
-  const firstName = parts.first.split(' ').map(titleCase).join(' ');
-  const lastName = titleCase(parts.last);
-  // Match the existing CSV MASTER row shape (A-G): staffId/amount/txid blank
-  // so the operator knows there's work to do (fill in the Branch STAFF ID
-  // before tomorrow's export can pay them).
-  const row = ['', firstName, lastName, 'Deposit', '', '', locationName || ''];
-  if (!dryRun) {
-    execFileSync('gog', [
-      'sheets', 'append', BRANCH_SHEET_ID, `'${CSV_MASTER_TAB}'!A:G`,
-      '--values-json', JSON.stringify([row]),
-      '--input', 'USER_ENTERED',
-      '--account', FROM_ACCOUNT,
-      '--no-input',
-    ], { encoding: 'utf8', maxBuffer: 20 * 1024 * 1024 });
-  }
-  return row;
 }
 
 function sendEmail(subject: string, body: string, dryRun: boolean) {
@@ -143,7 +109,7 @@ type Diag = {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  log(`watchdog start target=${args.targetDate} dryRun=${args.dryRun} skipMasterAppend=${args.skipMasterAppend}`);
+  log(`watchdog start target=${args.targetDate} dryRun=${args.dryRun}`);
 
   const csvPath = path.join(EXPORT_DIR, `branch-deposits-${args.targetDate}.csv`);
   const diagPath = path.join(EXPORT_DIR, `branch-deposits-${args.targetDate}.diagnostics.json`);
@@ -193,19 +159,9 @@ Watchdog log: ${LOG_PATH}`,
   }
 
   if (inScopeUnmatched.length) {
-    summaryBits.push(`${inScopeUnmatched.length} new staff added to CSV MASTER`);
-    const addedRows: Array<{ yotName: string; location: string | null; amount: number; row: string[] }> = [];
-    for (const r of inScopeUnmatched) {
-      if (args.skipMasterAppend) {
-        addedRows.push({ yotName: r.staffName || '', location: r.locationName, amount: r.bankToBankAmount, row: [] });
-      } else {
-        const row = appendPlaceholderToCsvMaster(r.staffName || '', r.locationName, args.dryRun);
-        addedRows.push({ yotName: r.staffName || '', location: r.locationName, amount: r.bankToBankAmount, row });
-      }
-    }
-    const verb = args.skipMasterAppend ? 'would-be added' : (args.dryRun ? 'DRY-RUN would add' : 'auto-added');
-    const lines = addedRows.map((r) => `- ${r.yotName} @ ${r.location || '?'} ($${r.amount}) — ${verb} placeholder row to CSV MASTER (blank STAFF ID + AMOUNT, TYPE=Deposit). Please fill in the Branch STAFF ID so tomorrow's export can pay them.`);
-    sections.push(`New staff at Branch-supported locations (need a Branch STAFF ID):\n${lines.join('\n')}`);
+    summaryBits.push(`${inScopeUnmatched.length} need manual payout`);
+    const lines = inScopeUnmatched.map((r) => `- ${r.staffName || '?'} @ ${r.locationName || '?'} earned $${r.bankToBankAmount} today (YOT bank-to-bank). They aren't on CSV MASTER, so they were not in tonight's deposit CSV. Action: pay them manually for today's amount, then add them to CSV MASTER (with their Branch STAFF ID) so tomorrow's export covers them.`);
+    sections.push(`Missing from CSV MASTER (manual payout for today):\n${lines.join('\n')}`);
   }
 
   if (!sections.length) {
