@@ -3603,6 +3603,21 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       ...cacheByLocDate.keys(),
     ]);
 
+    // YOT occasionally ships duplicate location records that differ only in
+    // capitalization (e.g. "Treaty Oaks St. Aug. Fl." (active=0) vs
+    // "Treaty Oaks St. Aug. FL." (active=1)). The inactive duplicate has
+    // stale coverage cache rows from older syncs, so it'd otherwise appear
+    // as a blank/garbage row on the dashboard. Drop locations flagged
+    // inactive on the YOT side.
+    const activeLocations = new Set(
+      sqlite.prepare(
+        `SELECT id FROM locations WHERE team_id = ? AND active = 1`
+      ).all(teamId).map((r: any) => String(r.id))
+    );
+    for (const id of [...locationIds]) {
+      if (!activeLocations.has(id)) locationIds.delete(id);
+    }
+
     const data = Array.from(locationIds).map((locationId) => {
       const stylistsByDate = actualByLoc.get(locationId) ?? new Map();
       const { averageByDow, closedByDow } = averageDailyAppointmentsByDow(
