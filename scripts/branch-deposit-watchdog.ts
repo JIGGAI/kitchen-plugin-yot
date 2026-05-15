@@ -97,6 +97,15 @@ type FuzzyMatchedRow = {
   matchKind: 'prefix' | 'typo';
 };
 
+type LoanPaidOff = {
+  staffId: string;
+  firstName: string;
+  lastName: string;
+  totalAmount: number;
+  paidOffOn: string;
+  loanRow: number;
+};
+
 type Diag = {
   date: string;
   source?: string;
@@ -105,6 +114,7 @@ type Diag = {
   masterRowCount?: number;
   reportRowsWithPositiveAmountButNoBranchMatch?: UnmatchedReportRow[];
   fuzzyMatchedRows?: FuzzyMatchedRow[];
+  loansPaidOffToday?: LoanPaidOff[];
 };
 
 async function main() {
@@ -146,8 +156,9 @@ Watchdog log: ${LOG_PATH}`,
   const unmatched = diag.reportRowsWithPositiveAmountButNoBranchMatch || [];
   const inScopeUnmatched = unmatched.filter((r) => r.inScope);
   const outOfScopeCount = unmatched.length - inScopeUnmatched.length;
+  const loansPaidOff = diag.loansPaidOffToday || [];
 
-  log(`diagnostics: export=${diag.exportRowCount} typos=${typoRows.length} unmatched=${unmatched.length} (inScope=${inScopeUnmatched.length}, outOfScope=${outOfScopeCount})`);
+  log(`diagnostics: export=${diag.exportRowCount} typos=${typoRows.length} unmatched=${unmatched.length} (inScope=${inScopeUnmatched.length}, outOfScope=${outOfScopeCount}) loansPaidOff=${loansPaidOff.length}`);
 
   const sections: string[] = [];
   const summaryBits: string[] = [];
@@ -162,6 +173,12 @@ Watchdog log: ${LOG_PATH}`,
     summaryBits.push(`${inScopeUnmatched.length} need manual payout`);
     const lines = inScopeUnmatched.map((r) => `- ${r.staffName || '?'} @ ${r.locationName || '?'} earned $${r.bankToBankAmount} today (YOT bank-to-bank). They aren't on CSV MASTER, so they were not in tonight's deposit CSV. Action: pay them manually for today's amount, then add them to CSV MASTER (with their Branch STAFF ID) so tomorrow's export covers them.`);
     sections.push(`Missing from CSV MASTER (manual payout for today):\n${lines.join('\n')}`);
+  }
+
+  if (loansPaidOff.length) {
+    summaryBits.push(`${loansPaidOff.length} loan${loansPaidOff.length > 1 ? 's' : ''} paid off`);
+    const lines = loansPaidOff.map((l) => `- ${l.firstName} ${l.lastName} (staff id ${l.staffId}) finished a $${l.totalAmount.toFixed(2)} loan today (LOANS row ${l.loanRow}). Archive the row to a "PAID …" tab when convenient.`);
+    sections.push(`Loans paid off today:\n${lines.join('\n')}`);
   }
 
   if (!sections.length) {
