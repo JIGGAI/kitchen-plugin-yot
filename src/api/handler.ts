@@ -3483,10 +3483,20 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     ).all(teamId, start, end) as ActualRow[];
 
     // Read the daily coverage cache. slot_payload already has the per-slot
-    // `light` flag the daily heatmap renders — counting those directly here
-    // guarantees the weekly view and the drill-down modal can never disagree
-    // on whether a given hour was under-covered. rostered_payload still
-    // provides the day's distinct-scheduled-stylist headcount.
+    // `light` flag, `scheduledStylists` and `averageDailyAppointments` the
+    // daily heatmap + drill-down render — surfacing all three here keeps
+    // the 10-day view consistent with the views the user can drill into:
+    //   - lightHours: copied directly so under-cover state matches.
+    //   - peakStylists: max scheduledStylists across the day's slots, NOT
+    //     the count of distinct rostered stylistIds. A stylist who only
+    //     works the morning shouldn't inflate "stylists on" past what
+    //     the hourly view ever shows simultaneously.
+    //   - cachedAverageDailyAppts: each cached day's average was computed
+    //     with its own sync-time reference date, so reading it back here
+    //     guarantees the cell's "avg X/day" matches the drill-down's
+    //     "avg X/day" — a live recompute with referenceDate=end would
+    //     include today's in-progress sales and future-rostered-but-empty
+    //     days, deflating the per-DOW average.
     type CacheRow = { locationId: string; date: string; slot_payload: string | null; rostered_payload: string | null };
     const cacheRows = sqlite.prepare(
       `SELECT location_id AS locationId, date, slot_payload, rostered_payload
@@ -3496,19 +3506,36 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     ).all(teamId, start, end) as CacheRow[];
 
     const LIGHT_HOURS_RED_THRESHOLD = 3;
-    type DayMeta = { lightHours: number; rosteredStylists: number; cachedRequired: number | null };
+    type DayMeta = {
+      lightHours: number;
+      peakStylists: number;
+      rosteredStylists: number;
+      cachedRequired: number | null;
+      cachedAverageDailyAppts: number | null;
+    };
     const cacheByLocDate = new Map<string, Map<string, DayMeta>>();
     for (const r of cacheRows) {
       let lightHours = 0;
+      let peakStylists = 0;
       let cachedRequired: number | null = null;
+      let cachedAverageDailyAppts: number | null = null;
       if (r.slot_payload) {
         try {
           const parsed = JSON.parse(r.slot_payload) as {
-            slots?: Array<{ light?: boolean }>;
+            slots?: Array<{ light?: boolean; scheduledStylists?: number }>;
             requiredStylists?: number;
+            averageDailyAppointments?: number;
           };
-          for (const s of parsed.slots ?? []) if (s.light) lightHours += 1;
+          for (const s of parsed.slots ?? []) {
+            if (s.light) lightHours += 1;
+            if (typeof s.scheduledStylists === 'number' && s.scheduledStylists > peakStylists) {
+              peakStylists = s.scheduledStylists;
+            }
+          }
           if (typeof parsed.requiredStylists === 'number') cachedRequired = parsed.requiredStylists;
+          if (typeof parsed.averageDailyAppointments === 'number') {
+            cachedAverageDailyAppts = parsed.averageDailyAppointments;
+          }
         } catch { /* leave defaults */ }
       }
       let rosteredStylists = 0;
@@ -3526,7 +3553,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       }
       let byDate = cacheByLocDate.get(r.locationId);
       if (!byDate) { byDate = new Map(); cacheByLocDate.set(r.locationId, byDate); }
-      byDate.set(r.date, { lightHours, rosteredStylists, cachedRequired });
+      byDate.set(r.date, { lightHours, peakStylists, rosteredStylists, cachedRequired, cachedAverageDailyAppts });
     }
 
     // Enumerate every day in the window once so we know what columns to emit.
@@ -3575,18 +3602,26 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         if (closedByDow[dow]) {
           return { date, stylists: 0, appts: 0, required: 0, lightHours: 0, underCover: false, closed: true, hasRoster: false };
         }
-        const appts = averageByDow[dow] ?? 0;
         const ratio = ratioForDate(date, ratios);
         const meta = cacheByDate?.get(date);
-        // Prefer the cached requiredStylists so the weekly view matches the
-        // daily heatmap exactly even if the user has tweaked ratios since
-        // the last coverage sync. Fall back to our own computation when no
-        // cache exists for the day.
+        // Prefer the cached averageDailyAppointments (set at sync time with
+        // a sync-date-anchored referenceDate, so it doesn't include today's
+        // in-progress sales or future-rostered-but-empty days). Falling
+        // back to the live per-DOW average only when no cache exists for
+        // the day — that's normally cells outside any synced window.
+        const appts = meta?.cachedAverageDailyAppts ?? averageByDow[dow] ?? 0;
+        // Required also prefers the cached value so the cell agrees with
+        // the daily heatmap even if ratios drifted since sync.
         const required = meta?.cachedRequired ?? (ratio > 0 ? Math.round(appts / ratio) : 0);
-        // For days with a roster, use the rostered headcount (right for future
-        // days where bookings haven't rolled in yet). Otherwise fall back to
-        // distinct-stylist counts from appointments.
-        const stylists = meta ? meta.rosteredStylists : (stylistsByDate.get(date) ?? 0);
+        // Peak concurrent rostered stylists across the day's slots — the
+        // same number the hourly heatmap shows at its busiest hour. A
+        // morning-only + evening-only stylist combo would inflate distinct
+        // count to 2 while the floor never actually has both present.
+        // Fall back to distinct-rostered (then to actual workers) when
+        // no slot payload exists (unsynced day).
+        const stylists = meta
+          ? (meta.peakStylists > 0 ? meta.peakStylists : meta.rosteredStylists)
+          : (stylistsByDate.get(date) ?? 0);
         const lightHours = meta?.lightHours ?? 0;
         const underCover = lightHours >= LIGHT_HOURS_RED_THRESHOLD;
         return { date, stylists, appts, required, lightHours, underCover, closed: false, hasRoster: !!meta };
