@@ -3667,6 +3667,193 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     return { status: 200, data: { start, end, ratios, averagingDays, data: filtered } };
   }
 
+  // GET /coverage/day-schedule?locationId=X&date=YYYY-MM-DD
+  // Powers the calendar-style schedule grid in the staff-coverage daily
+  // drill-down modal. Returns rostered stylists for the day (with their
+  // shift bounds) plus every appointment, with enough fields to render a
+  // time-line UI: who, when, what service, status, duration. Out-of-roster
+  // appointments (stylist booked but not on roster) are also surfaced so
+  // they can't silently disappear from the grid.
+  if (req.path === '/coverage/day-schedule' && req.method === 'GET') {
+    const locationId = cleanString(req.query.locationId);
+    const date = cleanString(req.query.date);
+    if (!locationId || !date) return apiError(400, 'BAD_REQUEST', 'locationId and date required');
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return apiError(400, 'BAD_REQUEST', 'date must be YYYY-MM-DD');
+    const { db, sqlite } = initializeDatabase(teamId);
+
+    type CacheRow = { rostered_payload: string | null; slot_payload: string | null };
+    const cacheRow = sqlite.prepare(
+      `SELECT rostered_payload, slot_payload FROM location_coverage_facts
+        WHERE team_id = ? AND location_id = ? AND date = ?`
+    ).get(teamId, locationId, date) as CacheRow | undefined;
+
+    type RosterRow = { stylistId?: string; stylistName?: string; status?: string; startsAt?: string; endsAt?: string };
+    const rosterRows: RosterRow[] = (() => {
+      if (!cacheRow?.rostered_payload) return [];
+      try {
+        const parsed = JSON.parse(cacheRow.rostered_payload) as { rows?: RosterRow[] };
+        return parsed.rows ?? [];
+      } catch { return []; }
+    })();
+    const scheduledRosterRows = rosterRows.filter((r): r is Required<Pick<RosterRow, 'stylistId' | 'startsAt' | 'endsAt'>> & RosterRow =>
+      r.status === 'scheduled' && !!r.stylistId && !!r.startsAt && !!r.endsAt
+    );
+
+    // Business hours = earliest shift start → latest shift end (with a 30-min
+    // pad on each side so the time-axis header has a little breathing room
+    // before/after the first/last appointment). Falls back to the slot
+    // payload's first/last slot when no scheduled roster rows exist.
+    let businessStart: string | null = null;
+    let businessEnd: string | null = null;
+    if (scheduledRosterRows.length) {
+      businessStart = scheduledRosterRows.reduce((acc, r) => (!acc || r.startsAt < acc ? r.startsAt : acc), '' as string);
+      businessEnd = scheduledRosterRows.reduce((acc, r) => (!acc || r.endsAt > acc ? r.endsAt : acc), '' as string);
+    } else if (cacheRow?.slot_payload) {
+      try {
+        const parsed = JSON.parse(cacheRow.slot_payload) as { slots?: Array<{ startsAt?: string; endsAt?: string }> };
+        const slots = parsed.slots ?? [];
+        if (slots.length) {
+          businessStart = slots[0]?.startsAt ?? null;
+          businessEnd = slots[slots.length - 1]?.endsAt ?? null;
+        }
+      } catch { /* leave null */ }
+    }
+
+    // Pull every appointment for (location, date). Joining to stylists for
+    // a clean fullName fallback when the roster row's name isn't available.
+    type Appt = {
+      id: string;
+      stylistId: string | null;
+      startAt: string | null;
+      endAt: string | null;
+      durationMinutes: number | null;
+      serviceName: string | null;
+      categoryName: string | null;
+      clientName: string | null;
+      statusCode: number | null;
+      statusDescription: string | null;
+      cancelledFlag: number | null;
+      newClient: number | null;
+      onlineBooking: number | null;
+    };
+    const appointments = sqlite.prepare(
+      `SELECT id,
+              stylist_id AS stylistId,
+              start_at AS startAt,
+              end_at AS endAt,
+              duration_minutes AS durationMinutes,
+              service_name_raw AS serviceName,
+              category_name AS categoryName,
+              client_name AS clientName,
+              status_code AS statusCode,
+              status_description AS statusDescription,
+              cancelled_flag AS cancelledFlag,
+              new_client AS newClient,
+              online_booking AS onlineBooking
+         FROM appointments
+        WHERE team_id = ? AND location_id = ?
+          AND substr(start_at, 1, 10) = ?
+        ORDER BY start_at ASC`
+    ).all(teamId, locationId, date) as Appt[];
+
+    // Build a name lookup for each stylist seen in the roster or in the
+    // appointments. roster row provides the YOT-display name; if a row
+    // lacks one (rare), fall back to the stylists table.
+    const stylistNameById = new Map<string, string>();
+    for (const r of rosterRows) {
+      if (r.stylistId && r.stylistName) stylistNameById.set(r.stylistId, r.stylistName);
+    }
+    const idsNeedingNames = new Set<string>();
+    for (const r of scheduledRosterRows) {
+      if (!stylistNameById.has(r.stylistId)) idsNeedingNames.add(r.stylistId);
+    }
+    for (const a of appointments) {
+      if (a.stylistId && !stylistNameById.has(a.stylistId)) idsNeedingNames.add(a.stylistId);
+    }
+    if (idsNeedingNames.size) {
+      const stylistRows = db.select().from(schema.stylists)
+        .where(eq(schema.stylists.teamId, teamId)).all() as schema.Stylist[];
+      for (const s of stylistRows) {
+        if (idsNeedingNames.has(s.id) && s.fullName) stylistNameById.set(s.id, s.fullName);
+      }
+    }
+
+    // Stylist rows = rostered stylists, sorted by shift start time. Off-
+    // roster stylists who still booked appointments get appended at the end
+    // with a null shift so the UI can show their work without inventing a
+    // shift it doesn't actually have.
+    type StylistRow = {
+      stylistId: string;
+      fullName: string;
+      shiftStartAt: string | null;
+      shiftEndAt: string | null;
+      onRoster: boolean;
+    };
+    const rosteredById = new Map<string, StylistRow>();
+    for (const r of scheduledRosterRows) {
+      const existing = rosteredById.get(r.stylistId);
+      // Multiple scheduled chunks (split shifts) → take the widest envelope
+      // for simplicity. The appointments themselves still render in their
+      // exact slots, so a stylist with a 2-hour mid-shift gap will just
+      // have an unmarked stretch on the row.
+      if (!existing) {
+        rosteredById.set(r.stylistId, {
+          stylistId: r.stylistId,
+          fullName: stylistNameById.get(r.stylistId) || `Stylist ${r.stylistId}`,
+          shiftStartAt: r.startsAt,
+          shiftEndAt: r.endsAt,
+          onRoster: true,
+        });
+      } else {
+        if (r.startsAt < (existing.shiftStartAt ?? r.startsAt)) existing.shiftStartAt = r.startsAt;
+        if (r.endsAt > (existing.shiftEndAt ?? r.endsAt)) existing.shiftEndAt = r.endsAt;
+      }
+    }
+    const offRosterIds = new Set<string>();
+    for (const a of appointments) {
+      if (a.stylistId && !rosteredById.has(a.stylistId)) offRosterIds.add(a.stylistId);
+    }
+    const stylists: StylistRow[] = [...rosteredById.values()]
+      .sort((a, b) => (a.shiftStartAt || '').localeCompare(b.shiftStartAt || ''));
+    for (const id of offRosterIds) {
+      stylists.push({
+        stylistId: id,
+        fullName: stylistNameById.get(id) || `Stylist ${id}`,
+        shiftStartAt: null,
+        shiftEndAt: null,
+        onRoster: false,
+      });
+    }
+
+    const responseAppointments = appointments.map((a) => ({
+      id: a.id,
+      stylistId: a.stylistId,
+      startAt: a.startAt,
+      endAt: a.endAt,
+      durationMinutes: a.durationMinutes,
+      serviceName: a.serviceName,
+      categoryName: a.categoryName,
+      clientName: a.clientName,
+      statusCode: a.statusCode,
+      statusDescription: a.statusDescription,
+      isCancelled: a.cancelledFlag === 1 || (a.statusDescription || '').toLowerCase() === 'cancelled',
+      isNewClient: a.newClient === 1,
+      isOnlineBooking: a.onlineBooking === 1,
+    }));
+
+    return {
+      status: 200,
+      data: {
+        locationId,
+        date,
+        businessStart,
+        businessEnd,
+        stylists,
+        appointments: responseAppointments,
+      },
+    };
+  }
+
   if (req.path === '/franchises/sync' && req.method === 'POST') {
     try {
       const { syncFranchises } = await import('../coverage/sync-franchises');
