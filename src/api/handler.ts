@@ -2254,8 +2254,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         syncedAt: string;
       };
 
-      let rows = sqlite.prepare(
-        `SELECT period_start AS periodStart, period_end AS periodEnd,
+      const SELECT_RETENTION_COLUMNS = `period_start AS periodStart, period_end AS periodEnd,
                 location_name AS locationName, staff_name AS staffName,
                 total_sales AS totalSales,
                 returned_to_staff_count AS returnedToStaffCount,
@@ -2277,18 +2276,45 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
                 retention_m3_count AS retentionM3Count,
                 retention_m3_pct AS retentionM3Pct,
                 retention_m3_label AS retentionM3Label,
-                synced_at AS syncedAt
+                synced_at AS syncedAt`;
+
+      let rows = sqlite.prepare(
+        `SELECT ${SELECT_RETENTION_COLUMNS}
          FROM staff_retention_facts
          WHERE team_id = ? AND period_start = ? AND period_end = ?`,
       ).all(teamId, startDate, endDate) as RetentionRow[];
 
-      // No fallback to most-recently-synced: if the exact window isn't
-      // cached, return hasData=false so the dashboard can prompt the user
-      // to trigger a fresh sync rather than silently showing stale numbers
-      // from a different window.
-      const matchedWindow: { startDate: string; endDate: string } | null = rows.length
+      let matchedWindow: { startDate: string; endDate: string } | null = rows.length
         ? { startDate, endDate }
         : null;
+      let isFallback = false;
+      // Stale-window fallback. The nightly sync's window-end advances each
+      // day (this-month: 2026-05-01 → today). When YOT returns 0 rows the
+      // script keeps the previous good snapshot — but its period_end is
+      // pinned to the date of that successful sync. The dashboard's strict
+      // exact-match query then sees no data even though we have a valid
+      // recent snapshot. Fall back to the latest stored window whose start
+      // matches and whose end is on/before the requested end. The dashboard
+      // surfaces `isFallback` + the actual matchedWindow so users can see
+      // the data is from an earlier snapshot date.
+      if (rows.length === 0) {
+        const fallback = sqlite.prepare(
+          `SELECT period_end AS periodEnd
+           FROM staff_retention_facts
+           WHERE team_id = ? AND period_start = ? AND period_end <= ?
+           ORDER BY period_end DESC
+           LIMIT 1`,
+        ).get(teamId, startDate, endDate) as { periodEnd: string } | undefined;
+        if (fallback) {
+          rows = sqlite.prepare(
+            `SELECT ${SELECT_RETENTION_COLUMNS}
+             FROM staff_retention_facts
+             WHERE team_id = ? AND period_start = ? AND period_end = ?`,
+          ).all(teamId, startDate, fallback.periodEnd) as RetentionRow[];
+          matchedWindow = { startDate, endDate: fallback.periodEnd };
+          isFallback = rows.length > 0;
+        }
+      }
       const hasData = rows.length > 0;
 
       // Group rows by location
@@ -2318,6 +2344,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
           ok: true,
           scope: { startDate, endDate },
           matchedWindow,
+          isFallback,
           hasData,
           trailingMonthLabels,
           lastSyncedAt,
