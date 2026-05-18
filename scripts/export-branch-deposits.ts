@@ -890,6 +890,14 @@ async function main() {
     const adjustedAmount = Number((postGarnishment - loanWithheldTotal).toFixed(2));
     const transactionId = buildTransactionId(match.row.lastName, match.row.staffId, adjustedAmount);
 
+    // Use CSV MASTER's location (column G on the Branch Daily Totals
+    // sheet) as the canonical location string. YOT's report appends the
+    // state abbreviation (e.g. "Brighton MI") which doesn't match the
+    // sheet's location field downstream consumers join against.
+    // matchedReportLocation keeps the raw YOT string for traceability in
+    // the watchdog log; only `location` (the field that flows to the CSV)
+    // gets normalized.
+    const csvLocation = match.row.location || yotRow.locationName || '';
     exportRows.push({
       staffId: match.row.staffId,
       firstName: match.row.firstName,
@@ -900,7 +908,7 @@ async function main() {
       garnishmentPercent,
       garnishmentAmount,
       transactionId,
-      location: yotRow.locationName || match.row.location || '',
+      location: csvLocation,
       matchedReportName: yotRow.staffName || '',
       matchedReportLocation: yotRow.locationName,
     });
@@ -913,7 +921,7 @@ async function main() {
         type: 'GARNISHMENT',
         amount: garnishmentAmount,
         transactionId: buildTransactionId(match.row.lastName, match.row.staffId, garnishmentAmount),
-        location: yotRow.locationName || match.row.location || '',
+        location: csvLocation,
         date: args.date,
       });
     }
