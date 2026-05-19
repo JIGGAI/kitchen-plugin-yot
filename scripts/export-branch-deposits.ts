@@ -464,11 +464,19 @@ To re-run the whole export (idempotent on sheet writes):
   }
 }
 
+// Wraps a staff id with the Google Sheets text-marker apostrophe so a
+// USER_ENTERED write doesn't re-parse "0731" as the number 731 and
+// strip the leading zero. The apostrophe is invisible in the cell;
+// subsequent FORMATTED_VALUE reads return the literal string back.
+function toStaffIdCell(staffId: string): string {
+  return staffId ? `'${staffId}` : staffId;
+}
+
 function toSheetValues(rows: GarnishmentPayoutRow[]): string[][] {
   return [
     ['STAFF ID', 'FIRST NAME', 'LAST NAME', 'TYPE', 'AMOUNT', 'TRANSACTION ID', 'LOCATION', 'DATE'],
     ...rows.map((row) => [
-      row.staffId,
+      toStaffIdCell(row.staffId),
       row.firstName,
       row.lastName,
       row.type,
@@ -489,7 +497,11 @@ function buildTransactionId(lastName: string, staffId: string, amount: number): 
 }
 
 function loadCsvMasterRows(sheetId: string, account: string): MasterRow[] {
-  const response = gogJsonForAccount(account, ['sheets', 'get', sheetId, `'${CSV_MASTER_TAB}'!A1:G500`]) as SheetValuesResponse;
+  // FORMATTED_VALUE preserves the cell's display string — critical for
+  // staff IDs typed with leading zeros (e.g. "0731" for Miranda Bender)
+  // which UNFORMATTED_VALUE would return as the number 731 and silently
+  // drop the leading zero on the way into the export CSV.
+  const response = gogJsonForAccount(account, ['sheets', 'get', sheetId, `'${CSV_MASTER_TAB}'!A1:G500`, '--render', 'FORMATTED_VALUE']) as SheetValuesResponse;
   const values = response.values || [];
   const rows: MasterRow[] = [];
   for (let i = 1; i < values.length; i++) {
@@ -576,7 +588,7 @@ function parsePercent(value: string | null | undefined): number | null {
 }
 
 function loadGarnishmentRules(sheetId: string, account: string): Map<string, GarnishmentRule> {
-  const response = gogJsonForAccount(account, ['sheets', 'get', sheetId, 'GARNISHMENTS!A1:H1200']) as SheetValuesResponse;
+  const response = gogJsonForAccount(account, ['sheets', 'get', sheetId, 'GARNISHMENTS!A1:H1200', '--render', 'FORMATTED_VALUE']) as SheetValuesResponse;
   const rows = response.values || [];
   const rules = new Map<string, GarnishmentRule>();
   for (const row of rows.slice(1)) {
@@ -591,7 +603,7 @@ function loadGarnishmentRules(sheetId: string, account: string): Map<string, Gar
 }
 
 function loadExistingGarnishmentPayoutRows(sheetId: string, account: string): GarnishmentPayoutRow[] {
-  const response = gogJsonForAccount(account, ['sheets', 'get', sheetId, `'GARNISHMENTS PAYOUTS'!A1:H1200`]) as SheetValuesResponse;
+  const response = gogJsonForAccount(account, ['sheets', 'get', sheetId, `'GARNISHMENTS PAYOUTS'!A1:H1200`, '--render', 'FORMATTED_VALUE']) as SheetValuesResponse;
   const rows = response.values || [];
   return rows.slice(1).map((row) => ({
     staffId: String(row[0] || '').trim(),
@@ -652,7 +664,7 @@ function isLoanDueOn(loan: Loan, dateIso: string): boolean {
 }
 
 function loadActiveLoans(sheetId: string, account: string): Loan[] {
-  const response = gogJsonForAccount(account, ['sheets', 'get', sheetId, `'LOANS'!A1:J500`]) as SheetValuesResponse;
+  const response = gogJsonForAccount(account, ['sheets', 'get', sheetId, `'LOANS'!A1:J500`, '--render', 'FORMATTED_VALUE']) as SheetValuesResponse;
   const values = response.values || [];
   const loans: Loan[] = [];
   for (let i = 1; i < values.length; i++) {
@@ -680,7 +692,7 @@ function loadActiveLoans(sheetId: string, account: string): Loan[] {
 }
 
 function loadExistingLoanPayments(sheetId: string, account: string): LoanPaymentRow[] {
-  const response = gogJsonForAccount(account, ['sheets', 'get', sheetId, `'LOAN PAYMENTS'!A1:I1200`]) as SheetValuesResponse;
+  const response = gogJsonForAccount(account, ['sheets', 'get', sheetId, `'LOAN PAYMENTS'!A1:I1200`, '--render', 'FORMATTED_VALUE']) as SheetValuesResponse;
   const values = response.values || [];
   return values.slice(1).map((row) => ({
     staffId: String(row[0] || '').trim(),
@@ -699,7 +711,7 @@ function rewriteLoanPaymentsSheet(sheetId: string, account: string, rows: LoanPa
   const values: string[][] = [
     ['STAFF ID', 'DATE', 'FIRST NAME', 'LAST NAME', 'LOAN AMOUNT', 'TOTAL PAID', 'WITHHOLDING', 'DAY', 'TRANSACTION ID'],
     ...rows.map((r) => [
-      r.staffId,
+      toStaffIdCell(r.staffId),
       r.date,
       r.firstName,
       r.lastName,
