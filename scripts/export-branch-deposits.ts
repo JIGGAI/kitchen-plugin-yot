@@ -21,7 +21,7 @@
 //
 // Per-day tab handling (the old `5/13/26` tab flow) is intentionally gone.
 
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -845,6 +845,85 @@ function addTab(spreadsheetId: string, account: string, title: string): void {
   });
 }
 
+// Moves a freshly-created tab to a specific position in the spreadsheet's
+// tab list. gog doesn't expose tab-position control, so we shell out to
+// gog to dump the refresh token, exchange it for an access token via the
+// OAuth client cred file, and call the Sheets API's batchUpdate endpoint
+// directly. The refresh token lives on disk only for the duration of the
+// call and is unlinked in the `finally` block (mode 0600 by gog default).
+//
+// If anything in this chain fails the new tab still ends up created
+// successfully (at the right end of the tab list) — we just log a warning
+// and let the operator drag it into place. The export's other on-sheet
+// writes are unaffected.
+const GOG_CLIENT_FILE_DEFAULT = path.join(homedir(), '.openclaw', 'secrets', 'gog-client.json');
+
+async function moveTabToIndex(args: {
+  spreadsheetId: string;
+  account: string;
+  sheetId: number;
+  newIndex: number;
+}): Promise<void> {
+  const refreshFile = path.join(homedir(), `.gog-refresh-${process.pid}-${Date.now()}.json`);
+  try {
+    execFileSync('gog', [
+      'auth', 'tokens', 'export', args.account,
+      '--out', refreshFile, '--overwrite', '--no-input',
+    ], { encoding: 'utf8', maxBuffer: 1024 * 1024 });
+    const refresh = JSON.parse(readFileSync(refreshFile, 'utf8'));
+    const refreshToken = String(refresh.refresh_token || '');
+    if (!refreshToken) throw new Error('gog auth tokens export returned no refresh_token');
+
+    const clientPath = process.env.GOG_CLIENT_FILE || GOG_CLIENT_FILE_DEFAULT;
+    const client = JSON.parse(readFileSync(clientPath, 'utf8'));
+    const installed = client.installed || client.web || {};
+    const clientId = String(installed.client_id || '');
+    const clientSecret = String(installed.client_secret || '');
+    if (!clientId || !clientSecret) throw new Error(`OAuth client creds missing in ${clientPath}`);
+
+    const tokenResp = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: clientId,
+        client_secret: clientSecret,
+        refresh_token: refreshToken,
+        grant_type: 'refresh_token',
+      }).toString(),
+    });
+    if (!tokenResp.ok) {
+      throw new Error(`OAuth refresh failed: ${tokenResp.status} ${await tokenResp.text()}`);
+    }
+    const tokenJson = await tokenResp.json() as { access_token?: string };
+    const accessToken = String(tokenJson.access_token || '');
+    if (!accessToken) throw new Error('OAuth refresh returned no access_token');
+
+    const apiResp = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(args.spreadsheetId)}:batchUpdate`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          requests: [{
+            updateSheetProperties: {
+              properties: { sheetId: args.sheetId, index: args.newIndex },
+              fields: 'index',
+            },
+          }],
+        }),
+      },
+    );
+    if (!apiResp.ok) {
+      throw new Error(`Sheets batchUpdate failed: ${apiResp.status} ${await apiResp.text()}`);
+    }
+  } finally {
+    try { unlinkSync(refreshFile); } catch { /* noop */ }
+  }
+}
+
 type DailyTabLocationAggregate = {
   branchAmount: number;
   branchNotes: string;
@@ -1320,6 +1399,28 @@ async function main() {
       resolved: branchMasterPerLocation,
       date: args.date,
     });
+    // Move the new tab to position `branchMasterIndex + 1` so the most
+    // recent daily tab sits immediately to the right of BRANCH MASTER and
+    // the rest of the daily tabs shift down (matches the operator's
+    // historical ordering: newest day on the left of the daily block).
+    // Best-effort — log a warning and continue if anything fails; the tab
+    // is already created with correct content.
+    try {
+      const info = gogJsonForAccount(args.account, ['sheets', 'metadata', args.sheetId]);
+      const sheets: any[] = info?.sheets || [];
+      const newTab = sheets.find((s) => s?.properties?.title === branchMasterTabName);
+      const branchMaster = sheets.find((s) => s?.properties?.title === BRANCH_MASTER_TAB);
+      if (newTab && branchMaster) {
+        await moveTabToIndex({
+          spreadsheetId: args.sheetId,
+          account: args.account,
+          sheetId: Number(newTab.properties.sheetId),
+          newIndex: Number(branchMaster.properties.index) + 1,
+        });
+      }
+    } catch (err: any) {
+      console.error(`[warn] failed to reposition '${branchMasterTabName}' tab (manual drag required): ${err?.message || err}`);
+    }
   }
 
   const csvPath = path.join(args.outputDir, `branch-deposits-${args.date}.csv`);
