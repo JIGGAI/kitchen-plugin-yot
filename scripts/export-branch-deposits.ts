@@ -21,7 +21,7 @@
 //
 // Per-day tab handling (the old `5/13/26` tab flow) is intentionally gone.
 
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -76,6 +76,11 @@ type ExportRow = {
   location: string;
   matchedReportName: string;
   matchedReportLocation: string | null;
+  // Set when the row came from a negative bankToBank — paid via the
+  // disbursements CSV (operator settles with the stylist via Branch) but
+  // excluded from the BRANCH MASTER daily tab's BRANCH column (which
+  // tracks only positives, matching the operator's accounting model).
+  isRebate: boolean;
 };
 
 type GarnishmentRule = {
@@ -172,6 +177,20 @@ type MatchDiagnostics = {
   loanWithholdingCount: number;
   loanPaymentRows: LoanPaymentRow[];
   loansPaidOffToday: LoanPaidOff[];
+  branchMasterTabName: string;
+  branchMasterPerLocation: Array<{
+    location: string;
+    branchAmount: number;
+    branchNotes: string;
+    yotAmount: number;
+    yotNotes: string;
+  }>;
+  negativeRebates: Array<{
+    staffName: string;
+    locationName: string | null;
+    rebateAmount: number;
+    matched: boolean;
+  }>;
 };
 
 const DEFAULT_SHEET_ID = '1jIFWOMmvMVbGULUbDpEqV2e6CsXy_DzhBrCorV9H-EA';
@@ -182,6 +201,14 @@ const DEFAULT_ORGANISATION_ID = 11082;
 const DEFAULT_OUTPUT_DIR = '/Users/hairmx/hmx-reports';
 const NEW_YORK_TZ = 'America/New_York';
 const CSV_MASTER_TAB = 'CSV MASTER';
+// Template tab on the Branch Daily Totals sheet. Holds two side-by-side
+// tables (BRANCH at cols A-C, YOT at cols E-G) keyed by location name in
+// rows 4-18 plus a TOTAL row at 21. We read it once per run to learn the
+// location list + TOTAL formula shape, then write a fresh per-day copy.
+const BRANCH_MASTER_TAB = 'BRANCH MASTER';
+const BRANCH_MASTER_FIRST_LOCATION_ROW = 4;
+const BRANCH_MASTER_LAST_LOCATION_ROW = 18;
+const BRANCH_MASTER_TOTAL_ROW = 21;
 // The Branch DISPURSEMENTS sheet — separate spreadsheet from the Branch
 // Daily Totals one. CSV BLANK MASTER tab carries the column layout for
 // Miranda's Branch processing; we only use its header for shape (the tab
@@ -264,7 +291,8 @@ function normalizeText(value: string | null | undefined): string {
 
 function normalizeLocation(value: string | null | undefined): string {
   return normalizeText(value)
-    .replace(/\bmi\b|\boh\b|\bpa\b/g, '')
+    .replace(/\bmi\b|\boh\b|\bpa\b|\bwv\b|\bfl\b/g, '')
+    .replace(/\btownship\b|\btwp\b/g, '')
     .replace(/\bstylist\b/g, '')
     .replace(/\s+/g, ' ')
     .trim();
@@ -747,6 +775,232 @@ function updateLoanCellsForRow(sheetId: string, account: string, rowNumber: numb
   });
 }
 
+// Formats an ISO yyyy-mm-dd into the tab name convention the operator has
+// been using on the Branch Daily Totals sheet: M/D/YY (no zero-padding,
+// two-digit year). Matches existing tabs like "5/15/26", "4/30/26".
+function formatDailyTabName(dateIso: string): string {
+  const m = dateIso.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) throw new Error(`Invalid ISO date: ${dateIso}`);
+  const year2 = m[1]!.slice(2);
+  const month = String(Number(m[2]));
+  const day = String(Number(m[3]));
+  return `${month}/${day}/${year2}`;
+}
+
+type BranchMasterTemplate = {
+  /** Location labels as they appear in col A rows 4-18 (preserve trailing
+   *  spaces — they're part of the sheet's identity for some rows). */
+  locationLabels: string[];
+  /** Row 2 header labels for the two tables: [A2, B2, C2, E2, F2, G2]. */
+  headerLabels: { a: string; b: string; c: string; e: string; f: string; g: string };
+};
+
+function loadBranchMasterTemplate(sheetId: string, account: string): BranchMasterTemplate {
+  const response = gogJsonForAccount(account, [
+    'sheets', 'get', sheetId, `'${BRANCH_MASTER_TAB}'!A1:G${BRANCH_MASTER_TOTAL_ROW}`,
+    '--render', 'FORMATTED_VALUE',
+  ]) as SheetValuesResponse;
+  const values = response.values || [];
+  const header = values[1] || [];
+  const locationLabels: string[] = [];
+  for (let r = BRANCH_MASTER_FIRST_LOCATION_ROW - 1; r <= BRANCH_MASTER_LAST_LOCATION_ROW - 1; r++) {
+    const label = String((values[r] || [])[0] || '');
+    locationLabels.push(label);
+  }
+  return {
+    locationLabels,
+    headerLabels: {
+      a: String(header[0] || 'LOCATION'),
+      b: String(header[1] || 'BRANCH'),
+      c: String(header[2] || 'NOTES'),
+      e: String(header[4] || 'LOCATION'),
+      f: String(header[5] || 'YOT'),
+      g: String(header[6] || 'NOTES'),
+    },
+  };
+}
+
+function getSheetIdByTitle(spreadsheetId: string, account: string, title: string): number | null {
+  const info = gogJsonForAccount(account, ['sheets', 'metadata', spreadsheetId]);
+  const sheets: any[] = info?.sheets || [];
+  for (const s of sheets) {
+    if (s?.properties?.title === title) return Number(s.properties.sheetId);
+  }
+  return null;
+}
+
+function deleteTabIfExists(spreadsheetId: string, account: string, title: string): void {
+  const id = getSheetIdByTitle(spreadsheetId, account, title);
+  if (id == null) return;
+  execFileSync('gog', ['sheets', 'delete-tab', spreadsheetId, title, '--account', account, '--force', '--no-input'], {
+    encoding: 'utf8',
+    maxBuffer: 20 * 1024 * 1024,
+  });
+}
+
+function addTab(spreadsheetId: string, account: string, title: string): void {
+  execFileSync('gog', ['sheets', 'add-tab', spreadsheetId, title, '--account', account, '--no-input'], {
+    encoding: 'utf8',
+    maxBuffer: 20 * 1024 * 1024,
+  });
+}
+
+// Moves a freshly-created tab to a specific position in the spreadsheet's
+// tab list. gog doesn't expose tab-position control, so we shell out to
+// gog to dump the refresh token, exchange it for an access token via the
+// OAuth client cred file, and call the Sheets API's batchUpdate endpoint
+// directly. The refresh token lives on disk only for the duration of the
+// call and is unlinked in the `finally` block (mode 0600 by gog default).
+//
+// If anything in this chain fails the new tab still ends up created
+// successfully (at the right end of the tab list) — we just log a warning
+// and let the operator drag it into place. The export's other on-sheet
+// writes are unaffected.
+const GOG_CLIENT_FILE_DEFAULT = path.join(homedir(), '.openclaw', 'secrets', 'gog-client.json');
+
+async function moveTabToIndex(args: {
+  spreadsheetId: string;
+  account: string;
+  sheetId: number;
+  newIndex: number;
+}): Promise<void> {
+  const refreshFile = path.join(homedir(), `.gog-refresh-${process.pid}-${Date.now()}.json`);
+  try {
+    execFileSync('gog', [
+      'auth', 'tokens', 'export', args.account,
+      '--out', refreshFile, '--overwrite', '--no-input',
+    ], { encoding: 'utf8', maxBuffer: 1024 * 1024 });
+    const refresh = JSON.parse(readFileSync(refreshFile, 'utf8'));
+    const refreshToken = String(refresh.refresh_token || '');
+    if (!refreshToken) throw new Error('gog auth tokens export returned no refresh_token');
+
+    const clientPath = process.env.GOG_CLIENT_FILE || GOG_CLIENT_FILE_DEFAULT;
+    const client = JSON.parse(readFileSync(clientPath, 'utf8'));
+    const installed = client.installed || client.web || {};
+    const clientId = String(installed.client_id || '');
+    const clientSecret = String(installed.client_secret || '');
+    if (!clientId || !clientSecret) throw new Error(`OAuth client creds missing in ${clientPath}`);
+
+    const tokenResp = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: clientId,
+        client_secret: clientSecret,
+        refresh_token: refreshToken,
+        grant_type: 'refresh_token',
+      }).toString(),
+    });
+    if (!tokenResp.ok) {
+      throw new Error(`OAuth refresh failed: ${tokenResp.status} ${await tokenResp.text()}`);
+    }
+    const tokenJson = await tokenResp.json() as { access_token?: string };
+    const accessToken = String(tokenJson.access_token || '');
+    if (!accessToken) throw new Error('OAuth refresh returned no access_token');
+
+    const apiResp = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(args.spreadsheetId)}:batchUpdate`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          requests: [{
+            updateSheetProperties: {
+              properties: { sheetId: args.sheetId, index: args.newIndex },
+              fields: 'index',
+            },
+          }],
+        }),
+      },
+    );
+    if (!apiResp.ok) {
+      throw new Error(`Sheets batchUpdate failed: ${apiResp.status} ${await apiResp.text()}`);
+    }
+  } finally {
+    try { unlinkSync(refreshFile); } catch { /* noop */ }
+  }
+}
+
+type DailyTabLocationAggregate = {
+  branchAmount: number;
+  branchNotes: string;
+  yotAmount: number;
+  yotNotes: string;
+};
+
+// Joins multi-source notes (one string per source) with " / " in a stable,
+// non-empty-only way. Mirrors the formatting the operator has been using on
+// BRANCH NOTES (e.g. "WH $75 LOAN ALLISON/ WH $50 LOAN TRISH").
+function joinNotes(parts: string[]): string {
+  return parts.filter((p) => p && p.trim()).join(' / ');
+}
+
+type ResolvedLocationRow = {
+  location: string;
+  branchAmount: number;
+  branchNotes: string;
+  yotAmount: number;
+  yotNotes: string;
+};
+
+function writeDailyTabContent(args: {
+  spreadsheetId: string;
+  account: string;
+  tabName: string;
+  template: BranchMasterTemplate;
+  resolved: ResolvedLocationRow[];
+  date: string;
+}): void {
+  const { spreadsheetId, account, tabName, template, resolved, date } = args;
+  const labelWithDate = `LOCATION ${formatDailyTabName(date)}`;
+
+  // Build the full A1:G21 grid in one shot.
+  const grid: string[][] = [];
+  // Row 1: leave blank (operator clears this on existing daily tabs).
+  grid.push(['', '', '', '', '', '', '']);
+  // Row 2: headers with date-stamped LOCATION labels.
+  grid.push([labelWithDate, template.headerLabels.b, template.headerLabels.c, '', labelWithDate, template.headerLabels.f, template.headerLabels.g]);
+  // Row 3: blank spacer (matches template).
+  grid.push(['', '', '', '', '', '', '']);
+
+  // Rows 4-18: one per template location. Blank cell when amount is zero
+  // (matches the operator's manual pattern on existing daily tabs).
+  for (const row of resolved) {
+    const branchVal = row.branchAmount !== 0 ? `$${row.branchAmount.toFixed(2)}` : '';
+    const yotVal = row.yotAmount !== 0 ? `$${row.yotAmount.toFixed(2)}` : '';
+    grid.push([
+      row.location,
+      branchVal,
+      row.branchNotes,
+      '',
+      row.location,
+      yotVal,
+      row.yotNotes,
+    ]);
+  }
+  // Rows 19, 20: blank spacers (preserve template shape).
+  while (grid.length < BRANCH_MASTER_TOTAL_ROW - 1) {
+    grid.push(['', '', '', '', '', '', '']);
+  }
+  // Row 21: TOTAL row with SUM formulas matching the template.
+  const sumRangeBranch = `B${BRANCH_MASTER_FIRST_LOCATION_ROW}:B${BRANCH_MASTER_LAST_LOCATION_ROW}`;
+  const sumRangeYot = `F${BRANCH_MASTER_FIRST_LOCATION_ROW}:F${BRANCH_MASTER_LAST_LOCATION_ROW}`;
+  grid.push(['', 'TOTAL', `=SUM(${sumRangeBranch})`, '', '', 'TOTAL', `=SUM(${sumRangeYot})`]);
+
+  const valuesJson = JSON.stringify(grid);
+  execFileSync('gog', [
+    'sheets', 'update', spreadsheetId,
+    `'${tabName}'!A1:G${BRANCH_MASTER_TOTAL_ROW}`,
+    '--values-json', valuesJson,
+    '--input', 'USER_ENTERED',
+    '--account', account,
+    '--no-input',
+  ], { encoding: 'utf8', maxBuffer: 20 * 1024 * 1024 });
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   mkdirSync(args.outputDir, { recursive: true });
@@ -812,19 +1066,45 @@ async function main() {
   const loanPaymentsThisRun: LoanPaymentRow[] = [];
   const loansPaidOffToday: LoanPaidOff[] = [];
   const loanCellUpdates: Array<{ rowNumber: number; totalPaid: number; remainingBalance: number }> = [];
+  // Tracks stylists whose bankToBank was negative for the day — the shop
+  // "owes" them that amount as a makewhole rebate. Drives both the BRANCH
+  // MASTER daily tab YOT NOTES ("FIRSTNAME OWED $X") and the new
+  // disbursements rows that pay them out.
+  type NegativeRebate = {
+    staffName: string;
+    locationName: string | null;
+    rebateAmount: number;
+    matched: boolean;
+  };
+  const negativeRebates: NegativeRebate[] = [];
 
   for (const yotRow of report.rows) {
     const rawAmount = Number(yotRow.bankToBankAmount || 0);
-    if (rawAmount <= 0) continue;
+    if (rawAmount === 0) continue;
+    const isRebate = rawAmount < 0;
+    const baseAmount = Math.abs(rawAmount);
 
     const match = matchYotRowToMaster(yotRow, masterIndexes);
     if (!match) {
-      unmatchedReport.push({
-        staffName: yotRow.staffName,
-        locationName: yotRow.locationName,
-        bankToBankAmount: rawAmount,
-        inScope: supportedLocations.has(normalizeLocation(yotRow.locationName)),
-      });
+      if (isRebate) {
+        // Tracked in negativeRebates instead of unmatchedReport — the
+        // watchdog's "pay them manually for today's amount" phrasing is
+        // only correct for positive bankToBank rows. YOT NOTES on the
+        // BRANCH MASTER daily tab will still annotate the rebate.
+        negativeRebates.push({
+          staffName: yotRow.staffName || '?',
+          locationName: yotRow.locationName,
+          rebateAmount: baseAmount,
+          matched: false,
+        });
+      } else {
+        unmatchedReport.push({
+          staffName: yotRow.staffName,
+          locationName: yotRow.locationName,
+          bankToBankAmount: rawAmount,
+          inScope: supportedLocations.has(normalizeLocation(yotRow.locationName)),
+        });
+      }
       continue;
     }
     if (match.kind !== 'exact') {
@@ -839,8 +1119,8 @@ async function main() {
 
     const garnishmentRule = garnishmentRules.get(match.row.staffId) || null;
     const garnishmentPercent = garnishmentRule?.percent ?? null;
-    const garnishmentAmount = garnishmentPercent ? Number((rawAmount * garnishmentPercent).toFixed(2)) : 0;
-    const postGarnishment = Number((rawAmount - garnishmentAmount).toFixed(2));
+    const garnishmentAmount = garnishmentPercent ? Number((baseAmount * garnishmentPercent).toFixed(2)) : 0;
+    const postGarnishment = Number((baseAmount - garnishmentAmount).toFixed(2));
 
     // Loan withholding runs AFTER garnishment so the loan amount can't push
     // the deposit negative. For each active loan whose DAY matches today
@@ -916,14 +1196,27 @@ async function main() {
       lastName: match.row.lastName,
       type: 'Deposit',
       amount: adjustedAmount,
-      originalAmount: rawAmount,
+      originalAmount: baseAmount,
       garnishmentPercent,
       garnishmentAmount,
       transactionId,
       location: csvLocation,
       matchedReportName: yotRow.staffName || '',
       matchedReportLocation: yotRow.locationName,
+      isRebate,
     });
+
+    if (isRebate) {
+      // baseAmount drove the disbursement row; record the original |negative|
+      // so the BRANCH MASTER YOT NOTES read "FIRSTNAME OWED $X" with the
+      // stylist's actual rebate amount (pre-deduction).
+      negativeRebates.push({
+        staffName: `${match.row.firstName} ${match.row.lastName}`.trim() || yotRow.staffName || '?',
+        locationName: csvLocation,
+        rebateAmount: baseAmount,
+        matched: true,
+      });
+    }
 
     if (garnishmentAmount > 0) {
       garnishmentPayoutRows.push({
@@ -970,6 +1263,166 @@ async function main() {
     }
   }
 
+  // Build per-location aggregates for the BRANCH MASTER daily tab.
+  //   - YOT column = sum of bankToBankAmount (signed) for ALL stylists at
+  //     the location from the cashout report — i.e., commission already
+  //     net of any -negative- bank-to-bank entries.
+  //   - BRANCH column = sum of exportRows.amount for the location (already
+  //     net of garnishment + loan withholding). For locations with
+  //     negative-bankToBank stylists, this naturally equals
+  //     `yotPerLocation + |negatives|` because we now emit a positive-
+  //     amount disbursement row for each negative stylist.
+  //   - BRANCH NOTES = per-loan annotations ("WH $X LOAN FIRSTNAME").
+  //   - YOT NOTES = per-rebate annotations ("FIRSTNAME OWED $X").
+  const branchMasterTemplate = loadBranchMasterTemplate(args.sheetId, args.account);
+  const branchMasterTabName = formatDailyTabName(args.date);
+
+  type PerLocAgg = DailyTabLocationAggregate;
+  const perLocation = new Map<string, PerLocAgg>();
+  const ensureAgg = (key: string): PerLocAgg => {
+    let agg = perLocation.get(key);
+    if (!agg) {
+      agg = { branchAmount: 0, branchNotes: '', yotAmount: 0, yotNotes: '' };
+      perLocation.set(key, agg);
+    }
+    return agg;
+  };
+
+  // YOT side: aggregate signed bankToBank across ALL report rows. Use the
+  // YOT-reported location (normalized) so locations not in CSV MASTER still
+  // get a number on the daily tab if they appear in the template.
+  for (const yotRow of report.rows) {
+    const key = normalizeLocation(yotRow.locationName);
+    if (!key) continue;
+    const agg = ensureAgg(key);
+    agg.yotAmount = Number((agg.yotAmount + (yotRow.bankToBankAmount ?? 0)).toFixed(2));
+  }
+  // YOT NOTES from rebates (matched + unmatched alike).
+  const yotNotesByKey = new Map<string, string[]>();
+  for (const r of negativeRebates) {
+    const key = normalizeLocation(r.locationName);
+    if (!key) continue;
+    const first = (r.staffName.split(' ')[0] || '').toUpperCase();
+    const note = `${first} OWED $${r.rebateAmount.toFixed(2)}`;
+    const arr = yotNotesByKey.get(key) || [];
+    arr.push(note);
+    yotNotesByKey.set(key, arr);
+  }
+  for (const [key, notes] of yotNotesByKey) {
+    ensureAgg(key).yotNotes = joinNotes(notes);
+  }
+
+  // BRANCH side: aggregate ALL exportRows.amount (positives + rebate
+  // rows). BRANCH per location matches the disbursements CSV per-location
+  // subtotal — what Branch actually pays out for the day.
+  //
+  // Policy note (2026-05-21): RJ chose this over "positives-only" so the
+  // operator can reconcile BRANCH against the CSV directly. If this gets
+  // flipped back, the only change needed is `if (r.isRebate) continue;`
+  // in this loop — the isRebate field is preserved on ExportRow.
+  const branchNotesByKey = new Map<string, string[]>();
+  const exportRowLocByStaff = new Map<string, string>();
+  for (const r of exportRows) {
+    exportRowLocByStaff.set(r.staffId, r.location);
+    const key = normalizeLocation(r.location);
+    if (!key) continue;
+    const agg = ensureAgg(key);
+    agg.branchAmount = Number((agg.branchAmount + r.amount).toFixed(2));
+  }
+  // BRANCH NOTES: one line per loan withholding this run ("WH $50 LOAN
+  // FIRSTNAME"), looking up the stylist's deposit location via the export
+  // row. Matches the format the operator has been writing manually on
+  // daily tabs.
+  for (const p of loanPaymentsThisRun) {
+    const loc = exportRowLocByStaff.get(p.staffId);
+    if (!loc) continue;
+    const key = normalizeLocation(loc);
+    if (!key) continue;
+    const first = (p.firstName.split(' ')[0] || '').toUpperCase();
+    const note = `WH $${p.withholding.toFixed(2)} LOAN ${first}`;
+    const arr = branchNotesByKey.get(key) || [];
+    arr.push(note);
+    branchNotesByKey.set(key, arr);
+  }
+  for (const [key, notes] of branchNotesByKey) {
+    ensureAgg(key).branchNotes = joinNotes(notes);
+  }
+
+  // Materialize an ordered, template-aligned view for diagnostics + write.
+  // Lookup: combine every per-location aggregate whose key equals the
+  // template label's normalized form OR starts with `${label} ` (so
+  // "Sterling" picks up both 'sterling' from CSV-MASTER-derived BRANCH
+  // amounts AND 'sterling warren' from the YOT report). Same combine
+  // applies to BRANCH and YOT note strings.
+  const findAggForLabel = (label: string): PerLocAgg | undefined => {
+    const key = normalizeLocation(label);
+    if (!key) return undefined;
+    let found = false;
+    const combined: PerLocAgg = { branchAmount: 0, branchNotes: '', yotAmount: 0, yotNotes: '' };
+    const branchNoteParts: string[] = [];
+    const yotNoteParts: string[] = [];
+    for (const [k, v] of perLocation) {
+      if (k === key || k.startsWith(`${key} `)) {
+        found = true;
+        combined.branchAmount = Number((combined.branchAmount + v.branchAmount).toFixed(2));
+        combined.yotAmount = Number((combined.yotAmount + v.yotAmount).toFixed(2));
+        if (v.branchNotes) branchNoteParts.push(v.branchNotes);
+        if (v.yotNotes) yotNoteParts.push(v.yotNotes);
+      }
+    }
+    if (!found) return undefined;
+    combined.branchNotes = joinNotes(branchNoteParts);
+    combined.yotNotes = joinNotes(yotNoteParts);
+    return combined;
+  };
+  const branchMasterPerLocation = branchMasterTemplate.locationLabels.map((label) => {
+    const agg = findAggForLabel(label);
+    return {
+      location: label,
+      branchAmount: agg?.branchAmount ?? 0,
+      branchNotes: agg?.branchNotes || '',
+      yotAmount: agg?.yotAmount ?? 0,
+      yotNotes: agg?.yotNotes || '',
+    };
+  });
+
+  if (args.dryRun) {
+    console.error(`[dry-run] skipping BRANCH MASTER daily tab write: would delete + recreate '${branchMasterTabName}' on sheet ${args.sheetId} with ${branchMasterPerLocation.length} locations`);
+  } else {
+    deleteTabIfExists(args.sheetId, args.account, branchMasterTabName);
+    addTab(args.sheetId, args.account, branchMasterTabName);
+    writeDailyTabContent({
+      spreadsheetId: args.sheetId,
+      account: args.account,
+      tabName: branchMasterTabName,
+      template: branchMasterTemplate,
+      resolved: branchMasterPerLocation,
+      date: args.date,
+    });
+    // Move the new tab to position `branchMasterIndex + 1` so the most
+    // recent daily tab sits immediately to the right of BRANCH MASTER and
+    // the rest of the daily tabs shift down (matches the operator's
+    // historical ordering: newest day on the left of the daily block).
+    // Best-effort — log a warning and continue if anything fails; the tab
+    // is already created with correct content.
+    try {
+      const info = gogJsonForAccount(args.account, ['sheets', 'metadata', args.sheetId]);
+      const sheets: any[] = info?.sheets || [];
+      const newTab = sheets.find((s) => s?.properties?.title === branchMasterTabName);
+      const branchMaster = sheets.find((s) => s?.properties?.title === BRANCH_MASTER_TAB);
+      if (newTab && branchMaster) {
+        await moveTabToIndex({
+          spreadsheetId: args.sheetId,
+          account: args.account,
+          sheetId: Number(newTab.properties.sheetId),
+          newIndex: Number(branchMaster.properties.index) + 1,
+        });
+      }
+    } catch (err: any) {
+      console.error(`[warn] failed to reposition '${branchMasterTabName}' tab (manual drag required): ${err?.message || err}`);
+    }
+  }
+
   const csvPath = path.join(args.outputDir, `branch-deposits-${args.date}.csv`);
   const diagnosticsPath = path.join(args.outputDir, `branch-deposits-${args.date}.diagnostics.json`);
   const disbursementsPath = path.join(args.outputDir, `disbursements-${args.date}.csv`);
@@ -993,6 +1446,9 @@ async function main() {
     loanWithholdingCount: loanPaymentsThisRun.length,
     loanPaymentRows: loanPaymentsThisRun,
     loansPaidOffToday,
+    branchMasterTabName,
+    branchMasterPerLocation,
+    negativeRebates,
   } satisfies MatchDiagnostics, null, 2), 'utf8');
 
   const typoRows = fuzzyMatchedRows.filter((r) => r.matchKind === 'typo');
@@ -1062,6 +1518,9 @@ Sourced from CSV MASTER on the Branch Daily Totals sheet, with garnishment + loa
     loanRuleCount: activeLoans.length,
     loanWithholdingCount: loanPaymentsThisRun.length,
     loansPaidOffTodayCount: loansPaidOffToday.length,
+    branchMasterTabName,
+    negativeRebateCount: negativeRebates.length,
+    negativeRebateMatchedCount: negativeRebates.filter((r) => r.matched).length,
   }, null, 2));
 }
 
