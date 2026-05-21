@@ -1233,22 +1233,18 @@ async function main() {
     ensureAgg(key).yotNotes = joinNotes(notes);
   }
 
-  // BRANCH side: aggregate positive-row amounts only (rebate rows are paid
-  // through the disbursements CSV but are EXCLUDED from BRANCH on the
-  // daily tab). Net effect: BRANCH = YOT + |negatives| - deductions for
-  // the location — i.e., YOT is the signed sum from cashout and BRANCH
-  // adds the negatives back as positives once (not twice).
+  // BRANCH side: aggregate ALL exportRows.amount (positives + rebate
+  // rows). BRANCH per location matches the disbursements CSV per-location
+  // subtotal — what Branch actually pays out for the day.
   //
-  // Example Clinton: positives = $78 + $184 + $52 = $314, Kelly = -$2.
-  //   YOT (signed) = $312. BRANCH = $314 (positives, with Kelly's $2
-  //   "added back"). Kelly's $2 row is still in the disbursements CSV;
-  //   the daily tab BRANCH and CSV per-location subtotal are different
-  //   views by design.
+  // Policy note (2026-05-21): RJ chose this over "positives-only" so the
+  // operator can reconcile BRANCH against the CSV directly. If this gets
+  // flipped back, the only change needed is `if (r.isRebate) continue;`
+  // in this loop — the isRebate field is preserved on ExportRow.
   const branchNotesByKey = new Map<string, string[]>();
   const exportRowLocByStaff = new Map<string, string>();
   for (const r of exportRows) {
     exportRowLocByStaff.set(r.staffId, r.location);
-    if (r.isRebate) continue;
     const key = normalizeLocation(r.location);
     if (!key) continue;
     const agg = ensureAgg(key);
