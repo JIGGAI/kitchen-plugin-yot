@@ -2357,6 +2357,156 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     }
   }
 
+  // GET /new-client-cohort-retention?windowStart=YYYY-MM-DD&windowEnd=YYYY-MM-DD
+  // Reads the precomputed `new_client_cohort_retention` table (refreshed
+  // nightly via run-new-client-cohort-retention.ts) and maps absolute
+  // cohort months to relative M-1/M-2/M-3 buckets based on the requested
+  // window's start month.
+  if (req.path === '/new-client-cohort-retention' && req.method === 'GET') {
+    try {
+      const { sqlite } = initializeDatabase(teamId);
+      const today = dateOnlyNow();
+      const firstOfMonth = today.slice(0, 8) + '01';
+      const windowStart = toDateOnlyInput(req.query.windowStart || req.query.start) || firstOfMonth;
+
+      // M-N is the cohort month N months before the window's start month.
+      const windowMonth = windowStart.slice(0, 7); // YYYY-MM
+      const monthOffset = (ym: string, delta: number): string => {
+        const [y, m] = ym.split('-').map(Number);
+        const d = new Date(Date.UTC(y!, m! - 1 + delta, 1));
+        return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+      };
+      const m1 = monthOffset(windowMonth, -1);
+      const m2 = monthOffset(windowMonth, -2);
+      const m3 = monthOffset(windowMonth, -3);
+      const monthList = [m1, m2, m3];
+
+      type Row = {
+        scope: 'stylist' | 'location';
+        locationId: string;
+        locationName: string | null;
+        stylistId: string | null;
+        stylistName: string | null;
+        cohortMonth: string;
+        newCount: number;
+        returnedCount: number;
+        computedAt: string;
+      };
+      const placeholders = monthList.map(() => '?').join(',');
+      // Join to locations and stylists. Stylists' id format is
+      // `<locationId>:<stylistId>`, so we match on the composite key. The
+      // dashboard uses stylistName as a first-name-within-location bridge
+      // to staff_retention's full staff_name field (e.g. "Kristin" →
+      // "Kristin Claybron" at Westland). LEFT JOINs preserve cohort rows
+      // when a name lookup misses.
+      const rows = sqlite.prepare(`
+        SELECT n.scope AS scope, n.location_id AS locationId, l.name AS locationName,
+               n.stylist_id AS stylistId, s.full_name AS stylistName,
+               n.cohort_month AS cohortMonth, n.new_count AS newCount,
+               n.returned_count AS returnedCount, n.computed_at AS computedAt
+        FROM new_client_cohort_retention n
+        LEFT JOIN locations l ON l.team_id = n.team_id AND l.id = n.location_id
+        LEFT JOIN stylists s ON s.team_id = n.team_id AND s.id = (n.location_id || ':' || n.stylist_id)
+        WHERE n.team_id = ?
+          AND n.cohort_month IN (${placeholders})
+      `).all(teamId, ...monthList) as Row[];
+
+      // Pivot: one record per (scope, locationId, stylistId?) with m1/m2/m3
+      // bucket subobjects. Empty bucket = { newCount: 0, returnedCount: 0 }
+      // (cohort had no new clients that month).
+      type Bucket = { newCount: number; returnedCount: number };
+      type StylistRecord = {
+        scope: 'stylist';
+        locationId: string;
+        locationName: string | null;
+        stylistId: string;
+        stylistName: string | null;
+        m1: Bucket & { month: string };
+        m2: Bucket & { month: string };
+        m3: Bucket & { month: string };
+      };
+      type LocationRecord = {
+        scope: 'location';
+        locationId: string;
+        locationName: string | null;
+        m1: Bucket & { month: string };
+        m2: Bucket & { month: string };
+        m3: Bucket & { month: string };
+      };
+      const stylistMap = new Map<string, StylistRecord>();
+      const locationMap = new Map<string, LocationRecord>();
+      const blank = (month: string): Bucket & { month: string } => ({ month, newCount: 0, returnedCount: 0 });
+
+      for (const r of rows) {
+        const bucketKey = r.cohortMonth === m1 ? 'm1' : r.cohortMonth === m2 ? 'm2' : 'm3';
+        const monthLabel = r.cohortMonth === m1 ? m1 : r.cohortMonth === m2 ? m2 : m3;
+        if (r.scope === 'stylist' && r.stylistId) {
+          const key = `${r.locationId}::${r.stylistId}`;
+          let rec = stylistMap.get(key);
+          if (!rec) {
+            rec = {
+              scope: 'stylist',
+              locationId: r.locationId,
+              locationName: r.locationName,
+              stylistId: r.stylistId,
+              stylistName: r.stylistName,
+              m1: blank(m1), m2: blank(m2), m3: blank(m3),
+            };
+            stylistMap.set(key, rec);
+          }
+          rec[bucketKey] = { month: monthLabel, newCount: r.newCount, returnedCount: r.returnedCount };
+        } else if (r.scope === 'location') {
+          let rec = locationMap.get(r.locationId);
+          if (!rec) {
+            rec = {
+              scope: 'location',
+              locationId: r.locationId,
+              locationName: r.locationName,
+              m1: blank(m1), m2: blank(m2), m3: blank(m3),
+            };
+            locationMap.set(r.locationId, rec);
+          }
+          rec[bucketKey] = { month: monthLabel, newCount: r.newCount, returnedCount: r.returnedCount };
+        }
+      }
+
+      const computedAt = rows.length ? rows.reduce((acc, r) => (r.computedAt > acc ? r.computedAt : acc), rows[0]!.computedAt) : null;
+      return {
+        status: 200,
+        data: {
+          windowStart,
+          windowMonth,
+          months: { m1, m2, m3 },
+          computedAt,
+          perStylist: Array.from(stylistMap.values()),
+          perLocation: Array.from(locationMap.values()),
+        },
+      };
+    } catch (error: any) {
+      return apiError(500, 'INTERNAL', error?.message || 'Failed to read new-client cohort retention');
+    }
+  }
+
+  // POST /new-client-cohort-retention/recompute?startMonth=YYYY-MM&endMonth=YYYY-MM
+  // Triggers the local-derived cohort recompute (reads from
+  // `appointments`, writes to `new_client_cohort_retention`). Mirrors the
+  // staff-retention sync trigger but with no YOT API call — everything's
+  // computed off data we already have, so this is fast (<1s for 6 months
+  // on a ~100k-row appointments table).
+  if (req.path === '/new-client-cohort-retention/recompute' && req.method === 'POST') {
+    try {
+      const startMonth = (req.query.startMonth as string | undefined) || undefined;
+      const endMonth = (req.query.endMonth as string | undefined) || undefined;
+      if (startMonth && !/^\d{4}-\d{2}$/.test(startMonth)) return apiError(400, 'BAD_REQUEST', 'startMonth must be YYYY-MM');
+      if (endMonth && !/^\d{4}-\d{2}$/.test(endMonth)) return apiError(400, 'BAD_REQUEST', 'endMonth must be YYYY-MM');
+      const { computeNewClientCohortRetention } = await import('../reports/compute-new-client-cohort-retention');
+      const result = computeNewClientCohortRetention({ teamId, startMonth, endMonth });
+      return { status: 200, data: result };
+    } catch (error: any) {
+      return apiError(500, 'INTERNAL', error?.message || 'Failed to recompute new-client cohort retention');
+    }
+  }
+
   // POST /staff-retention/sync?startDate=&endDate=&organisationId=
   if (req.path === '/staff-retention/sync' && req.method === 'POST') {
     const { db } = initializeDatabase(teamId);
