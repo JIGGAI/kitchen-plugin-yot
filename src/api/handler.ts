@@ -164,6 +164,17 @@ type PayoutExportDiagnostics = {
     location: string;
     date: string;
   }>;
+  loanPaymentRows?: Array<{
+    staffId: string;
+    date: string;
+    firstName: string;
+    lastName: string;
+    loanAmount: number;
+    totalPaid: number;
+    withholding: number;
+    day: string;
+    transactionId: string;
+  }>;
 };
 type PayoutLocationTotalRow = {
   date: string;
@@ -520,12 +531,27 @@ function readPayoutExportForDate(date: string): { rows: PayoutFactRow[]; generat
     garnishmentByKey.set(key, asNumber(row.amount));
   }
 
+  // Loan withholdings: indexed by staffId since loan rows don't carry a
+  // location (they're per-stylist-per-day). The exporter only applies a
+  // loan to one of the stylist's YOT rows (the first with capacity), so
+  // attaching the full withholding to the first CSV row keyed by staffId
+  // matches the actual deduction. Subsequent CSV rows for the same
+  // stylist (split-shift across locations) get 0.
+  const loanRows = diagnostics?.loanPaymentRows || [];
+  const loanRemainingByStaff = new Map<string, number>();
+  for (const row of loanRows) {
+    const prior = loanRemainingByStaff.get(row.staffId) || 0;
+    loanRemainingByStaff.set(row.staffId, Number((prior + asNumber(row.withholding)).toFixed(2)));
+  }
+
   return {
     generatedAt,
     rows: csvRows.map((row) => {
       const key = `${row.staffId}::${row.transactionId}::${normalizeMatchLocation(row.location)}`;
       const garnishmentAmount = garnishmentByKey.get(key) || 0;
-      const originalPayoutAmount = Number((row.amount + garnishmentAmount).toFixed(2));
+      const loanPaymentAmount = row.staffId ? (loanRemainingByStaff.get(row.staffId) || 0) : 0;
+      if (row.staffId && loanPaymentAmount > 0) loanRemainingByStaff.set(row.staffId, 0);
+      const originalPayoutAmount = Number((row.amount + garnishmentAmount + loanPaymentAmount).toFixed(2));
       const garnishmentPercent = garnishmentAmount > 0 && originalPayoutAmount > 0
         ? Number((garnishmentAmount / originalPayoutAmount).toFixed(4))
         : null;
@@ -538,7 +564,7 @@ function readPayoutExportForDate(date: string): { rows: PayoutFactRow[]; generat
         originalPayoutAmount,
         garnishmentPercent,
         garnishmentAmount,
-        loanPaymentAmount: 0,
+        loanPaymentAmount,
         netPayoutAmount: row.amount,
         lastUpdatedAt: generatedAt,
       } satisfies PayoutFactRow;
