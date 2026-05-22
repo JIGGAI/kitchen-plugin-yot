@@ -1344,6 +1344,22 @@ async function main() {
     arr.push(note);
     branchNotesByKey.set(key, arr);
   }
+  // Same shape for garnishments ("GARN $26.75 FIRSTNAME"). Garnishment
+  // rows carry their own `location` (set to the matched CSV MASTER
+  // location upstream), so we don't need the exportRowLocByStaff lookup
+  // — but fall back to it for robustness in case a future change drops
+  // the location field.
+  for (const g of garnishmentPayoutRows) {
+    const loc = g.location || exportRowLocByStaff.get(g.staffId);
+    if (!loc) continue;
+    const key = normalizeLocation(loc);
+    if (!key) continue;
+    const first = (g.firstName.split(' ')[0] || '').toUpperCase();
+    const note = `GARN $${g.amount.toFixed(2)} ${first}`;
+    const arr = branchNotesByKey.get(key) || [];
+    arr.push(note);
+    branchNotesByKey.set(key, arr);
+  }
   for (const [key, notes] of branchNotesByKey) {
     ensureAgg(key).branchNotes = joinNotes(notes);
   }
