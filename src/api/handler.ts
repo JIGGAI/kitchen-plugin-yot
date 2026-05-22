@@ -524,11 +524,19 @@ function readPayoutExportForDate(date: string): { rows: PayoutFactRow[]; generat
     ? JSON.parse(readFileSync(diagnosticsPath, 'utf8')) as PayoutExportDiagnostics
     : null;
   const generatedAt = diagnostics?.generatedAt || `${date}T00:00:00.000Z`;
+  // Garnishments: keyed by staffId + normalized location. The diagnostics
+  // payout row's transactionId encodes the garnishment amount, while the
+  // CSV row's transactionId encodes the net amount — they're deliberately
+  // different transactions, so joining on transactionId always missed.
+  // Sum garnishments per (staffId, location) and apply the total to the
+  // first matching CSV row; subsequent rows for the same stylist/location
+  // pair (rare) see 0.
   const garnishmentRows = diagnostics?.garnishmentPayoutRows || [];
   const garnishmentByKey = new Map<string, number>();
   for (const row of garnishmentRows) {
-    const key = `${row.staffId}::${row.transactionId}::${normalizeMatchLocation(row.location)}`;
-    garnishmentByKey.set(key, asNumber(row.amount));
+    const key = `${row.staffId}::${normalizeMatchLocation(row.location)}`;
+    const prior = garnishmentByKey.get(key) || 0;
+    garnishmentByKey.set(key, Number((prior + asNumber(row.amount)).toFixed(2)));
   }
 
   // Loan withholdings: indexed by staffId since loan rows don't carry a
@@ -547,8 +555,9 @@ function readPayoutExportForDate(date: string): { rows: PayoutFactRow[]; generat
   return {
     generatedAt,
     rows: csvRows.map((row) => {
-      const key = `${row.staffId}::${row.transactionId}::${normalizeMatchLocation(row.location)}`;
+      const key = `${row.staffId}::${normalizeMatchLocation(row.location)}`;
       const garnishmentAmount = garnishmentByKey.get(key) || 0;
+      if (garnishmentAmount > 0) garnishmentByKey.set(key, 0);
       const loanPaymentAmount = row.staffId ? (loanRemainingByStaff.get(row.staffId) || 0) : 0;
       if (row.staffId && loanPaymentAmount > 0) loanRemainingByStaff.set(row.staffId, 0);
       const originalPayoutAmount = Number((row.amount + garnishmentAmount + loanPaymentAmount).toFixed(2));
