@@ -2390,6 +2390,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         cohortMonth: string;
         newCount: number;
         returnedCount: number;
+        returnedToStylistCount: number | null;
         computedAt: string;
       };
       const placeholders = monthList.map(() => '?').join(',');
@@ -2403,7 +2404,9 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         SELECT n.scope AS scope, n.location_id AS locationId, l.name AS locationName,
                n.stylist_id AS stylistId, s.full_name AS stylistName,
                n.cohort_month AS cohortMonth, n.new_count AS newCount,
-               n.returned_count AS returnedCount, n.computed_at AS computedAt
+               n.returned_count AS returnedCount,
+               n.returned_to_stylist_count AS returnedToStylistCount,
+               n.computed_at AS computedAt
         FROM new_client_cohort_retention n
         LEFT JOIN locations l ON l.team_id = n.team_id AND l.id = n.location_id
         LEFT JOIN stylists s ON s.team_id = n.team_id AND s.id = (n.location_id || ':' || n.stylist_id)
@@ -2412,9 +2415,10 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       `).all(teamId, ...monthList) as Row[];
 
       // Pivot: one record per (scope, locationId, stylistId?) with m1/m2/m3
-      // bucket subobjects. Empty bucket = { newCount: 0, returnedCount: 0 }
-      // (cohort had no new clients that month).
-      type Bucket = { newCount: number; returnedCount: number };
+      // bucket subobjects. Empty bucket = zero counts (cohort had no new
+      // clients that month). returnedToStylistCount is nullable on pre-
+      // migration-0016 rows; coerce to 0 so the UI can always do math.
+      type Bucket = { newCount: number; returnedCount: number; returnedToStylistCount: number };
       type StylistRecord = {
         scope: 'stylist';
         locationId: string;
@@ -2435,7 +2439,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       };
       const stylistMap = new Map<string, StylistRecord>();
       const locationMap = new Map<string, LocationRecord>();
-      const blank = (month: string): Bucket & { month: string } => ({ month, newCount: 0, returnedCount: 0 });
+      const blank = (month: string): Bucket & { month: string } => ({ month, newCount: 0, returnedCount: 0, returnedToStylistCount: 0 });
 
       for (const r of rows) {
         const bucketKey = r.cohortMonth === m1 ? 'm1' : r.cohortMonth === m2 ? 'm2' : 'm3';
@@ -2454,7 +2458,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
             };
             stylistMap.set(key, rec);
           }
-          rec[bucketKey] = { month: monthLabel, newCount: r.newCount, returnedCount: r.returnedCount };
+          rec[bucketKey] = { month: monthLabel, newCount: r.newCount, returnedCount: r.returnedCount, returnedToStylistCount: r.returnedToStylistCount ?? 0 };
         } else if (r.scope === 'location') {
           let rec = locationMap.get(r.locationId);
           if (!rec) {
@@ -2466,7 +2470,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
             };
             locationMap.set(r.locationId, rec);
           }
-          rec[bucketKey] = { month: monthLabel, newCount: r.newCount, returnedCount: r.returnedCount };
+          rec[bucketKey] = { month: monthLabel, newCount: r.newCount, returnedCount: r.returnedCount, returnedToStylistCount: r.returnedToStylistCount ?? 0 };
         }
       }
 

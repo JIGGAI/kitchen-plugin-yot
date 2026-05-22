@@ -13,6 +13,9 @@
 //   - "Returned" = the same client_id has ANY later appointment in the
 //     business, to any stylist. The customer wants forward retention
 //     credited to the originating stylist.
+//   - "Returned to stylist" = the same client_id has a later appointment
+//     specifically with the originating stylist. Powers the Top Retainers
+//     leaderboard, which is keyed on same-stylist loyalty.
 //   - cohort_month = YYYY-MM of the client's FIRST appointment in the
 //     ingestion window. If a client somehow has new_client=1 on multiple
 //     appointments (rare YOT data quirk — ~0.05% of cases) we collapse
@@ -74,6 +77,7 @@ type RawCohortRow = {
   stylistId: string;
   newCount: number;
   returnedCount: number;
+  returnedToStylistCount: number;
 };
 
 function computeMonth(sqlite: SqliteDb, teamId: string, cohortMonth: string): RawCohortRow[] {
@@ -114,11 +118,18 @@ function computeMonth(sqlite: SqliteDb, teamId: string, cohortMonth: string): Ra
         WHERE a.team_id = ?
           AND a.client_id = c.client_id
           AND COALESCE(a.start_at, a.starts_at) > c.first_at
-      ) THEN 1 ELSE 0 END) AS returnedCount
+      ) THEN 1 ELSE 0 END) AS returnedCount,
+      SUM(CASE WHEN EXISTS (
+        SELECT 1 FROM appointments a
+        WHERE a.team_id = ?
+          AND a.client_id = c.client_id
+          AND a.stylist_id = c.stylist_id
+          AND COALESCE(a.start_at, a.starts_at) > c.first_at
+      ) THEN 1 ELSE 0 END) AS returnedToStylistCount
     FROM cohort c
     GROUP BY c.location_id, c.stylist_id
   `);
-  return stmt.all(teamId, monthStart, monthEnd, teamId) as RawCohortRow[];
+  return stmt.all(teamId, monthStart, monthEnd, teamId, teamId) as RawCohortRow[];
 }
 
 export function computeNewClientCohortRetention(options: ComputeOptions): ComputeResult {
@@ -138,13 +149,14 @@ export function computeNewClientCohortRetention(options: ComputeOptions): Comput
   const upsertStylist = sqlite.prepare(`
     INSERT INTO new_client_cohort_retention (
       id, team_id, scope, location_id, stylist_id, cohort_month,
-      new_count, returned_count, computed_at
-    ) VALUES (?, ?, 'stylist', ?, ?, ?, ?, ?, ?)
+      new_count, returned_count, returned_to_stylist_count, computed_at
+    ) VALUES (?, ?, 'stylist', ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(team_id, scope, location_id, stylist_id, cohort_month)
     DO UPDATE SET
-      new_count      = excluded.new_count,
-      returned_count = excluded.returned_count,
-      computed_at    = excluded.computed_at
+      new_count                  = excluded.new_count,
+      returned_count             = excluded.returned_count,
+      returned_to_stylist_count  = excluded.returned_to_stylist_count,
+      computed_at                = excluded.computed_at
   `);
   // location-scope rows have stylist_id = NULL. SQLite treats NULLs as
   // distinct in UNIQUE constraints, so we need a separate ON CONFLICT
@@ -160,8 +172,8 @@ export function computeNewClientCohortRetention(options: ComputeOptions): Comput
   const insertLocation = sqlite.prepare(`
     INSERT INTO new_client_cohort_retention (
       id, team_id, scope, location_id, stylist_id, cohort_month,
-      new_count, returned_count, computed_at
-    ) VALUES (?, ?, 'location', ?, NULL, ?, ?, ?, ?)
+      new_count, returned_count, returned_to_stylist_count, computed_at
+    ) VALUES (?, ?, 'location', ?, NULL, ?, ?, ?, ?, ?)
   `);
 
   const tx = sqlite.transaction((monthList: string[]) => {
@@ -178,17 +190,22 @@ export function computeNewClientCohortRetention(options: ComputeOptions): Comput
           month,
           r.newCount,
           r.returnedCount,
+          r.returnedToStylistCount,
           computedAt,
         );
         stylistRowsWritten++;
       }
 
-      // Location rollups: sum across stylists at each location.
-      const byLocation = new Map<string, { newCount: number; returnedCount: number }>();
+      // Location rollups: sum across stylists at each location. The
+      // returned_to_stylist column is a sum of same-stylist returns at
+      // that location — kept consistent with stylist rows but not surfaced
+      // in the location UI.
+      const byLocation = new Map<string, { newCount: number; returnedCount: number; returnedToStylistCount: number }>();
       for (const r of rows) {
-        const acc = byLocation.get(r.locationId) || { newCount: 0, returnedCount: 0 };
+        const acc = byLocation.get(r.locationId) || { newCount: 0, returnedCount: 0, returnedToStylistCount: 0 };
         acc.newCount += r.newCount;
         acc.returnedCount += r.returnedCount;
+        acc.returnedToStylistCount += r.returnedToStylistCount;
         byLocation.set(r.locationId, acc);
       }
       for (const [locationId, agg] of byLocation) {
@@ -200,6 +217,7 @@ export function computeNewClientCohortRetention(options: ComputeOptions): Comput
           month,
           agg.newCount,
           agg.returnedCount,
+          agg.returnedToStylistCount,
           computedAt,
         );
         locationRowsWritten++;
