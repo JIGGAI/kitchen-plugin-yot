@@ -357,6 +357,16 @@ function formatCsvCell(value: string | number): string {
   return text;
 }
 
+// Adds one calendar day to a YYYY-MM-DD string. Used for the
+// Disbursement Date column on the CSV emailed to Miranda — she was
+// manually bumping every row to the next day, so we now ship it
+// pre-advanced (run on 5/21 → disbursement date 5/22).
+function nextDayIso(date: string): string {
+  const d = new Date(`${date}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + 1);
+  return d.toISOString().slice(0, 10);
+}
+
 function toCsv(rows: ExportRow[]): string {
   const lines = [
     ['STAFF ID', 'FIRST NAME', 'LAST NAME', 'TYPE', 'AMOUNT', 'TRANSACTION ID', 'LOCATION'].join(','),
@@ -380,9 +390,11 @@ function toCsv(rows: ExportRow[]): string {
 //   ID, First Name, Last Name, Type, Amount, Transaction ID, Location,
 //   Disbursement Date (YYYY-MM-DD), Description
 // First seven columns are sourced from our export rows (which already have
-// garnishment + loan withholdings applied); date is args.date; description
-// is left blank for Miranda to annotate as needed.
+// garnishment + loan withholdings applied); the disbursement date is
+// args.date + 1 day (Branch pays out the day after the export runs);
+// description is left blank for Miranda to annotate as needed.
 function toDisbursementsCsv(rows: ExportRow[], date: string): string {
+  const disbursementDate = nextDayIso(date);
   const lines = [
     ['ID', 'First Name', 'Last Name', 'Type', 'Amount', 'Transaction ID', 'Location', 'Disbursement Date (YYYY-MM-DD)', 'Description'].join(','),
   ];
@@ -395,7 +407,7 @@ function toDisbursementsCsv(rows: ExportRow[], date: string): string {
       Number.isInteger(row.amount) ? String(row.amount) : row.amount.toFixed(2),
       row.transactionId,
       row.location,
-      date,
+      disbursementDate,
       '',
     ].map(formatCsvCell).join(','));
   }
