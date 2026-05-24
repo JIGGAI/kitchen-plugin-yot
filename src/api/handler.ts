@@ -10,6 +10,7 @@ import { and, eq, sql } from 'drizzle-orm';
 import { initializeDatabase } from '../db';
 import * as schema from '../db/schema';
 import { listAppointmentsForRequest } from './list-appointments';
+import { stylistsByLocationForRange } from './stylists-by-location';
 import { buildAppointmentLookupsForRows } from './appointment-lookups';
 import { characterizeClientPaging, extractAppointmentsRangeRows, fetchAppointmentsRange, fetchBusiness, fetchClients, fetchLocationServices, fetchLocationStaff, fetchLocations, fetchStaffProfile, ping } from '../drivers/yot-client';
 import { runStaffCashoutReport } from '../reports/run-staff-cashout';
@@ -3292,6 +3293,20 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       };
     } catch (error: any) {
       return apiError(500, 'DATABASE_ERROR', error?.message || 'Failed to read appointments');
+    }
+  }
+
+  if (req.path === '/stylists-by-location' && req.method === 'GET') {
+    try {
+      const { db } = initializeDatabase(teamId);
+      const startsAfter  = cleanString(req.query.startsAfter  || req.query.startAtGte || req.query.dateFrom);
+      const startsBefore = cleanString(req.query.startsBefore || req.query.startAtLte || req.query.dateTo);
+      return {
+        status: 200,
+        data: { data: stylistsByLocationForRange(db, teamId, { startsAfter, startsBefore }) },
+      };
+    } catch (error: any) {
+      return apiError(500, 'DATABASE_ERROR', error?.message || 'Failed to read stylists by location');
     }
   }
 
