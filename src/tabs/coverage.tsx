@@ -27,6 +27,7 @@ import { api, formatDateTime, modal, t } from './common';
     averageDailyAppointments?: number;
     requiredStylists?: number;
     customersPerStylistForDay?: number;
+    holiday?: { name: string } | null;
   };
 
   type Ratios = { weekday: number; saturday: number; sunday: number };
@@ -111,6 +112,7 @@ import { api, formatDateTime, modal, t } from './common';
     // YOT data hygiene: same physical store appears 2-3 times in the master
     // list with subtle name variations; only one record is the live one.
     function isRowInactive(row: LocationRow): boolean {
+      if (row.holiday) return false; // public holiday = closed today, but keep the row visible
       if (typeof row.averageDailyAppointments !== 'number') return false; // not loaded yet
       const hasAppointments = (row.averageDailyAppointments || 0) > 0;
       const hasRostered = row.slots.some((s) => (s.scheduledStylists || 0) > 0);
@@ -142,6 +144,7 @@ import { api, formatDateTime, modal, t } from './common';
             averageDailyAppointments: syncRes?.averageDailyAppointments,
             requiredStylists: syncRes?.requiredStylists,
             customersPerStylistForDay: syncRes?.customersPerStylistForDay,
+            holiday: syncRes?.holiday || null,
           };
         }
         const slotsRes = await api('yot', teamId!, `/coverage/slots?locationId=${encodeURIComponent(locationId)}&date=${date}`) as any;
@@ -157,6 +160,7 @@ import { api, formatDateTime, modal, t } from './common';
           averageDailyAppointments: slotsRes?.averageDailyAppointments,
           requiredStylists: slotsRes?.requiredStylists,
           customersPerStylistForDay: slotsRes?.customersPerStylistForDay,
+          holiday: slotsRes?.holiday || null,
         };
       } catch (e: any) {
         const msg = deepError(e);
@@ -348,19 +352,31 @@ import { api, formatDateTime, modal, t } from './common';
             ),
           ),
           h('tbody', null,
-            ...visibleRows.map((row: LocationRow) => h('tr', { key: row.locationId },
-              h('td', { style: locCellStyle },
-                row.locationName,
-                typeof row.averageDailyAppointments === 'number'
-                  ? h('div', { style: { ...t.faint, fontSize: '0.7rem', fontWeight: 400 } },
-                      `avg ${row.averageDailyAppointments.toFixed(1)}/day → need ${row.requiredStylists ?? '?'} (1:${row.customersPerStylistForDay ?? '?'})`)
-                  : null,
-                row.error
-                  ? h('div', { style: { color: '#ff8888', fontSize: '0.7rem', fontWeight: 400 } }, row.error.slice(0, 60))
-                  : null,
-              ),
-              ...columns.map((c) => cellFor(row, c)),
-            )),
+            ...visibleRows.map((row: LocationRow) => row.holiday
+              ? h('tr', { key: row.locationId },
+                  h('td', { style: locCellStyle },
+                    row.locationName,
+                    h('div', { style: { ...t.faint, fontSize: '0.7rem', fontWeight: 400 } }, 'Public holiday — store closed'),
+                  ),
+                  h('td', {
+                    colSpan: Math.max(1, columns.length),
+                    style: { textAlign: 'center', fontWeight: 600, letterSpacing: '0.04em', color: '#d8c8ff', background: '#2b2540' },
+                    title: `Closed — ${row.holiday.name}`,
+                  }, `CLOSED — ${row.holiday.name}`),
+                )
+              : h('tr', { key: row.locationId },
+                  h('td', { style: locCellStyle },
+                    row.locationName,
+                    typeof row.averageDailyAppointments === 'number'
+                      ? h('div', { style: { ...t.faint, fontSize: '0.7rem', fontWeight: 400 } },
+                          `avg ${row.averageDailyAppointments.toFixed(1)}/day → need ${row.requiredStylists ?? '?'} (1:${row.customersPerStylistForDay ?? '?'})`)
+                      : null,
+                    row.error
+                      ? h('div', { style: { color: '#ff8888', fontSize: '0.7rem', fontWeight: 400 } }, row.error.slice(0, 60))
+                      : null,
+                  ),
+                  ...columns.map((c) => cellFor(row, c)),
+                )),
           ),
         ),
       ) : (!busy && !error

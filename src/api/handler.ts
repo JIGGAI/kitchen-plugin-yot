@@ -3642,7 +3642,9 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       upsertSyncState(covDb, teamId, 'location_coverage_facts', {
         lastSyncedAt: now, lastSuccessAt: now, lastError: null, rowCount,
       });
-      return { status: 200, data: result };
+      const { holidaysByDate } = await import('../coverage/sync-holidays');
+      const holidayName = holidaysByDate(covSqlite, teamId, [body.date!]).get(body.date!) ?? null;
+      return { status: 200, data: { ...result, holiday: holidayName ? { name: holidayName } : null } };
     } catch (err: any) {
       const msg = err?.message || 'Coverage sync failed';
       const now = new Date().toISOString();
