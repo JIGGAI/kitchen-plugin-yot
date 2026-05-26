@@ -318,3 +318,33 @@ export async function fetchFranchisesHtml(config: YotConfig): Promise<string> {
 
 export { parseFranchisesHtml } from '../coverage/parse-franchises-html';
 export type { FranchiseEntry } from '../coverage/parse-franchises-html';
+
+/**
+ * Fetch the public-holidays list page from /Staff/PublicHolidays/List.
+ * Returns the joined HTML of all pages (one <li itemId> per holiday). The
+ * `?PageIndex=N` query param is REQUIRED — without it the endpoint returns the
+ * empty "no items" shell. Mirrors fetchFranchisesHtml's pagination.
+ */
+export async function fetchPublicHolidaysHtml(config: YotConfig): Promise<string> {
+  const baseUrl = resolveBaseUrl(config);
+  const pages: string[] = [];
+  for (let pageIndex = 0; pageIndex < 20; pageIndex++) {
+    const res = await mvcFetch(config, `/Staff/PublicHolidays/List?PageIndex=${pageIndex}`, {
+      method: 'POST',
+      headers: {
+        origin: baseUrl,
+        referer: `${baseUrl}/Staff/PublicHolidays/Index`,
+      },
+      body: '',
+    });
+    if (!res.ok) {
+      const snippet = (await res.text()).slice(0, 240);
+      throw new Error(`YOT MVC public-holidays fetch failed: HTTP ${res.status} ${snippet}`);
+    }
+    const html = await res.text();
+    pages.push(html);
+    if (!/itemId=/i.test(html)) break;
+    if (!/hasNextPage:\s*true/i.test(html)) break;
+  }
+  return pages.join('\n');
+}

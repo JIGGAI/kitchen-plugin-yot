@@ -3642,7 +3642,9 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       upsertSyncState(covDb, teamId, 'location_coverage_facts', {
         lastSyncedAt: now, lastSuccessAt: now, lastError: null, rowCount,
       });
-      return { status: 200, data: result };
+      const { holidaysByDate } = await import('../coverage/sync-holidays');
+      const holidayName = holidaysByDate(covSqlite, teamId, [body.date!]).get(body.date!) ?? null;
+      return { status: 200, data: { ...result, holiday: holidayName ? { name: holidayName } : null } };
     } catch (err: any) {
       const msg = err?.message || 'Coverage sync failed';
       const now = new Date().toISOString();
@@ -3660,7 +3662,10 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     const { readCachedCoverage } = await import('../coverage/sync');
     const cached = readCachedCoverage(teamId, locationId, date);
     if (!cached) return apiError(404, 'NO_COVERAGE_CACHE', 'Run /coverage/sync first');
-    return { status: 200, data: cached };
+    const { holidaysByDate } = await import('../coverage/sync-holidays');
+    const { sqlite: covSqlite } = initializeDatabase(teamId);
+    const holidayName = holidaysByDate(covSqlite, teamId, [date]).get(date) ?? null;
+    return { status: 200, data: { ...cached, holiday: holidayName ? { name: holidayName } : null } };
   }
 
   if (req.path === '/coverage/light-windows' && req.method === 'GET') {
@@ -3698,6 +3703,8 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     };
     const averagingDays = Number(req.query.averagingDays) || DEFAULT_AVERAGING_DAYS;
     const { db, sqlite } = initializeDatabase(teamId);
+    const { holidaysByDate } = await import('../coverage/sync-holidays');
+    const { attachHolidayToCells } = await import('./coverage-holiday');
 
     type ActualRow = { locationId: string; date: string; stylists: number };
     const actualRows = sqlite.prepare(
@@ -3890,7 +3897,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         const underCover = lightHours >= LIGHT_HOURS_RED_THRESHOLD;
         return { date, stylists, appts, required, lightHours, underCover, closed: false, hasRoster: !!meta };
       });
-      return { locationId, days: out };
+      return { locationId, days: attachHolidayToCells(out, holidaysByDate(sqlite, teamId, days)) };
     });
 
     // Mirror the daily heatmap's isRowInactive filter: drop locations where
@@ -4108,6 +4115,26 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     const { listFranchises } = await import('../coverage/sync-franchises');
     const data = listFranchises(teamId);
     return { status: 200, data: { data, total: data.length } };
+  }
+
+  if (req.path === '/public-holidays/sync' && req.method === 'POST') {
+    try {
+      const { syncPublicHolidays } = await import('../coverage/sync-holidays');
+      const result = await syncPublicHolidays({ teamId });
+      return { status: 200, data: result };
+    } catch (err: any) {
+      const msg = err?.message || 'Public holidays sync failed';
+      if (err?.name === 'MvcAuthMissingError') return apiError(412, 'MVC_AUTH_MISSING', msg);
+      if (err?.name === 'MvcAuthExpiredError') return apiError(401, 'MVC_AUTH_EXPIRED', msg);
+      return apiError(500, 'PUBLIC_HOLIDAYS_SYNC_FAILED', msg);
+    }
+  }
+
+  if (req.path === '/public-holidays' && req.method === 'GET') {
+    const { listPublicHolidays } = await import('../coverage/sync-holidays');
+    const from = cleanString(req.query.from) || undefined;
+    const to = cleanString(req.query.to) || undefined;
+    return { status: 200, data: { holidays: listPublicHolidays(teamId, from, to) } };
   }
 
   if (req.path === '/coverage/staff-available' && req.method === 'GET') {
