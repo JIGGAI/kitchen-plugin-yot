@@ -4110,6 +4110,26 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     return { status: 200, data: { data, total: data.length } };
   }
 
+  if (req.path === '/public-holidays/sync' && req.method === 'POST') {
+    try {
+      const { syncPublicHolidays } = await import('../coverage/sync-holidays');
+      const result = await syncPublicHolidays({ teamId });
+      return { status: 200, data: result };
+    } catch (err: any) {
+      const msg = err?.message || 'Public holidays sync failed';
+      if (err?.name === 'MvcAuthMissingError') return apiError(412, 'MVC_AUTH_MISSING', msg);
+      if (err?.name === 'MvcAuthExpiredError') return apiError(401, 'MVC_AUTH_EXPIRED', msg);
+      return apiError(500, 'PUBLIC_HOLIDAYS_SYNC_FAILED', msg);
+    }
+  }
+
+  if (req.path === '/public-holidays' && req.method === 'GET') {
+    const { listPublicHolidays } = await import('../coverage/sync-holidays');
+    const from = cleanString(req.query.from) || undefined;
+    const to = cleanString(req.query.to) || undefined;
+    return { status: 200, data: { holidays: listPublicHolidays(teamId, from, to) } };
+  }
+
   if (req.path === '/coverage/staff-available' && req.method === 'GET') {
     const locationId = cleanString(req.query.locationId);
     const from = cleanString(req.query.from);
