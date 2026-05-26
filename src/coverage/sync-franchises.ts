@@ -80,6 +80,9 @@ export async function syncFranchises(opts: SyncFranchisesOptions): Promise<SyncF
     config,
     (cookie) => { persistMvcCookie(sqlite, teamId, cookie); },
     (cfg) => fetchFranchisesHtml(cfg),
+    // No franchise rows → possibly an expired-cookie zombie session; let
+    // withAutoLogin probe and re-login rather than persisting an empty sync.
+    { looksEmpty: (h) => !/itemId=/i.test(h) },
   );
   const entries = parseFranchisesHtml(html);
   const syncedAt = new Date().toISOString();

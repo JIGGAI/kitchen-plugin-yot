@@ -10,6 +10,30 @@ import type { YotConfig } from '../types';
 
 const DEFAULT_BASE_URL = 'https://app.youreontime.com';
 
+// YOT gates several endpoints on a real browser User-Agent (the default Node
+// fetch UA gets bounced). Shared across login + session-probe requests.
+const BROWSER_UA =
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36';
+
+// A page that always renders the global "welcome menu" chrome when the session
+// is authenticated. Used purely as a cheap auth probe.
+const SESSION_PROBE_PATH = '/Staff/PublicHolidays/Index';
+
+/**
+ * Decide whether an MVC page's HTML reflects a genuinely authenticated session.
+ *
+ * YOT does NOT redirect expired AJAX requests to /Account/Login — it returns
+ * HTTP 200 with empty lists and a "zombie" welcome menu: the staff profile
+ * image points at `ProfilePic/0` and the name is blank. A live session binds
+ * the logged-in staff's numeric id (e.g. `ProfilePic/34422`). The login page
+ * has no welcome menu at all. All three cases collapse to: a profile id > 0.
+ */
+export function isMvcSessionLive(html: string): boolean {
+  const match = html.match(/\/Administration\/Staff\/ProfilePic\/(\d+)/);
+  if (!match) return false;
+  return Number(match[1]) > 0;
+}
+
 export class MvcAuthMissingError extends Error {
   constructor() {
     super('YotConfig.mvcCookie is empty. Capture a Cookie header from a logged-in YOT session and store it in config.');
@@ -104,8 +128,7 @@ export async function loginToMvc(config: YotConfig): Promise<string> {
     redirect: 'manual',
     headers: {
       'content-type': 'application/x-www-form-urlencoded',
-      'user-agent':
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36',
+      'user-agent': BROWSER_UA,
       origin: baseUrl,
       referer: `${baseUrl}/Account/Login`,
     },
@@ -152,26 +175,71 @@ export async function loginToMvc(config: YotConfig): Promise<string> {
 }
 
 /**
- * Wrap `op` so that an MvcAuthExpiredError triggers a login attempt (when
- * credentials are configured), persists the new cookie via the supplied
- * `persistCookie` callback, then retries `op` once with the refreshed config.
+ * GET a normal authenticated page and report whether the session is live.
+ * Unlike mvcFetch, this never throws on expiry — it resolves to a boolean so
+ * withAutoLogin can decide whether an empty result was real or a dead cookie.
+ */
+export async function defaultVerifyMvcSession(config: YotConfig): Promise<boolean> {
+  if (!config.mvcCookie || !config.mvcCookie.trim()) return false;
+  const res = await fetch(`${resolveBaseUrl(config)}${SESSION_PROBE_PATH}`, {
+    headers: { accept: 'text/html', cookie: config.mvcCookie, 'user-agent': BROWSER_UA },
+    redirect: 'manual',
+  });
+  if (res.status !== 200) return false;
+  return isMvcSessionLive(await res.text());
+}
+
+export interface WithAutoLoginOptions<T> {
+  /**
+   * Flags an op result that looks empty. When it does, the session is probed
+   * (YOT returns 200 + empty list for an expired cookie instead of redirecting
+   * to login), and a dead session is treated as auth expiry.
+   */
+  looksEmpty?: (result: T) => boolean;
+  /** Probe whether the session is authenticated. Injectable for tests. */
+  verifySession?: (config: YotConfig) => Promise<boolean>;
+  /** Login implementation. Injectable for tests; defaults to loginToMvc. */
+  login?: (config: YotConfig) => Promise<string>;
+}
+
+/**
+ * Wrap `op` so that auth expiry triggers a login (when credentials are
+ * configured), persists the new cookie via `persistCookie`, then retries `op`
+ * once with the refreshed config.
+ *
+ * Expiry is detected two ways: a thrown MvcAuthExpiredError/MvcAuthMissingError,
+ * OR — when `options.looksEmpty` is supplied — an empty result whose session
+ * fails a verification probe (the "zombie session" case YOT doesn't redirect).
  */
 export async function withAutoLogin<T>(
   config: YotConfig,
   persistCookie: (cookie: string) => Promise<void> | void,
   op: (config: YotConfig) => Promise<T>,
+  options: WithAutoLoginOptions<T> = {},
 ): Promise<T> {
+  const verifySession = options.verifySession ?? defaultVerifyMvcSession;
+  const login = options.login ?? loginToMvc;
+
+  const attempt = async (cfg: YotConfig, allowVerify: boolean): Promise<T> => {
+    const result = await op(cfg);
+    if (allowVerify && options.looksEmpty?.(result) && !(await verifySession(cfg))) {
+      throw new MvcAuthExpiredError(200);
+    }
+    return result;
+  };
+
   try {
-    return await op(config);
+    return await attempt(config, true);
   } catch (err) {
     const isAuthErr = err instanceof MvcAuthExpiredError || err instanceof MvcAuthMissingError;
     const canLogin = !!(config.mvcUserName && config.mvcPassword && config.mvcOrganisation);
     if (!isAuthErr || !canLogin) throw err;
 
-    const fresh = await loginToMvc(config);
+    const fresh = await login(config);
     await persistCookie(fresh);
-    const refreshed: YotConfig = { ...config, mvcCookie: fresh };
-    return op(refreshed);
+    // Don't re-verify on the retry: a still-empty result is genuine emptiness,
+    // and re-probing a fresh-but-empty session would loop.
+    return attempt({ ...config, mvcCookie: fresh }, false);
   }
 }
 

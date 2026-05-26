@@ -329,6 +329,9 @@ export async function syncCoverageForLocationDay(opts: SyncCoverageOptions): Pro
     config,
     (cookie) => persistMvcCookie(sqlite, opts.teamId, cookie),
     (cfg) => fetchLocationRosterHtml(cfg, opts.locationId, weekStart),
+    // An expired cookie returns `{"Items":[],"Any":false}` with no roster cells
+    // instead of redirecting to login; probe + re-login rather than parse empty.
+    { looksEmpty: (h) => !/change_staff_day_schedule/.test(h) },
   );
   const allEntries = parseRosterHtml(html);
 
