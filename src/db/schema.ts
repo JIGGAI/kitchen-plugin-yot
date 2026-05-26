@@ -73,6 +73,19 @@ export const franchises = sqliteTable('franchises', {
   pk: primaryKey({ columns: [t.teamId, t.franchiseId] }),
 }));
 
+export const publicHolidays = sqliteTable('public_holidays', {
+  teamId: text('team_id').notNull(),
+  holidayId: text('holiday_id').notNull(),
+  name: text('name').notNull(),
+  date: text('date').notNull(),       // YYYY-MM-DD
+  syncedAt: text('synced_at').notNull(),
+}, (t) => ({
+  pk: primaryKey({ columns: [t.teamId, t.holidayId] }),
+}));
+
+export type PublicHoliday = typeof publicHolidays.$inferSelect;
+export type NewPublicHoliday = typeof publicHolidays.$inferInsert;
+
 export const stylists = sqliteTable('stylists', {
   id: text('id').primaryKey(),
   teamId: text('team_id').notNull(),
