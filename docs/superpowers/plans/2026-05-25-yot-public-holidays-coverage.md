@@ -754,7 +754,7 @@ Run: `curl -fsS -u kitchen:hair -X POST "http://127.0.0.1:7777/api/plugins/yot/p
 Expected: `{"syncedAt":"...","count":17}` (≈17 holidays).
 Verify: `sqlite3 ~/.openclaw/kitchen/plugins/yot/yot-hmx-marketing-team.db "SELECT date,name FROM public_holidays WHERE team_id='hmx-marketing-team' ORDER BY date LIMIT 5;"`
 
-> **Deploy note:** Steps that hit the live kitchen (`/public-holidays/sync`, and the UI verification in Tasks 7/8) require the new plugin code to be running. After the plugin PR merges, deploy with `npm run build` in `~/kitchen-plugin-yot` + `launchctl kickstart -k gui/$(id -u)/ai.openclaw.gateway` (the kitchen symlinks this working tree; ~2.5 min cold-start). Get explicit approval before restarting — it bounces all of OpenClaw.
+> **Deploy note:** Steps that hit the live kitchen (`/public-holidays/sync`, and the UI verification in Tasks 7/8) require the new plugin code to be running. To deploy, just run **`npm run build`** in `~/kitchen-plugin-yot` — the kitchen symlinks this working tree and picks up the rebuilt `dist/` **without a restart** (per RJ). A gateway restart is NOT needed for plugin code changes.
 
 ---
 
@@ -786,5 +786,5 @@ gh pr create --base main --title "feat(coverage): CLOSED — <holiday> on staff-
 
 - **DRY:** `attachHolidayToCells` is the single source of the "holiday ⇒ closed + suppress" rule; both response paths use the same `holidaysByDate` lookup.
 - **YAGNI:** no per-location overrides, no holiday editing UI, no half-day support (per the spec's out-of-scope).
-- **Do not rebuild `dist/` or restart the gateway** until the plugin PR is merged and deploy is approved — the live kitchen runs this working tree's `dist/`.
+- **Be aware the live kitchen runs this working tree's `dist/`.** Tests run from `src/` via vitest and do NOT touch the live service, so develop freely. Only `npm run build` makes changes live (no restart needed) — hold that until the PR is merged / deploy is approved.
 - The `holiday` field is computed at read time, so a `/public-holidays/sync` takes effect immediately without re-running `/coverage/sync`.
