@@ -72,6 +72,53 @@ describe('parseRosterHtml', () => {
   });
 });
 
+describe('parseRosterHtml — absence / exception cells', () => {
+  // Build a one-cell roster fragment with the given inner HTML, matching the
+  // shape ENTRY_RE expects (real YOT markup wraps the reason in a red span).
+  const cell = (inner: string) =>
+    `<table class="grid"><tbody><tr><td>` +
+    `<a class="change_staff_day_schedule" href="Javascript:void(0)" data-id="91001" ` +
+    `data-name="Josh Christen (Artist)" data-day="27" data-month="5" data-year="2026">${inner}</a>` +
+    `</td></tr></tbody></table>`;
+
+  const only = (inner: string) => {
+    const entries = parseRosterHtml(cell(inner));
+    expect(entries).toHaveLength(1);
+    return entries[0]!;
+  };
+
+  it('classifies a "Sick" red-span cell as absent with the reason', () => {
+    const e = only(`<span style='color:red'>Sick</span>`);
+    expect(e.status).toBe('absent');
+    expect(e.reason).toBe('Sick');
+    expect(e.startsAt).toBeNull();
+    expect(e.endsAt).toBeNull();
+  });
+
+  it('classifies a "No Show" red-span cell as absent with the reason', () => {
+    const e = only(`<span style='color:red'>No Show</span>`);
+    expect(e.status).toBe('absent');
+    expect(e.reason).toBe('No Show');
+  });
+
+  it('keeps store-wide holiday/closure labels as holiday (not absent)', () => {
+    expect(only(`<span style='color:red'>Memorial Day</span>`).status).toBe('holiday');
+    expect(only(`<span style='color:red'>Memorial weekend</span>`).status).toBe('holiday');
+    expect(only(`<span style='color:red'>Holiday</span>`).status).toBe('holiday');
+  });
+
+  it('still treats "Not Scheduled" as not-scheduled with no reason', () => {
+    const e = only('Not Scheduled');
+    expect(e.status).toBe('not-scheduled');
+    expect(e.reason).toBeUndefined();
+  });
+
+  it('does not include absent rows in scheduledOnly', () => {
+    const entries = parseRosterHtml(cell(`<span style='color:red'>Sick</span>`));
+    expect(scheduledOnly(entries)).toHaveLength(0);
+  });
+});
+
 describe('scheduledOnly', () => {
   it('keeps only entries that have a non-null startsAt/endsAt', () => {
     const entries = parseRosterHtml(FIXTURE);

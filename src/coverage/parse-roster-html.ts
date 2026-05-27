@@ -13,7 +13,15 @@
 // Some <a> tags in the response are not closed (the </td> closes them), so
 // the entry-level regex terminates on </a> OR </td> to handle both cases.
 
-export type RosterStatus = 'scheduled' | 'not-scheduled' | 'holiday';
+//   4. "<span style='color:red'>Sick</span>" / "No Show" / other reasons
+//                                                 → status: 'absent' + reason
+//
+// YOT renders a per-stylist exception (called in sick, no-show, etc.) as a
+// red <span> carrying a free-text reason in place of the shift time. Those are
+// distinct from store-wide closures ("Holiday", "Memorial Day", …), which we
+// keep classifying as 'holiday' via a keyword list so they don't surface as
+// individual absences.
+export type RosterStatus = 'scheduled' | 'not-scheduled' | 'holiday' | 'absent';
 
 export type RosterEntry = {
   stylistId: string;
@@ -22,7 +30,14 @@ export type RosterEntry = {
   status: RosterStatus;
   startsAt: string | null;  // ISO datetime, null unless scheduled
   endsAt: string | null;
+  reason?: string;          // free-text label for 'absent' cells (e.g. "Sick")
 };
+
+// Reason labels that mean a store-wide closure / holiday rather than one
+// stylist being out. Matched case-insensitively as substrings against the
+// cell's visible text. Extend as new closure labels appear in YOT.
+const CLOSURE_REASON_RE =
+  /holiday|memorial|christmas|thanksgiving|new year|labor day|independence|july\s*4|closed/i;
 
 const ENTRY_RE = /<a\s+class="change_staff_day_schedule"[^>]*?data-id="(\d+)"[^>]*?data-name="([^"]*)"[^>]*?data-day="(\d+)"[^>]*?data-month="(\d+)"[^>]*?data-year="(\d+)"[^>]*>([\s\S]*?)(?:<\/a>|<\/td>)/g;
 const TIME_RANGE_RE = /(\d{1,2}):(\d{2})\s*(AM|PM)\s*to\s*<br\s*\/?>\s*(\d{1,2}):(\d{2})\s*(AM|PM)/i;
@@ -53,10 +68,15 @@ function decodeInner(raw: string): string {
     .replace(/&#39;/g, "'");
 }
 
-function classifyAndExtract(inner: string, date: string): { status: RosterStatus; startsAt: string | null; endsAt: string | null } {
+function classifyAndExtract(inner: string, date: string): { status: RosterStatus; startsAt: string | null; endsAt: string | null; reason?: string } {
   const decoded = decodeInner(inner);
-  // Holiday: any <span> mentioning Holiday wins over time match (a holiday cell sometimes has both)
-  if (/Holiday/i.test(decoded)) {
+  // Visible text with tags stripped + whitespace collapsed, e.g.
+  // "<span style='color:red'>Sick</span>" → "Sick". Used to detect closure
+  // labels and to carry the absence reason.
+  const text = decoded.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+  // Store-wide closure label (Holiday, Memorial Day, …) wins over a time match
+  // (a holiday cell sometimes carries both).
+  if (CLOSURE_REASON_RE.test(text)) {
     return { status: 'holiday', startsAt: null, endsAt: null };
   }
   const match = decoded.match(TIME_RANGE_RE);
@@ -69,7 +89,12 @@ function classifyAndExtract(inner: string, date: string): { status: RosterStatus
       endsAt: isoDateTime(date, end.h, end.m),
     };
   }
-  // Default: anything else (including "Not Scheduled") is treated as not-scheduled.
+  // A non-empty reason that isn't "Not Scheduled" is a per-stylist absence
+  // (called in sick, no-show, etc.) — carry the label through as the reason.
+  if (text && !/^not\s*scheduled$/i.test(text)) {
+    return { status: 'absent', startsAt: null, endsAt: null, reason: text };
+  }
+  // Default: "Not Scheduled" / empty.
   return { status: 'not-scheduled', startsAt: null, endsAt: null };
 }
 
@@ -83,8 +108,8 @@ export function parseRosterHtml(html: string): RosterEntry[] {
     const year = Number(m[5]);
     const inner = m[6];
     const date = isoDate(year, month, day);
-    const { status, startsAt, endsAt } = classifyAndExtract(inner, date);
-    out.push({ stylistId, stylistName, date, status, startsAt, endsAt });
+    const { status, startsAt, endsAt, reason } = classifyAndExtract(inner, date);
+    out.push({ stylistId, stylistName, date, status, startsAt, endsAt, ...(reason ? { reason } : {}) });
   }
   return out;
 }
