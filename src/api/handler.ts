@@ -3931,7 +3931,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         WHERE team_id = ? AND location_id = ? AND date = ?`
     ).get(teamId, locationId, date) as CacheRow | undefined;
 
-    type RosterRow = { stylistId?: string; stylistName?: string; status?: string; startsAt?: string; endsAt?: string };
+    type RosterRow = { stylistId?: string; stylistName?: string; status?: string; startsAt?: string; endsAt?: string; reason?: string };
     const rosterRows: RosterRow[] = (() => {
       if (!cacheRow?.rostered_payload) return [];
       try {
@@ -3942,6 +3942,16 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     const scheduledRosterRows = rosterRows.filter((r): r is Required<Pick<RosterRow, 'stylistId' | 'startsAt' | 'endsAt'>> & RosterRow =>
       r.status === 'scheduled' && !!r.stylistId && !!r.startsAt && !!r.endsAt
     );
+    // Per-stylist absences (called in sick, no-show, …): scheduled-but-out rows
+    // YOT marks with a red reason label and no shift time. Surfaced in the grid
+    // so a manager sees who was expected but isn't here. First reason per
+    // stylist wins (a day has one cell per stylist anyway).
+    const absentReasonById = new Map<string, string>();
+    for (const r of rosterRows) {
+      if (r.status === 'absent' && r.stylistId && !absentReasonById.has(r.stylistId)) {
+        absentReasonById.set(r.stylistId, (r.reason || 'Out').trim() || 'Out');
+      }
+    }
 
     // Business hours = earliest shift start → latest shift end (with a 30-min
     // pad on each side so the time-axis header has a little breathing room
@@ -4011,6 +4021,9 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     for (const r of scheduledRosterRows) {
       if (!stylistNameById.has(r.stylistId)) idsNeedingNames.add(r.stylistId);
     }
+    for (const id of absentReasonById.keys()) {
+      if (!stylistNameById.has(id)) idsNeedingNames.add(id);
+    }
     for (const a of appointments) {
       if (a.stylistId && !stylistNameById.has(a.stylistId)) idsNeedingNames.add(a.stylistId);
     }
@@ -4032,6 +4045,8 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       shiftStartAt: string | null;
       shiftEndAt: string | null;
       onRoster: boolean;
+      absent?: boolean;
+      absenceReason?: string;
     };
     const rosteredById = new Map<string, StylistRow>();
     for (const r of scheduledRosterRows) {
@@ -4055,7 +4070,11 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     }
     const offRosterIds = new Set<string>();
     for (const a of appointments) {
-      if (a.stylistId && !rosteredById.has(a.stylistId)) offRosterIds.add(a.stylistId);
+      // An absent stylist may still have a (cancelled/reassigned) appointment
+      // carrying their id — show them as absent, not as an off-roster worker.
+      if (a.stylistId && !rosteredById.has(a.stylistId) && !absentReasonById.has(a.stylistId)) {
+        offRosterIds.add(a.stylistId);
+      }
     }
     const stylists: StylistRow[] = [...rosteredById.values()]
       .sort((a, b) => (a.shiftStartAt || '').localeCompare(b.shiftStartAt || ''));
@@ -4068,6 +4087,19 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         onRoster: false,
       });
     }
+    // Absent stylists last, alphabetical — out today with their reason badge.
+    const absentRows: StylistRow[] = [...absentReasonById.entries()]
+      .map(([id, reason]) => ({
+        stylistId: id,
+        fullName: stylistNameById.get(id) || `Stylist ${id}`,
+        shiftStartAt: null,
+        shiftEndAt: null,
+        onRoster: false,
+        absent: true,
+        absenceReason: reason,
+      }))
+      .sort((a, b) => a.fullName.localeCompare(b.fullName));
+    stylists.push(...absentRows);
 
     const responseAppointments = appointments.map((a) => ({
       id: a.id,
