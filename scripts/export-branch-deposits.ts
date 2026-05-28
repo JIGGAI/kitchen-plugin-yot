@@ -76,11 +76,6 @@ type ExportRow = {
   location: string;
   matchedReportName: string;
   matchedReportLocation: string | null;
-  // Set when the row came from a negative bankToBank — paid via the
-  // disbursements CSV (operator settles with the stylist via Branch) but
-  // excluded from the BRANCH MASTER daily tab's BRANCH column (which
-  // tracks only positives, matching the operator's accounting model).
-  isRebate: boolean;
 };
 
 type GarnishmentRule = {
@@ -1078,10 +1073,13 @@ async function main() {
   const loanPaymentsThisRun: LoanPaymentRow[] = [];
   const loansPaidOffToday: LoanPaidOff[] = [];
   const loanCellUpdates: Array<{ rowNumber: number; totalPaid: number; remainingBalance: number }> = [];
-  // Tracks stylists whose bankToBank was negative for the day — the shop
-  // "owes" them that amount as a makewhole rebate. Drives both the BRANCH
-  // MASTER daily tab YOT NOTES ("FIRSTNAME OWED $X") and the new
-  // disbursements rows that pay them out.
+  // Tracks stylists whose bankToBank was negative for the day — the
+  // stylist OWES the shop that amount (e.g. rebate/void absorbed by the
+  // shop on their behalf). Drives the BRANCH MASTER daily tab YOT NOTES
+  // ("FIRSTNAME OWES $X") only — we do NOT emit a disbursement row,
+  // garnishment, or loan withholding, since there is no payment going
+  // out to act on. Recovery of the obligation happens outside this
+  // pipeline.
   type NegativeRebate = {
     staffName: string;
     locationName: string | null;
@@ -1099,10 +1097,10 @@ async function main() {
     const match = matchYotRowToMaster(yotRow, masterIndexes);
     if (!match) {
       if (isRebate) {
-        // Tracked in negativeRebates instead of unmatchedReport — the
-        // watchdog's "pay them manually for today's amount" phrasing is
-        // only correct for positive bankToBank rows. YOT NOTES on the
-        // BRANCH MASTER daily tab will still annotate the rebate.
+        // Tracked in negativeRebates instead of unmatchedReport — there's
+        // no positive payment to chase, so the watchdog's "pay manually"
+        // alert doesn't apply. YOT NOTES on the BRANCH MASTER daily tab
+        // will still annotate the obligation.
         negativeRebates.push({
           staffName: yotRow.staffName || '?',
           locationName: yotRow.locationName,
@@ -1127,6 +1125,20 @@ async function main() {
         locationName: yotRow.locationName,
         matchKind: match.kind,
       });
+    }
+
+    if (isRebate) {
+      // Stylist owes the shop $baseAmount. Annotate BRANCH MASTER YOT
+      // NOTES only — no disbursement, garnishment, or loan withholding
+      // (no payment is going out for those to act on).
+      const csvLocation = match.row.location || yotRow.locationName || null;
+      negativeRebates.push({
+        staffName: `${match.row.firstName} ${match.row.lastName}`.trim() || yotRow.staffName || '?',
+        locationName: csvLocation,
+        rebateAmount: baseAmount,
+        matched: true,
+      });
+      continue;
     }
 
     const garnishmentRule = garnishmentRules.get(match.row.staffId) || null;
@@ -1215,20 +1227,7 @@ async function main() {
       location: csvLocation,
       matchedReportName: yotRow.staffName || '',
       matchedReportLocation: yotRow.locationName,
-      isRebate,
     });
-
-    if (isRebate) {
-      // baseAmount drove the disbursement row; record the original |negative|
-      // so the BRANCH MASTER YOT NOTES read "FIRSTNAME OWED $X" with the
-      // stylist's actual rebate amount (pre-deduction).
-      negativeRebates.push({
-        staffName: `${match.row.firstName} ${match.row.lastName}`.trim() || yotRow.staffName || '?',
-        locationName: csvLocation,
-        rebateAmount: baseAmount,
-        matched: true,
-      });
-    }
 
     if (garnishmentAmount > 0) {
       garnishmentPayoutRows.push({
@@ -1280,12 +1279,11 @@ async function main() {
   //     the location from the cashout report — i.e., commission already
   //     net of any -negative- bank-to-bank entries.
   //   - BRANCH column = sum of exportRows.amount for the location (already
-  //     net of garnishment + loan withholding). For locations with
-  //     negative-bankToBank stylists, this naturally equals
-  //     `yotPerLocation + |negatives|` because we now emit a positive-
-  //     amount disbursement row for each negative stylist.
+  //     net of garnishment + loan withholding). Rebate (negative
+  //     bankToBank) stylists do NOT produce an exportRow, so they don't
+  //     contribute to BRANCH — they only show up as a YOT NOTES annotation.
   //   - BRANCH NOTES = per-loan annotations ("WH $X LOAN FIRSTNAME").
-  //   - YOT NOTES = per-rebate annotations ("FIRSTNAME OWED $X").
+  //   - YOT NOTES = per-rebate annotations ("FIRSTNAME OWES $X").
   const branchMasterTemplate = loadBranchMasterTemplate(args.sheetId, args.account);
   const branchMasterTabName = formatDailyTabName(args.date);
 
@@ -1315,7 +1313,7 @@ async function main() {
     const key = normalizeLocation(r.locationName);
     if (!key) continue;
     const first = (r.staffName.split(' ')[0] || '').toUpperCase();
-    const note = `${first} OWED $${r.rebateAmount.toFixed(2)}`;
+    const note = `${first} OWES $${r.rebateAmount.toFixed(2)}`;
     const arr = yotNotesByKey.get(key) || [];
     arr.push(note);
     yotNotesByKey.set(key, arr);
@@ -1324,14 +1322,11 @@ async function main() {
     ensureAgg(key).yotNotes = joinNotes(notes);
   }
 
-  // BRANCH side: aggregate ALL exportRows.amount (positives + rebate
-  // rows). BRANCH per location matches the disbursements CSV per-location
-  // subtotal — what Branch actually pays out for the day.
-  //
-  // Policy note (2026-05-21): RJ chose this over "positives-only" so the
-  // operator can reconcile BRANCH against the CSV directly. If this gets
-  // flipped back, the only change needed is `if (r.isRebate) continue;`
-  // in this loop — the isRebate field is preserved on ExportRow.
+  // BRANCH side: aggregate exportRows.amount. exportRows only contains
+  // positive-bankToBank stylists (post-deduction), so BRANCH per location
+  // matches the disbursements CSV per-location subtotal — what Branch
+  // actually pays out for the day. Rebate stylists are tracked in
+  // negativeRebates / YOT NOTES only and never reach this loop.
   const branchNotesByKey = new Map<string, string[]>();
   const exportRowLocByStaff = new Map<string, string>();
   for (const r of exportRows) {
