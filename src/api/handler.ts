@@ -1973,6 +1973,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
   if (req.path === '/staff-performance' && req.method === 'GET') {
     try {
       const { sqlite } = initializeDatabase(teamId);
+      const { parseHoursWorkedToMinutes, formatMinutesAsHours } = await import('../reports/reports/staff-performance');
       const today = dateOnlyNow();
       const startDate = toDateOnlyInput(req.query.startDate || req.query.start || req.query.date) || today;
       const endDate = toDateOnlyInput(req.query.endDate || req.query.end || req.query.date) || startDate;
@@ -1982,6 +1983,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         servicesPerSale: number | null; productsSold: number | null; productsValue: number | null;
         totalSalesValue: number | null; pointsEarned: number | null; clientsPerPoint: number | null;
         commissionTipsTotal: number | null; avgSaleValue: number | null;
+        averageTip: number | null; hoursWorkedRaw: string | null; totalPerHour: number | null;
         lastUpdatedAt: string | null;
       };
       const facts = sqlite.prepare(
@@ -1991,7 +1993,9 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
           products_sold AS productsSold, products_value AS productsValue,
           total_sales_value AS totalSalesValue, points_earned AS pointsEarned,
           clients_per_point AS clientsPerPoint, commission_tips_total AS commissionTipsTotal,
-          avg_sale_value AS avgSaleValue, last_updated_at AS lastUpdatedAt
+          avg_sale_value AS avgSaleValue, average_tip AS averageTip,
+          hours_worked_raw AS hoursWorkedRaw, total_per_hour AS totalPerHour,
+          last_updated_at AS lastUpdatedAt
          FROM staff_performance_facts WHERE team_id = ? AND date BETWEEN ? AND ?`,
       ).all(teamId, startDate, endDate) as StaffPerfFact[];
 
@@ -2000,6 +2004,9 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         totalSalesCount: number; serviceSold: number; servicesValue: number;
         productsSold: number; productsValue: number; totalSalesValue: number;
         pointsEarned: number; commissionTipsTotal: number;
+        // tipsTotal = Σ(avg_tip × sale_count) so the range/subtotal avg tip is a
+        // proper weighted average; hoursMinutes sums parsed "Xh, Ym" cells.
+        tipsTotal: number; hoursMinutes: number;
       };
       const buckets = new Map<string, Acc>();
       let lastUpdatedAt: string | null = null;
@@ -2009,7 +2016,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
           locationName: f.locationName, staffName: f.staffName,
           totalSalesCount: 0, serviceSold: 0, servicesValue: 0,
           productsSold: 0, productsValue: 0, totalSalesValue: 0,
-          pointsEarned: 0, commissionTipsTotal: 0,
+          pointsEarned: 0, commissionTipsTotal: 0, tipsTotal: 0, hoursMinutes: 0,
         };
         acc.totalSalesCount += Number(f.totalSalesCount || 0);
         acc.serviceSold += Number(f.serviceSold || 0);
@@ -2019,16 +2026,25 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         acc.totalSalesValue += Number(f.totalSalesValue || 0);
         acc.pointsEarned += Number(f.pointsEarned || 0);
         acc.commissionTipsTotal += Number(f.commissionTipsTotal || 0);
+        acc.tipsTotal += Number(f.averageTip || 0) * Number(f.totalSalesCount || 0);
+        acc.hoursMinutes += parseHoursWorkedToMinutes(f.hoursWorkedRaw);
         buckets.set(key, acc);
         lastUpdatedAt = mostRecentIso(lastUpdatedAt, f.lastUpdatedAt);
       }
-      const rows = Array.from(buckets.values()).map((a) => ({
-        ...a,
-        // Recompute ratios from sums so multi-day ranges aggregate correctly.
-        servicesPerSale: a.totalSalesCount > 0 ? a.serviceSold / a.totalSalesCount : null,
-        avgSaleValue: a.totalSalesCount > 0 ? a.totalSalesValue / a.totalSalesCount : null,
-        clientsPerPoint: a.pointsEarned > 0 ? a.totalSalesCount / a.pointsEarned : null,
-      })).sort((a, b) => b.totalSalesValue - a.totalSalesValue);
+      const rows = Array.from(buckets.values()).map((a) => {
+        const hours = a.hoursMinutes / 60;
+        return {
+          ...a,
+          // Recompute ratios from sums so multi-day ranges aggregate correctly.
+          servicesPerSale: a.totalSalesCount > 0 ? a.serviceSold / a.totalSalesCount : null,
+          avgSaleValue: a.totalSalesCount > 0 ? a.totalSalesValue / a.totalSalesCount : null,
+          clientsPerPoint: a.pointsEarned > 0 ? a.totalSalesCount / a.pointsEarned : null,
+          averageTip: a.totalSalesCount > 0 ? a.tipsTotal / a.totalSalesCount : null,
+          hoursWorkedMinutes: a.hoursMinutes,
+          hoursWorked: formatMinutesAsHours(a.hoursMinutes),
+          totalPerHour: hours > 0 ? a.totalSalesValue / hours : null,
+        };
+      }).sort((a, b) => b.totalSalesValue - a.totalSalesValue);
       return { status: 200, data: { ok: true, startDate, endDate, rowCount: rows.length, lastUpdatedAt, rows } };
     } catch (error: any) {
       return apiError(500, 'INTERNAL', error?.message || 'Failed to read staff performance facts');
