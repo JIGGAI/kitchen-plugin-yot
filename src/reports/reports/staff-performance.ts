@@ -121,6 +121,32 @@ function cleanString(value: unknown): string | null {
   return text || null;
 }
 
+/**
+ * Parse YOT's "Hours Worked" cell (e.g. "8h, 0m", "8h", "45m", "1h, 30m")
+ * into total minutes. Tolerant of missing parts, decimals ("8.5h"), and
+ * junk/blank — anything unparseable yields 0 so range aggregation never
+ * crashes. Used to sum hours across a multi-day range before recomputing
+ * $/hour from summed sales ÷ summed hours.
+ */
+export function parseHoursWorkedToMinutes(raw: string | null | undefined): number {
+  if (raw == null) return 0;
+  const s = String(raw).trim();
+  if (!s) return 0;
+  const h = s.match(/(\d+(?:\.\d+)?)\s*h/i);
+  const m = s.match(/(\d+(?:\.\d+)?)\s*m/i);
+  if (!h && !m) return 0;
+  const hours = h ? Number(h[1]) : 0;
+  const mins = m ? Number(m[1]) : 0;
+  const total = (Number.isFinite(hours) ? hours : 0) * 60 + (Number.isFinite(mins) ? mins : 0);
+  return Math.round(total);
+}
+
+/** Format a minute count back into YOT's "Xh, Ym" shape. */
+export function formatMinutesAsHours(minutes: number): string {
+  const safe = Number.isFinite(minutes) && minutes > 0 ? Math.round(minutes) : 0;
+  return `${Math.floor(safe / 60)}h, ${safe % 60}m`;
+}
+
 export function buildStaffPerformanceParameterDiscovery(
   params: StaffPerformanceParams,
   apiKey: string,
