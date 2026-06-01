@@ -2447,14 +2447,22 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       };
       const placeholders = monthList.map(() => '?').join(',');
       // Join to locations and stylists. Stylists' id format is
-      // `<locationId>:<stylistId>`, so we match on the composite key. The
-      // dashboard uses stylistName as a first-name-within-location bridge
-      // to staff_retention's full staff_name field (e.g. "Kristin" →
-      // "Kristin Claybron" at Westland). LEFT JOINs preserve cohort rows
-      // when a name lookup misses.
+      // `<locationId>:<stylistId>`, so we match on the composite key.
+      // LEFT JOINs preserve cohort rows when a name lookup misses.
+      // stylistName: prefer a real "First Last" built from given_name +
+      // surname (YOT now supplies surname on the staff API). The dashboard
+      // bridges this to staff_retention's full "First Last" staff_name, so
+      // emitting the full name lets it disambiguate same-first-name stylists
+      // at one location (e.g. Allison Indra vs Allison Grider). Falls back to
+      // full_name (often first-name-only) when surname isn't populated yet.
       const rows = sqlite.prepare(`
         SELECT n.scope AS scope, n.location_id AS locationId, l.name AS locationName,
-               n.stylist_id AS stylistId, s.full_name AS stylistName,
+               n.stylist_id AS stylistId,
+               CASE
+                 WHEN s.surname IS NOT NULL AND TRIM(s.surname) <> ''
+                   THEN TRIM(TRIM(COALESCE(s.given_name, s.full_name, '')) || ' ' || TRIM(s.surname))
+                 ELSE s.full_name
+               END AS stylistName,
                n.cohort_month AS cohortMonth, n.new_count AS newCount,
                n.returned_count AS returnedCount,
                n.returned_to_stylist_count AS returnedToStylistCount,
