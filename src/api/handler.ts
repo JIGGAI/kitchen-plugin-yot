@@ -39,6 +39,27 @@ import type {
   YotConfig,
 } from '../types';
 
+// ── Location-name canonicalization ───────────────────────────────────────────
+// YOT sometimes records one physical shop under several names over time (the
+// StaffPerformance report carries free-text location names, not ids). Map those
+// historical variants onto the canonical active location name so per-location
+// aggregates don't split a single store into several rows. Keyed by normalized
+// name (trim + collapse internal whitespace + lowercase). Non-listed names pass
+// through unchanged. Add new variant→canonical pairs here as YOT renames sites.
+const LOCATION_NAME_ALIASES: Record<string, string> = {
+  // St. Augustine FL "Treaty Oaks" shop — recorded under three names over time
+  // (see ranges: "Treaty Oaks St. Augustine Fl." → "St. Augustine FL." →
+  // "Treaty Oaks St. Aug. FL."). Canonical active record is id 7432.
+  'st. augustine fl.': 'Treaty Oaks St. Aug. FL.',
+  'treaty oaks st. augustine fl.': 'Treaty Oaks St. Aug. FL.',
+};
+
+export function canonicalLocationName(name: string | null | undefined): string {
+  const raw = String(name ?? '');
+  const norm = raw.trim().replace(/\s+/g, ' ').toLowerCase();
+  return LOCATION_NAME_ALIASES[norm] ?? raw;
+}
+
 export type PluginRequest = {
   method: string;
   path: string;
@@ -2011,9 +2032,12 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       const buckets = new Map<string, Acc>();
       let lastUpdatedAt: string | null = null;
       for (const f of facts) {
-        const key = `${f.locationName}::${f.staffName}`;
+        // Collapse historical name variants of one shop onto its canonical name
+        // so a single store doesn't appear as several locations.
+        const locationName = canonicalLocationName(f.locationName);
+        const key = `${locationName}::${f.staffName}`;
         const acc = buckets.get(key) || {
-          locationName: f.locationName, staffName: f.staffName,
+          locationName, staffName: f.staffName,
           totalSalesCount: 0, serviceSold: 0, servicesValue: 0,
           productsSold: 0, productsValue: 0, totalSalesValue: 0,
           pointsEarned: 0, commissionTipsTotal: 0, tipsTotal: 0, hoursMinutes: 0,
