@@ -15,11 +15,14 @@
 // We iterate YOT positives and look each up in CSV MASTER. A match emits
 // an export row with the YOT bank-to-bank amount minus any garnishment;
 // the transaction id is rebuilt in the format Branch has been receiving
-// (<LastName><StaffId><AmountInteger>12/30/1899). When YOT pays someone
+// (<LastName><StaffId><AmountInteger><M/D/YYYY><Location>). When YOT pays
+// someone
 // who isn't on CSV MASTER, the watchdog appends a placeholder row to the
 // sheet and emails RJ.
 //
-// Per-day tab handling (the old `5/13/26` tab flow) is intentionally gone.
+// Per-day tabs: the BRANCH MASTER daily tab (Branch Daily Totals sheet) and
+// a CSV mirror tab (Branch DISPURSEMENTS sheet) are both recreated per run,
+// named M/D/YY.
 
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -503,12 +506,25 @@ function toSheetValues(rows: GarnishmentPayoutRow[]): string[][] {
   ];
 }
 
-// Branch's TRANSACTION ID convention, mirrored from the per-day tabs the
-// operator used to maintain by hand: lastName + staffId + integer amount
+// Branch's TRANSACTION ID convention: lastName + staffId + integer amount
 // (truncated, not rounded — matches what operators typed historically)
-// + literal "12/30/1899" (Sheets' epoch placeholder).
-function buildTransactionId(lastName: string, staffId: string, amount: number): string {
-  return `${lastName}${staffId}${Math.floor(amount)}12/30/1899`;
+// + payout date + location. The date used to be the literal "12/30/1899"
+// (Sheets' epoch placeholder copied from the old hand-maintained tabs),
+// which made the id collide whenever the same stylist netted the same
+// whole-dollar amount again — Branch rejects duplicate transaction ids.
+// The real payout date (same M/D/YYYY shape) fixes cross-day collisions;
+// the location (spaces stripped) fixes same-day split-shift collisions
+// where one stylist deposits at two shops.
+function buildTransactionId(lastName: string, staffId: string, amount: number, dateIso: string, location: string): string {
+  return `${lastName}${staffId}${Math.floor(amount)}${formatTransactionDate(dateIso)}${location.replace(/\s+/g, '')}`;
+}
+
+// M/D/YYYY (no zero-padding, four-digit year) — same shape as the old
+// "12/30/1899" literal the ids carried before the date was real.
+function formatTransactionDate(dateIso: string): string {
+  const m = dateIso.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) throw new Error(`Invalid ISO date: ${dateIso}`);
+  return `${Number(m[2])}/${Number(m[3])}/${m[1]}`;
 }
 
 async function loadCsvMasterRows(sheetId: string, _account: string): Promise<MasterRow[]> {
@@ -873,6 +889,57 @@ async function writeDailyTabContent(args: {
   await sheetsApi.updateValues(spreadsheetId, `'${tabName}'!A1:G${BRANCH_MASTER_TOTAL_ROW}`, grid, 'USER_ENTERED');
 }
 
+// Mirrors the disbursements CSV onto a per-day tab ("M/D/YY") on the Branch
+// DISPURSEMENTS sheet — same rows, same column order as the CSV BLANK MASTER
+// template. The operator maintained these tabs by hand through 5/19/26; this
+// resumes them automatically. Delete + recreate makes re-runs idempotent
+// (same pattern as the BRANCH MASTER daily tab). RAW input keeps
+// leading-zero staff ids (e.g. "0731") as text instead of letting Sheets
+// coerce them to numbers and drop the zero.
+async function writeDispursementsDailyTab(args: {
+  account: string;
+  tabName: string;
+  rows: ExportRow[];
+  date: string;
+}): Promise<void> {
+  const disbursementDate = nextDayIso(args.date);
+  const values: (string | number)[][] = [
+    ['ID', 'First Name', 'Last Name', 'Type', 'Amount', 'Transaction ID', 'Location', 'Disbursement Date (YYYY-MM-DD)', 'Description'],
+    ...args.rows.map((row) => [
+      row.staffId,
+      row.firstName,
+      row.lastName,
+      row.type,
+      row.amount,
+      row.transactionId,
+      row.location,
+      disbursementDate,
+      '',
+    ]),
+  ];
+  await deleteTabIfExists(DISPURSEMENTS_SHEET_ID, args.account, args.tabName);
+  await addTab(DISPURSEMENTS_SHEET_ID, args.account, args.tabName);
+  await sheetsApi.updateValues(DISPURSEMENTS_SHEET_ID, `'${args.tabName}'!A1:I${values.length}`, values, 'RAW');
+  // Position right of the CSV BLANK MASTER template (newest day first),
+  // matching where the operator kept the hand-made daily tabs. Best-effort —
+  // the tab already has correct content if the move fails.
+  try {
+    const tabs = await sheetsApi.listTabs(DISPURSEMENTS_SHEET_ID);
+    const newTab = tabs.find((t) => t.title === args.tabName);
+    const template = tabs.find((t) => t.title === DISPURSEMENTS_TEMPLATE_TAB);
+    if (newTab && template) {
+      await moveTabToIndex({
+        spreadsheetId: DISPURSEMENTS_SHEET_ID,
+        account: args.account,
+        sheetId: newTab.sheetId,
+        newIndex: template.index + 1,
+      });
+    }
+  } catch (err: any) {
+    console.error(`[warn] failed to reposition '${args.tabName}' tab on Branch DISPURSEMENTS (manual drag required): ${err?.message || err}`);
+  }
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   mkdirSync(args.outputDir, { recursive: true });
@@ -1006,6 +1073,16 @@ async function main() {
       continue;
     }
 
+    // Use CSV MASTER's location (column G on the Branch Daily Totals
+    // sheet) as the canonical location string. YOT's report appends the
+    // state abbreviation (e.g. "Brighton MI") which doesn't match the
+    // sheet's location field downstream consumers join against.
+    // matchedReportLocation keeps the raw YOT string for traceability in
+    // the watchdog log; only `location` (the field that flows to the CSV)
+    // gets normalized. Hoisted above the loan loop because transaction ids
+    // (deposit, garnishment, and loan rows alike) embed the location.
+    const csvLocation = match.row.location || yotRow.locationName || '';
+
     const garnishmentRule = garnishmentRules.get(match.row.staffId) || null;
     const garnishmentPercent = garnishmentRule?.percent ?? null;
     const garnishmentAmount = garnishmentPercent ? Number((baseAmount * garnishmentPercent).toFixed(2)) : 0;
@@ -1044,7 +1121,7 @@ async function main() {
         totalPaid: newTotalPaid,
         withholding: actual,
         day: loan.day,
-        transactionId: buildTransactionId(loan.lastName, loan.staffId, actual),
+        transactionId: buildTransactionId(loan.lastName, loan.staffId, actual, args.date, csvLocation),
       });
       loanCellUpdates.push({
         rowNumber: loan.rowNumber,
@@ -1069,16 +1146,8 @@ async function main() {
     }
 
     const adjustedAmount = Number((postGarnishment - loanWithheldTotal).toFixed(2));
-    const transactionId = buildTransactionId(match.row.lastName, match.row.staffId, adjustedAmount);
+    const transactionId = buildTransactionId(match.row.lastName, match.row.staffId, adjustedAmount, args.date, csvLocation);
 
-    // Use CSV MASTER's location (column G on the Branch Daily Totals
-    // sheet) as the canonical location string. YOT's report appends the
-    // state abbreviation (e.g. "Brighton MI") which doesn't match the
-    // sheet's location field downstream consumers join against.
-    // matchedReportLocation keeps the raw YOT string for traceability in
-    // the watchdog log; only `location` (the field that flows to the CSV)
-    // gets normalized.
-    const csvLocation = match.row.location || yotRow.locationName || '';
     exportRows.push({
       staffId: match.row.staffId,
       firstName: match.row.firstName,
@@ -1101,7 +1170,7 @@ async function main() {
         lastName: match.row.lastName,
         type: 'GARNISHMENT',
         amount: garnishmentAmount,
-        transactionId: buildTransactionId(match.row.lastName, match.row.staffId, garnishmentAmount),
+        transactionId: buildTransactionId(match.row.lastName, match.row.staffId, garnishmentAmount, args.date, csvLocation),
         location: csvLocation,
         date: args.date,
       });
@@ -1324,6 +1393,28 @@ async function main() {
 
   writeFileSync(csvPath, toCsv(depositRows), 'utf8');
   writeFileSync(disbursementsPath, toDisbursementsCsv(depositRows, args.date), 'utf8');
+
+  // Mirror the disbursements CSV onto a per-day tab on the Branch
+  // DISPURSEMENTS sheet. Failure here shouldn't block the email to Miranda
+  // — the CSV is already on disk — so log + report status instead of
+  // throwing.
+  let dispursementsTabStatus: 'written' | 'failed' | 'skipped-dry-run' = 'skipped-dry-run';
+  if (args.dryRun) {
+    console.error(`[dry-run] skipping Branch DISPURSEMENTS daily tab write: would delete + recreate '${branchMasterTabName}' on sheet ${DISPURSEMENTS_SHEET_ID} with ${depositRows.length} rows`);
+  } else {
+    try {
+      await writeDispursementsDailyTab({
+        account: args.account,
+        tabName: branchMasterTabName,
+        rows: depositRows,
+        date: args.date,
+      });
+      dispursementsTabStatus = 'written';
+    } catch (err: any) {
+      dispursementsTabStatus = 'failed';
+      console.error(`[warn] failed to write '${branchMasterTabName}' tab on Branch DISPURSEMENTS: ${err?.message || err}`);
+    }
+  }
   writeFileSync(diagnosticsPath, JSON.stringify({
     date: args.date,
     source: 'csv-master',
@@ -1430,6 +1521,7 @@ Sourced from CSV MASTER on the Branch Daily Totals sheet, with garnishment + loa
     loanWithholdingCount: loanPaymentsThisRun.length,
     loansPaidOffTodayCount: loansPaidOffToday.length,
     branchMasterTabName,
+    dispursementsTabStatus,
     negativeRebateCount: negativeRebates.length,
     negativeRebateMatchedCount: negativeRebates.filter((r) => r.matched).length,
   }, null, 2));
