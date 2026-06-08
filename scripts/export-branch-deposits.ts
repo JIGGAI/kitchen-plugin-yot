@@ -189,6 +189,16 @@ type MatchDiagnostics = {
     rebateAmount: number;
     matched: boolean;
   }>;
+  // Delivery outcome — lets the watchdog tell a real, sent run apart from a
+  // dry-run or a failed/skipped send. A dry-run leaves identical CSV +
+  // diagnostics files on disk but never emails Miranda or writes the live
+  // sheets, so without these fields a stale dry-run masks a missed send.
+  dryRun: boolean;
+  skipEmail: boolean;
+  disbursementsRecipient: string;
+  disbursementsEmailStatus: 'sent' | 'skipped' | 'failed';
+  disbursementsFailureAlertStatus: 'sent' | 'skipped' | 'failed' | 'not-needed';
+  dispursementsTabStatus: 'written' | 'failed' | 'skipped-dry-run';
 };
 
 const DEFAULT_SHEET_ID = '1jIFWOMmvMVbGULUbDpEqV2e6CsXy_DzhBrCorV9H-EA';
@@ -1415,28 +1425,9 @@ async function main() {
       console.error(`[warn] failed to write '${branchMasterTabName}' tab on Branch DISPURSEMENTS: ${err?.message || err}`);
     }
   }
-  writeFileSync(diagnosticsPath, JSON.stringify({
-    date: args.date,
-    source: 'csv-master',
-    sourceLabel: CSV_MASTER_TAB,
-    generatedAt: new Date().toISOString(),
-    reportRowCount: report.rows.length,
-    masterRowCount: masterRows.length,
-    exportRowCount: depositRows.length,
-    zeroNetOmittedRows: zeroNetRows,
-    reportRowsWithPositiveAmountButNoBranchMatch: unmatchedReport,
-    fuzzyMatchedRows,
-    garnishmentRuleCount: garnishmentRules.size,
-    garnishmentAdjustedRowCount: garnishmentPayoutRows.length,
-    garnishmentPayoutRows,
-    loanRuleCount: activeLoans.length,
-    loanWithholdingCount: loanPaymentsThisRun.length,
-    loanPaymentRows: loanPaymentsThisRun,
-    loansPaidOffToday,
-    branchMasterTabName,
-    branchMasterPerLocation,
-    negativeRebates,
-  } satisfies MatchDiagnostics, null, 2), 'utf8');
+  // NB: the diagnostics JSON is written AFTER the email step below, so it can
+  // record the real delivery outcome (disbursementsEmailStatus / dryRun). The
+  // watchdog relies on those fields to tell a sent run from a dry-run.
 
   const typoRows = fuzzyMatchedRows.filter((r) => r.matchKind === 'typo');
   const inScopeUnmatchedRows = unmatchedReport.filter((r) => r.inScope);
@@ -1495,6 +1486,36 @@ Sourced from CSV MASTER on the Branch Daily Totals sheet, with garnishment + loa
       failureAlertStatus = delivered ? 'sent' : (recipient === DISPURSEMENTS_FAILURE_ALERT_TO ? 'skipped' : 'failed');
     }
   }
+
+  // Written last so the delivery outcome (email status, dry-run) is captured.
+  writeFileSync(diagnosticsPath, JSON.stringify({
+    date: args.date,
+    source: 'csv-master',
+    sourceLabel: CSV_MASTER_TAB,
+    generatedAt: new Date().toISOString(),
+    reportRowCount: report.rows.length,
+    masterRowCount: masterRows.length,
+    exportRowCount: depositRows.length,
+    zeroNetOmittedRows: zeroNetRows,
+    reportRowsWithPositiveAmountButNoBranchMatch: unmatchedReport,
+    fuzzyMatchedRows,
+    garnishmentRuleCount: garnishmentRules.size,
+    garnishmentAdjustedRowCount: garnishmentPayoutRows.length,
+    garnishmentPayoutRows,
+    loanRuleCount: activeLoans.length,
+    loanWithholdingCount: loanPaymentsThisRun.length,
+    loanPaymentRows: loanPaymentsThisRun,
+    loansPaidOffToday,
+    branchMasterTabName,
+    branchMasterPerLocation,
+    negativeRebates,
+    dryRun: args.dryRun,
+    skipEmail: args.skipEmail,
+    disbursementsRecipient: recipient,
+    disbursementsEmailStatus: emailStatus,
+    disbursementsFailureAlertStatus: failureAlertStatus,
+    dispursementsTabStatus,
+  } satisfies MatchDiagnostics, null, 2), 'utf8');
 
   console.log(JSON.stringify({
     ok: true,

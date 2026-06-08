@@ -115,6 +115,12 @@ type Diag = {
   reportRowsWithPositiveAmountButNoBranchMatch?: UnmatchedReportRow[];
   fuzzyMatchedRows?: FuzzyMatchedRow[];
   loansPaidOffToday?: LoanPaidOff[];
+  // Delivery outcome (export script >= 2026-06-08). Undefined on legacy
+  // diagnostics files written before the field existed.
+  dryRun?: boolean;
+  skipEmail?: boolean;
+  disbursementsRecipient?: string;
+  disbursementsEmailStatus?: 'sent' | 'skipped' | 'failed';
 };
 
 async function main() {
@@ -158,7 +164,38 @@ Watchdog log: ${LOG_PATH}`,
   const outOfScopeCount = unmatched.length - inScopeUnmatched.length;
   const loansPaidOff = diag.loansPaidOffToday || [];
 
-  log(`diagnostics: export=${diag.exportRowCount} typos=${typoRows.length} unmatched=${unmatched.length} (inScope=${inScopeUnmatched.length}, outOfScope=${outOfScopeCount}) loansPaidOff=${loansPaidOff.length}`);
+  log(`diagnostics: export=${diag.exportRowCount} typos=${typoRows.length} unmatched=${unmatched.length} (inScope=${inScopeUnmatched.length}, outOfScope=${outOfScopeCount}) loansPaidOff=${loansPaidOff.length} emailStatus=${diag.disbursementsEmailStatus ?? 'n/a'} dryRun=${diag.dryRun ?? 'n/a'}`);
+
+  // The CSV + diagnostics can exist yet the real send never happened — a
+  // manual --dry-run / --skip-email run, or the nightly send failed. These
+  // leave identical files on disk, so without this check a stale dry-run
+  // masks a missed payout (exactly what happened on 2026-06-07). On legacy
+  // files the field is undefined ("can't tell") — skip rather than false-alarm.
+  if (diag.disbursementsEmailStatus !== undefined && diag.disbursementsEmailStatus !== 'sent') {
+    const reason = diag.dryRun
+      ? 'a dry-run produced these files — no real send happened'
+      : `the disbursements email status was "${diag.disbursementsEmailStatus}"`;
+    log(`NOT-SENT target=${args.targetDate} emailStatus=${diag.disbursementsEmailStatus} dryRun=${!!diag.dryRun}`);
+    sendEmail(
+      `[HMX] Branch deposit NOT SENT for ${args.targetDate}`,
+      `The Branch deposit files for ${args.targetDate} exist, but ${reason}.
+
+Miranda was NOT emailed the deposit CSV and the live Google Sheets were NOT updated. The ${diag.exportRowCount} deposits for ${args.targetDate} have not been processed.
+
+  Email status: ${diag.disbursementsEmailStatus}
+  Dry run: ${!!diag.dryRun}
+  Recipient: ${diag.disbursementsRecipient || '(default)'}
+
+Re-run for real (emails Miranda + writes the live sheets):
+  export GOG_KEYRING_PASSWORD="$(cat ~/.openclaw/secrets/gog_keyring_password)" && cd ~/kitchen-plugin-yot && npx tsx scripts/export-branch-deposits.ts --date=${args.targetDate}
+
+Diagnostics: ${diagPath}
+Watchdog log: ${LOG_PATH}`,
+      args.dryRun,
+    );
+    log('not-sent alert sent');
+    return;
+  }
 
   const sections: string[] = [];
   const summaryBits: string[] = [];
