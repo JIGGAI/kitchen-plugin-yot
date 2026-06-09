@@ -1,17 +1,22 @@
 // Weekend Branch disbursements combiner.
 //
-// Runs Sundays at 21:30 ET (30 min after the Sunday nightly export) via
-// ~/Library/LaunchAgents/com.hairmx.weekend-deposit-combine.plist. Reads the
-// two per-day disbursements CSVs the nightly export already wrote —
+// Runs Sundays at 17:00 ET (1h after the Sunday nightly export's 16:00 ET run)
+// via ~/Library/LaunchAgents/com.hairmx.weekend-deposit-combine.plist. Reads
+// the two per-day disbursements CSVs the nightly export already wrote —
 //   ~/hmx-reports/disbursements-<saturday>.csv
 //   ~/hmx-reports/disbursements-<sunday>.csv
-// — stacks their rows under one header (a stylist who worked both days keeps
-// one row per day, each with its own date-encoded transaction id), writes
+// — merges them under one header, writes
 //   ~/hmx-reports/disbursements-weekend-<saturday>-to-<sunday>.csv
 // and emails the combined file to Miranda.
 //
+// Merge rule: group by (staff id, location). A stylist who worked the SAME
+// shop on both days collapses to one row with the two amounts summed and a
+// fresh transaction id encoding the summed amount (Branch rejects duplicate
+// ids), dated Monday for disbursement. Entries at DIFFERENT locations are kept
+// as separate rows. Single-day stylists pass through unchanged.
+//
 // This is ADDITIVE: the individual Saturday and Sunday emails still go out at
-// their normal 21:00 ET times. This job does NOT touch the export, the live
+// their normal export times. This job does NOT touch the export, the live
 // Google Sheets, or the nightly watchdog — it only re-packages two files that
 // already exist and sends one extra email.
 //
@@ -79,6 +84,12 @@ function prevDayIso(date: string): string {
   return d.toISOString().slice(0, 10);
 }
 
+function nextDayIso(date: string): string {
+  const d = new Date(`${date}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + 1);
+  return d.toISOString().slice(0, 10);
+}
+
 function weekdayName(date: string): string {
   return new Date(`${date}T12:00:00Z`).toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' });
 }
@@ -109,6 +120,27 @@ function parseCsvLine(line: string): string[] {
 // Non-empty lines of a CSV file (drops the trailing blank from the final \n).
 function readCsvLines(filePath: string): string[] {
   return readFileSync(filePath, 'utf8').split('\n').filter((l) => l.length > 0);
+}
+
+function parseAmount(cell: string | undefined): number {
+  const n = Number(String(cell ?? '').replace(/[$,\s]/g, ''));
+  return Number.isFinite(n) ? n : 0;
+}
+
+// The next three mirror export-branch-deposits.ts (buildTransactionId /
+// formatTransactionDate / formatCsvCell). Kept in sync by hand — importing that
+// script would execute its top-level main() and run a real export.
+function formatTransactionDate(dateIso: string): string {
+  const m = dateIso.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) throw new Error(`Invalid ISO date: ${dateIso}`);
+  return `${Number(m[2])}/${Number(m[3])}/${m[1]}`;
+}
+function buildTransactionId(lastName: string, staffId: string, amount: number, dateIso: string, location: string): string {
+  return `${lastName}${staffId}${Math.floor(amount)}${formatTransactionDate(dateIso)}${location.replace(/\s+/g, '')}`;
+}
+function formatCsvCell(value: string | number): string {
+  const text = String(value ?? '');
+  return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
 async function sendFailureAlert(account: string, subject: string, body: string): Promise<void> {
@@ -150,34 +182,67 @@ async function main() {
     process.exit(1);
   }
 
-  const satRows = satLines.slice(1);
-  const sunRows = sunLines.slice(1);
-  const combinedRows = [...satRows, ...sunRows];
-  const combinedCsv = `${[header, ...combinedRows].join('\n')}\n`;
+  // disbursements columns: ID, First, Last, Type, Amount, Transaction ID,
+  // Location, Disbursement Date (YYYY-MM-DD), Description.
+  const ID = 0, FIRST = 1, LAST = 2, TYPE = 3, AMOUNT = 4, LOCATION = 6;
+  const satRows = satLines.slice(1).map((raw) => ({ raw, fields: parseCsvLine(raw) }));
+  const sunRows = sunLines.slice(1).map((raw) => ({ raw, fields: parseCsvLine(raw) }));
 
+  // Group by (staff id, location). A stylist who worked the SAME shop on both
+  // days collapses into one row with their two amounts summed and a fresh
+  // transaction id (Branch rejects duplicate ids, and an id encodes its
+  // amount). Entries at DIFFERENT locations are never combined — they stay as
+  // separate rows. Single-entry stylists pass through byte-for-byte. Sat rows
+  // are inserted before Sun rows so output order is stable.
+  const groups = new Map<string, Array<{ raw: string; fields: string[] }>>();
+  const order: string[] = [];
+  for (const row of [...satRows, ...sunRows]) {
+    const key = `${row.fields[ID] ?? ''}|${row.fields[LOCATION] ?? ''}`;
+    if (!groups.has(key)) { groups.set(key, []); order.push(key); }
+    groups.get(key)!.push(row);
+  }
+
+  const monday = nextDayIso(sunday); // disbursement date for merged weekend rows
+  let mergedStylistCount = 0;
+  const outRows: string[] = [];
+  for (const key of order) {
+    const list = groups.get(key)!;
+    if (list.length === 1) {
+      outRows.push(list[0]!.raw); // untouched single-day entry
+      continue;
+    }
+    mergedStylistCount += 1;
+    const f = list[0]!.fields;
+    const staffId = f[ID] ?? '';
+    const lastName = f[LAST] ?? '';
+    const location = f[LOCATION] ?? '';
+    const sum = list.reduce((s, r) => s + parseAmount(r.fields[AMOUNT]), 0);
+    const amountStr = Number.isInteger(sum) ? String(sum) : sum.toFixed(2);
+    const txn = buildTransactionId(lastName, staffId, sum, sunday, location);
+    const merged = [staffId, f[FIRST] ?? '', lastName, f[TYPE] ?? 'Deposit', amountStr, txn, location, monday, ''];
+    outRows.push(merged.map(formatCsvCell).join(','));
+  }
+
+  const combinedCsv = `${[header, ...outRows].join('\n')}\n`;
   mkdirSync(args.outputDir, { recursive: true });
   writeFileSync(combinedPath, combinedCsv, 'utf8');
 
-  // Amount is column index 4 in the disbursements CSV (ID, First, Last, Type,
-  // Amount, …). Sum it for the email summary; never let a parse blip throw.
-  const amountColumn = 4;
-  let total = 0;
-  for (const row of combinedRows) {
-    const cell = parseCsvLine(row)[amountColumn] ?? '';
-    const n = Number(cell.replace(/[$,\s]/g, ''));
-    if (Number.isFinite(n)) total += n;
-  }
+  // Total is unchanged by merging — sum of every input amount.
+  const total = [...satRows, ...sunRows].reduce((s, r) => s + parseAmount(r.fields[AMOUNT]), 0);
   const totalStr = total.toFixed(2);
 
   const recipient = args.testRecipient || DEFAULT_RECIPIENT;
-  const subject = `HMX Disbursements WEEKEND ${saturday} + ${sunday} — ${combinedRows.length} deposits, $${totalStr}`;
+  const subject = `HMX Disbursements WEEKEND ${saturday} + ${sunday} — ${outRows.length} deposits, $${totalStr}`;
+  const mergedNote = mergedStylistCount
+    ? `${mergedStylistCount} stylist${mergedStylistCount > 1 ? 's' : ''} who worked both days were merged into a single summed row each.`
+    : 'No stylist worked both days, so nothing needed merging.';
   const body = `Combined Saturday + Sunday disbursements file is attached.
 
   Saturday ${saturday}: ${satRows.length} deposits
   Sunday   ${sunday}: ${sunRows.length} deposits
-  Combined: ${combinedRows.length} deposits, $${totalStr}
+  Combined: ${outRows.length} deposits, $${totalStr}
 
-This file stacks the two nightly disbursements CSVs you already received for ${saturday} and ${sunday} into one upload. Each row keeps its own day's transaction id and disbursement date. Auto-generated Sunday night.`;
+${mergedNote} A stylist who worked two DIFFERENT locations over the weekend keeps a separate row per location. Merged rows carry a fresh transaction id for the summed amount and a Monday (${monday}) disbursement date. Auto-generated Sunday afternoon.`;
 
   let emailStatus: 'sent' | 'skipped' | 'failed' = 'skipped';
   if (args.dryRun || args.skipEmail) {
@@ -210,7 +275,8 @@ This file stacks the two nightly disbursements CSVs you already received for ${s
     emailStatus,
     saturdayRowCount: satRows.length,
     sundayRowCount: sunRows.length,
-    combinedRowCount: combinedRows.length,
+    combinedRowCount: outRows.length,
+    mergedStylistCount,
     totalAmount: Number(totalStr),
   }, null, 2));
 }
