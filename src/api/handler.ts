@@ -218,6 +218,8 @@ type RevenuePeriodAccumulator = {
   netAmount: number;
   appointmentCount: number;
   uniqueClientCount: number;
+  salesCount: number;
+  totalSales: number;
   locationIds: Set<string>;
   dayKeys: Set<string>;
   lastUpdatedAt: string | null;
@@ -744,6 +746,8 @@ function buildRevenueByPeriod(rows: RevenueFactRow[], grain: RevenueGrain) {
       netAmount: 0,
       appointmentCount: 0,
       uniqueClientCount: 0,
+      salesCount: 0,
+      totalSales: 0,
       locationIds: new Set<string>(),
       dayKeys: new Set<string>(),
       lastUpdatedAt: null,
@@ -753,6 +757,8 @@ function buildRevenueByPeriod(rows: RevenueFactRow[], grain: RevenueGrain) {
     bucket.netAmount += asNumber(row.netAmount);
     bucket.appointmentCount += asNumber(row.appointmentCount);
     bucket.uniqueClientCount += asNumber(row.uniqueClientCount);
+    bucket.salesCount += asNumber((row as any).salesCount);
+    bucket.totalSales += asNumber((row as any).totalSales);
     bucket.locationIds.add(row.locationId);
     bucket.dayKeys.add(row.date);
     bucket.lastUpdatedAt = mostRecentIso(bucket.lastUpdatedAt, row.lastUpdatedAt || null);
@@ -770,6 +776,8 @@ function buildRevenueByPeriod(rows: RevenueFactRow[], grain: RevenueGrain) {
       netAmount: bucket.netAmount,
       appointmentCount: bucket.appointmentCount,
       uniqueClientCount: bucket.uniqueClientCount,
+      salesCount: bucket.salesCount || null,
+      totalSales: bucket.totalSales || null,
       locationCount: bucket.locationIds.size,
       dayCount: bucket.dayKeys.size,
       lastUpdatedAt: bucket.lastUpdatedAt,
@@ -859,6 +867,8 @@ function buildRevenueByPeriodLocation(rows: RevenueFactRow[], grain: RevenueGrai
     netAmount: number;
     appointmentCount: number;
     uniqueClientCount: number;
+    salesCount: number;
+    totalSales: number;
   }>();
   for (const row of rows) {
     const bounds = periodBoundsForDate(row.date, grain);
@@ -875,12 +885,16 @@ function buildRevenueByPeriodLocation(rows: RevenueFactRow[], grain: RevenueGrai
       netAmount: 0,
       appointmentCount: 0,
       uniqueClientCount: 0,
+      salesCount: 0,
+      totalSales: 0,
     };
     bucket.grossAmount += asNumber(row.grossAmount);
     bucket.discountAmount += asNumber(row.discountAmount);
     bucket.netAmount += asNumber(row.netAmount);
     bucket.appointmentCount += asNumber(row.appointmentCount);
     bucket.uniqueClientCount += asNumber(row.uniqueClientCount);
+    bucket.salesCount += asNumber((row as any).salesCount);
+    bucket.totalSales += asNumber((row as any).totalSales);
     if (!bucket.locationName && row.locationName) bucket.locationName = row.locationName;
     buckets.set(key, bucket);
   }
