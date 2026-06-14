@@ -2050,8 +2050,13 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       type Acc = {
         locationName: string;
         appointments: number; cancelled: number; noShows: number;
+        onlineBookings: number; voucherCount: number;
         salesCount: number; productSales: number; serviceSales: number;
         totalSales: number; yoyAmount: number;
+        // totalClients is a chain-wide client-database snapshot (same value
+        // on every location row, not additive) — take the max rather than
+        // summing across months when a week crosses a boundary.
+        totalClients: number;
         // YoY % is already a percent on each row — when a week crosses a
         // month, prefer the latest month's value (last row wins) since
         // there's no clean way to combine two YoY percents.
@@ -2063,17 +2068,21 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         const acc = buckets.get(row.locationName) || {
           locationName: row.locationName,
           appointments: 0, cancelled: 0, noShows: 0,
+          onlineBookings: 0, voucherCount: 0,
           salesCount: 0, productSales: 0, serviceSales: 0,
-          totalSales: 0, yoyAmount: 0, yoyPct: null,
+          totalSales: 0, yoyAmount: 0, totalClients: 0, yoyPct: null,
         };
         acc.appointments += Number(row.appointments || 0);
         acc.cancelled += Number(row.cancelled || 0);
         acc.noShows += Number(row.noShows || 0);
+        acc.onlineBookings += Number(row.onlineBookings || 0);
+        acc.voucherCount += Number(row.voucherCount || 0);
         acc.salesCount += Number(row.salesCount || 0);
         acc.productSales += Number(row.productSales || 0);
         acc.serviceSales += Number(row.serviceSales || 0);
         acc.totalSales += Number(row.totalSales || 0);
         acc.yoyAmount += Number(row.yoyAmount || 0);
+        acc.totalClients = Math.max(acc.totalClients, Number(row.totalClients || 0));
         if (row.yoyPct != null) acc.yoyPct = Number(row.yoyPct);
         buckets.set(row.locationName, acc);
       }
