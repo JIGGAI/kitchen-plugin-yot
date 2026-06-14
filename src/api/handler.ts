@@ -151,6 +151,34 @@ export function buildStylistNameMap(
   return byId;
 }
 
+/**
+ * Choose a home location for each "orphan" stylist — one who took appointments
+ * but was not returned by any location's staff list (cross-shop floaters /
+ * reassigned staff that YOT's per-location staff endpoint omits). We assign
+ * each orphan to the location where they have the most appointments so the
+ * synthesized stylist row gets a sensible home and a later per-location sync
+ * updates the same `LOCATION:YOT_ID` primary key instead of duplicating.
+ *
+ * `apptRows` is the per-(stylist, location) appointment tally; `knownPrivateIds`
+ * are the bare YOT ids already present in the stylists table (skipped here).
+ */
+export function selectOrphanStylistHomes(
+  apptRows: Array<{ sid: string | null; locId: string | null; n: number }>,
+  knownPrivateIds: Set<string>,
+): Map<string, string> {
+  const home = new Map<string, string>();
+  const best = new Map<string, number>();
+  for (const r of apptRows) {
+    if (!r.sid || !r.locId) continue;
+    if (knownPrivateIds.has(r.sid)) continue;
+    if ((best.get(r.sid) ?? -1) < r.n) {
+      best.set(r.sid, r.n);
+      home.set(r.sid, r.locId);
+    }
+  }
+  return home;
+}
+
 function safeJsonParseArray(value: string | null): string[] {
   if (!value) return [];
   try {
@@ -3258,7 +3286,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     const startedAt = new Date().toISOString();
     const runId = randomUUID();
     try {
-      const { db } = initializeDatabase(teamId);
+      const { db, sqlite } = initializeDatabase(teamId);
       db.insert(schema.syncRuns).values({ id: runId, teamId, resource: 'stylists', status: 'running', startedAt }).run();
       const locations = await fetchLocations(config);
       const activeLocations = locations.filter((item) => item?.id != null && item?.active !== false);
@@ -3308,9 +3336,71 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
           rowsWritten++;
         }
       }
+
+      // Reconciliation pass: name stylists who took appointments in the last
+      // year but were not returned by any location's staff list (cross-shop
+      // floaters / reassigned staff). The per-location endpoint omits them, so
+      // they would otherwise render as "Stylist <id>" in the day-schedule grid.
+      // fetchStaffProfile resolves them by id; we file each under their busiest
+      // location so a later per-location sync updates the same PK in place.
+      const knownPrivateIds = new Set(
+        (db.select({ privateId: schema.stylists.privateId }).from(schema.stylists)
+          .where(eq(schema.stylists.teamId, teamId)).all() as Array<{ privateId: string | null }>)
+          .map((r) => r.privateId)
+          .filter((id): id is string => !!id),
+      );
+      const apptTally = sqlite.prepare(
+        `SELECT COALESCE(stylist_id, staff_id) AS sid, location_id AS locId, COUNT(*) AS n
+           FROM appointments
+          WHERE team_id = ?
+            AND COALESCE(stylist_id, staff_id) IS NOT NULL
+            AND location_id IS NOT NULL
+            AND start_at >= date('now', '-365 day')
+          GROUP BY sid, location_id`,
+      ).all(teamId) as Array<{ sid: string | null; locId: string | null; n: number }>;
+      const orphanHomes = selectOrphanStylistHomes(apptTally, knownPrivateIds);
+      let orphansReconciled = 0;
+      for (const [sid, locId] of orphanHomes) {
+        let profile: Record<string, any> | null = null;
+        try { profile = await fetchStaffProfile(config, Number(sid)); } catch {}
+        const fullName = normalizeFullName(profile);
+        if (!fullName) continue; // no name to gain — leave the id fallback in place
+        const profileDetails = collectStylistProfileDetails(profile);
+        const values: schema.NewStylist = {
+          id: `${locId}:${sid}`,
+          teamId,
+          locationId: locId,
+          privateId: sid,
+          givenName: cleanString(profile?.givenName ?? profile?.firstName),
+          surname: cleanString(profile?.surname ?? profile?.lastName),
+          fullName,
+          initial: cleanString(profile?.initial),
+          jobTitle: cleanString(profile?.jobTitle),
+          jobDescription: cleanString(profile?.jobDescription),
+          emailAddress: cleanString(profile?.emailAddress),
+          mobilePhone: cleanString(profile?.mobilePhone),
+          active: null,
+          sourceLocationId: locId,
+          serviceCategoryNames: JSON.stringify(profileDetails.categoryNames),
+          serviceIds: JSON.stringify(profileDetails.serviceIds),
+          serviceNames: JSON.stringify(profileDetails.serviceNames),
+          profileRaw: profile ? JSON.stringify(profile) : null,
+          raw: JSON.stringify({ reconciledFromAppointments: true, stylistId: sid }),
+          syncedAt: now,
+        };
+        const existing = db.select().from(schema.stylists).where(eq(schema.stylists.id, values.id)).all();
+        if (existing.length) {
+          db.update(schema.stylists).set({ ...values }).where(eq(schema.stylists.id, values.id)).run();
+        } else {
+          db.insert(schema.stylists).values(values).run();
+        }
+        orphansReconciled++;
+        rowsWritten++;
+      }
+
       upsertSyncState(db, teamId, 'stylists', { lastSyncedAt: now, lastSuccessAt: now, lastError: null, rowCount: rowsWritten });
-      db.update(schema.syncRuns).set({ status: 'success', completedAt: now, rowsSeen, rowsWritten, pageCount: activeLocations.length, notes: `locations=${activeLocations.length}` }).where(eq(schema.syncRuns.id, runId)).run();
-      return { status: 200, data: { ok: true, synced: rowsWritten, rowsSeen, locationCount: activeLocations.length, startedAt, completedAt: now } };
+      db.update(schema.syncRuns).set({ status: 'success', completedAt: now, rowsSeen, rowsWritten, pageCount: activeLocations.length, notes: `locations=${activeLocations.length} orphansReconciled=${orphansReconciled}` }).where(eq(schema.syncRuns.id, runId)).run();
+      return { status: 200, data: { ok: true, synced: rowsWritten, rowsSeen, locationCount: activeLocations.length, orphansReconciled, startedAt, completedAt: now } };
     } catch (error: any) {
       const errMsg = error?.message || String(error);
       const now = new Date().toISOString();
