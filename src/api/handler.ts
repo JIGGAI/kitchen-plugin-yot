@@ -123,6 +123,34 @@ function normalizeFullName(item: Record<string, any> | null | undefined): string
   return composed || null;
 }
 
+/**
+ * Build a bare-YOT-id → display-name map for the day-schedule grid.
+ *
+ * Name sources, in priority order:
+ *  1. the roster payload — carries YOT display names keyed by the bare stylist id.
+ *  2. the stylists table — but its primary key is `LOCATION:YOT_ID`, while
+ *     appointments and the roster reference the bare YOT id. So we resolve via
+ *     `private_id` (with a `LOCATION:` strip as a fallback). Matching the raw
+ *     `id` against bare appointment ids never lines up, which is what produced
+ *     the `Stylist <id>` labels for off-roster staff at e.g. Howell/Rochester.
+ *
+ * Roster names win; the stylists table only fills gaps.
+ */
+export function buildStylistNameMap(
+  rosterRows: Array<{ stylistId?: string | null; stylistName?: string | null }>,
+  stylistRows: Array<{ id: string; privateId?: string | null; fullName?: string | null }>,
+): Map<string, string> {
+  const byId = new Map<string, string>();
+  for (const r of rosterRows) {
+    if (r.stylistId && r.stylistName) byId.set(r.stylistId, r.stylistName);
+  }
+  for (const s of stylistRows) {
+    const yotId = s.privateId || (s.id.includes(':') ? s.id.slice(s.id.indexOf(':') + 1) : s.id);
+    if (yotId && s.fullName && !byId.has(yotId)) byId.set(yotId, s.fullName);
+  }
+  return byId;
+}
+
 function safeJsonParseArray(value: string | null): string[] {
   if (!value) return [];
   try {
@@ -4073,29 +4101,13 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     ).all(teamId, locationId, date) as Appt[];
 
     // Build a name lookup for each stylist seen in the roster or in the
-    // appointments. roster row provides the YOT-display name; if a row
-    // lacks one (rare), fall back to the stylists table.
-    const stylistNameById = new Map<string, string>();
-    for (const r of rosterRows) {
-      if (r.stylistId && r.stylistName) stylistNameById.set(r.stylistId, r.stylistName);
-    }
-    const idsNeedingNames = new Set<string>();
-    for (const r of scheduledRosterRows) {
-      if (!stylistNameById.has(r.stylistId)) idsNeedingNames.add(r.stylistId);
-    }
-    for (const id of absentReasonById.keys()) {
-      if (!stylistNameById.has(id)) idsNeedingNames.add(id);
-    }
-    for (const a of appointments) {
-      if (a.stylistId && !stylistNameById.has(a.stylistId)) idsNeedingNames.add(a.stylistId);
-    }
-    if (idsNeedingNames.size) {
-      const stylistRows = db.select().from(schema.stylists)
-        .where(eq(schema.stylists.teamId, teamId)).all() as schema.Stylist[];
-      for (const s of stylistRows) {
-        if (idsNeedingNames.has(s.id) && s.fullName) stylistNameById.set(s.id, s.fullName);
-      }
-    }
+    // appointments. The roster row provides the YOT-display name; stylists
+    // off the roster (booked appointments but no scheduled shift) get named
+    // from the stylists table — resolved by private_id, since that table is
+    // keyed `LOCATION:YOT_ID` while appointments use the bare YOT id.
+    const stylistRows = db.select().from(schema.stylists)
+      .where(eq(schema.stylists.teamId, teamId)).all() as schema.Stylist[];
+    const stylistNameById = buildStylistNameMap(rosterRows, stylistRows);
 
     // Stylist rows = rostered stylists, sorted by shift start time. Off-
     // roster stylists who still booked appointments get appended at the end
