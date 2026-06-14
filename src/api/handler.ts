@@ -179,6 +179,45 @@ export function selectOrphanStylistHomes(
   return home;
 }
 
+/**
+ * An `appointmentId` is unique to one real YOT appointment, but the sync keys
+ * rows by `LOCATION:appointmentId` and YOT's `/appointmentsrange` is actor-
+ * scoped — it can return the same appointment under more than one location
+ * across runs (e.g. when a stylist transfers shops). That leaves the same
+ * appointment cached at two locations, so it shows at both.
+ *
+ * Given all rows for the duplicated appointment ids, return the row ids to
+ * delete — every copy except the best one per appointment. "Best" = the copy
+ * with a real status over a blank one, then the freshest `syncedAt`, then a
+ * stable id tiebreak.
+ */
+export function selectDuplicateAppointmentRows(
+  rows: Array<{ id: string; appointmentId: string | null; statusDescription: string | null; syncedAt: string | null }>,
+): string[] {
+  const byAppt = new Map<string, typeof rows>();
+  for (const r of rows) {
+    if (!r.appointmentId) continue;
+    const list = byAppt.get(r.appointmentId);
+    if (list) list.push(r);
+    else byAppt.set(r.appointmentId, [r]);
+  }
+  const toDelete: string[] = [];
+  for (const list of byAppt.values()) {
+    if (list.length < 2) continue;
+    const sorted = [...list].sort((a, b) => {
+      const aHasStatus = a.statusDescription ? 1 : 0;
+      const bHasStatus = b.statusDescription ? 1 : 0;
+      if (aHasStatus !== bHasStatus) return bHasStatus - aHasStatus;
+      const aSync = a.syncedAt ?? '';
+      const bSync = b.syncedAt ?? '';
+      if (aSync !== bSync) return aSync < bSync ? 1 : -1;
+      return a.id < b.id ? 1 : -1;
+    });
+    for (let i = 1; i < sorted.length; i++) toDelete.push(sorted[i]!.id);
+  }
+  return toDelete;
+}
+
 function safeJsonParseArray(value: string | null): string[] {
   if (!value) return [];
   try {
@@ -3527,7 +3566,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       ? Math.max(0, Math.min(parseInt(req.query.forwardDays || '0', 10) || 0, 365))
       : 0;
     try {
-      const { db } = initializeDatabase(teamId);
+      const { db, sqlite } = initializeDatabase(teamId);
       db.insert(schema.syncRuns).values({ id: runId, teamId, resource: 'appointments', status: 'running', startedAt, notes: `lookbackDays=${lookbackDays}${explicitLookback ? '' : ' (auto-resume)'}; forwardDays=${forwardDays}` }).run();
       const locations = await fetchLocations(config);
       const activeLocations = locations.filter((item) => item?.id != null && item?.active !== false);
@@ -3624,9 +3663,34 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         }
         locationsSynced++;
       }
+
+      // Collapse any appointment that ended up cached under more than one
+      // location into a single row. YOT's /appointmentsrange is actor-scoped,
+      // so a stylist's appointment can be returned under two locations across
+      // runs (notably when a stylist transfers shops), leaving the same
+      // appointmentId at both. Keep the best copy (real status, then freshest)
+      // and delete the rest so it can't show at two shops at once. Only runs
+      // when this sync actually wrote rows, so an empty/zombie feed can't
+      // trigger deletions.
+      let duplicatesPruned = 0;
+      if (rowsWritten > 0) {
+        const dupRows = sqlite.prepare(
+          `SELECT id, appointment_id AS appointmentId, status_description AS statusDescription, synced_at AS syncedAt
+             FROM appointments
+            WHERE team_id = ? AND appointment_id IN (
+              SELECT appointment_id FROM appointments
+               WHERE team_id = ? AND appointment_id IS NOT NULL
+               GROUP BY appointment_id HAVING COUNT(DISTINCT location_id) > 1)`,
+        ).all(teamId, teamId) as Array<{ id: string; appointmentId: string | null; statusDescription: string | null; syncedAt: string | null }>;
+        for (const id of selectDuplicateAppointmentRows(dupRows)) {
+          db.delete(schema.appointments).where(eq(schema.appointments.id, id)).run();
+          duplicatesPruned++;
+        }
+      }
+
       upsertSyncState(db, teamId, 'appointments', { lastSyncedAt: now, lastSuccessAt: now, lastError: null, rowCount: rowsWritten });
-      db.update(schema.syncRuns).set({ status: 'success', completedAt: now, rowsSeen, rowsWritten, pageCount: locationsSynced, notes: `lookbackDays=${lookbackDays}; locations=${locationsSynced}` }).where(eq(schema.syncRuns.id, runId)).run();
-      return { status: 200, data: { ok: true, synced: rowsWritten, rowsSeen, locationCount: locationsSynced, lookbackDays, startedAt, completedAt: now } };
+      db.update(schema.syncRuns).set({ status: 'success', completedAt: now, rowsSeen, rowsWritten, pageCount: locationsSynced, notes: `lookbackDays=${lookbackDays}; locations=${locationsSynced}; duplicatesPruned=${duplicatesPruned}` }).where(eq(schema.syncRuns.id, runId)).run();
+      return { status: 200, data: { ok: true, synced: rowsWritten, rowsSeen, locationCount: locationsSynced, lookbackDays, duplicatesPruned, startedAt, completedAt: now } };
     } catch (error: any) {
       const errMsg = error?.message || String(error);
       const now = new Date().toISOString();
