@@ -152,31 +152,66 @@ export function buildStylistNameMap(
 }
 
 /**
- * Choose a home location for each "orphan" stylist — one who took appointments
- * but was not returned by any location's staff list (cross-shop floaters /
- * reassigned staff that YOT's per-location staff endpoint omits). We assign
- * each orphan to the location where they have the most appointments so the
- * synthesized stylist row gets a sensible home and a later per-location sync
- * updates the same `LOCATION:YOT_ID` primary key instead of duplicating.
+ * Pick cached appointment rows to prune for one location after a sync: rows
+ * whose start falls inside the window the feed just covered but whose
+ * `appointmentId` the current feed no longer returns. YOT's `/appointmentsrange`
+ * is location-scoped and complete (verified: every actor returns the same set,
+ * no pagination/cap), so an in-window appointment the feed omits is genuinely
+ * gone — e.g. a stylist who left the shop. Rows OUTSIDE the window are never
+ * touched (they weren't re-fetched, so absence means nothing).
  *
- * `apptRows` is the per-(stylist, location) appointment tally; `knownPrivateIds`
- * are the bare YOT ids already present in the stylists table (skipped here).
+ * Caller MUST skip pruning when the feed came back empty (seen.size === 0) to
+ * avoid wiping good data on a zombie/empty response.
  */
-export function selectOrphanStylistHomes(
-  apptRows: Array<{ sid: string | null; locId: string | null; n: number }>,
-  knownPrivateIds: Set<string>,
-): Map<string, string> {
-  const home = new Map<string, string>();
-  const best = new Map<string, number>();
-  for (const r of apptRows) {
-    if (!r.sid || !r.locId) continue;
-    if (knownPrivateIds.has(r.sid)) continue;
-    if ((best.get(r.sid) ?? -1) < r.n) {
-      best.set(r.sid, r.n);
-      home.set(r.sid, r.locId);
-    }
+export function selectStaleAppointmentRows(
+  localRows: Array<{ id: string; appointmentId: string | null; startAt: string | null }>,
+  seenAppointmentIds: Set<string>,
+  windowStartDate: string, // 'YYYY-MM-DD'
+  windowEndDate: string, // 'YYYY-MM-DD'
+): string[] {
+  const ids: string[] = [];
+  for (const r of localRows) {
+    if (!r.appointmentId || !r.startAt) continue;
+    const day = r.startAt.slice(0, 10);
+    if (day < windowStartDate || day > windowEndDate) continue;
+    if (!seenAppointmentIds.has(r.appointmentId)) ids.push(r.id);
   }
-  return home;
+  return ids;
+}
+
+/**
+ * An `appointmentId` is unique to one real YOT appointment, but rows are keyed
+ * `LOCATION:appointmentId`. If the same appointment is ever cached under more
+ * than one location, return the row ids to delete — every copy except the best
+ * one per appointment. "Best" = real status over a blank one, then freshest
+ * `syncedAt`, then a stable id tiebreak. A safety net alongside the prune for
+ * any appointment returned under two locations within a single run.
+ */
+export function selectDuplicateAppointmentRows(
+  rows: Array<{ id: string; appointmentId: string | null; statusDescription: string | null; syncedAt: string | null }>,
+): string[] {
+  const byAppt = new Map<string, typeof rows>();
+  for (const r of rows) {
+    if (!r.appointmentId) continue;
+    const list = byAppt.get(r.appointmentId);
+    if (list) list.push(r);
+    else byAppt.set(r.appointmentId, [r]);
+  }
+  const toDelete: string[] = [];
+  for (const list of byAppt.values()) {
+    if (list.length < 2) continue;
+    const sorted = [...list].sort((a, b) => {
+      const aHasStatus = a.statusDescription ? 1 : 0;
+      const bHasStatus = b.statusDescription ? 1 : 0;
+      if (aHasStatus !== bHasStatus) return bHasStatus - aHasStatus;
+      const aSync = a.syncedAt ?? '';
+      const bSync = b.syncedAt ?? '';
+      if (aSync !== bSync) return aSync < bSync ? 1 : -1;
+      return a.id < b.id ? 1 : -1;
+    });
+    for (let i = 1; i < sorted.length; i++) toDelete.push(sorted[i]!.id);
+  }
+  return toDelete;
 }
 
 function safeJsonParseArray(value: string | null): string[] {
@@ -3286,7 +3321,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     const startedAt = new Date().toISOString();
     const runId = randomUUID();
     try {
-      const { db, sqlite } = initializeDatabase(teamId);
+      const { db } = initializeDatabase(teamId);
       db.insert(schema.syncRuns).values({ id: runId, teamId, resource: 'stylists', status: 'running', startedAt }).run();
       const locations = await fetchLocations(config);
       const activeLocations = locations.filter((item) => item?.id != null && item?.active !== false);
@@ -3337,70 +3372,9 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         }
       }
 
-      // Reconciliation pass: name stylists who took appointments in the last
-      // year but were not returned by any location's staff list (cross-shop
-      // floaters / reassigned staff). The per-location endpoint omits them, so
-      // they would otherwise render as "Stylist <id>" in the day-schedule grid.
-      // fetchStaffProfile resolves them by id; we file each under their busiest
-      // location so a later per-location sync updates the same PK in place.
-      const knownPrivateIds = new Set(
-        (db.select({ privateId: schema.stylists.privateId }).from(schema.stylists)
-          .where(eq(schema.stylists.teamId, teamId)).all() as Array<{ privateId: string | null }>)
-          .map((r) => r.privateId)
-          .filter((id): id is string => !!id),
-      );
-      const apptTally = sqlite.prepare(
-        `SELECT COALESCE(stylist_id, staff_id) AS sid, location_id AS locId, COUNT(*) AS n
-           FROM appointments
-          WHERE team_id = ?
-            AND COALESCE(stylist_id, staff_id) IS NOT NULL
-            AND location_id IS NOT NULL
-            AND start_at >= date('now', '-365 day')
-          GROUP BY sid, location_id`,
-      ).all(teamId) as Array<{ sid: string | null; locId: string | null; n: number }>;
-      const orphanHomes = selectOrphanStylistHomes(apptTally, knownPrivateIds);
-      let orphansReconciled = 0;
-      for (const [sid, locId] of orphanHomes) {
-        let profile: Record<string, any> | null = null;
-        try { profile = await fetchStaffProfile(config, Number(sid)); } catch {}
-        const fullName = normalizeFullName(profile);
-        if (!fullName) continue; // no name to gain — leave the id fallback in place
-        const profileDetails = collectStylistProfileDetails(profile);
-        const values: schema.NewStylist = {
-          id: `${locId}:${sid}`,
-          teamId,
-          locationId: locId,
-          privateId: sid,
-          givenName: cleanString(profile?.givenName ?? profile?.firstName),
-          surname: cleanString(profile?.surname ?? profile?.lastName),
-          fullName,
-          initial: cleanString(profile?.initial),
-          jobTitle: cleanString(profile?.jobTitle),
-          jobDescription: cleanString(profile?.jobDescription),
-          emailAddress: cleanString(profile?.emailAddress),
-          mobilePhone: cleanString(profile?.mobilePhone),
-          active: null,
-          sourceLocationId: locId,
-          serviceCategoryNames: JSON.stringify(profileDetails.categoryNames),
-          serviceIds: JSON.stringify(profileDetails.serviceIds),
-          serviceNames: JSON.stringify(profileDetails.serviceNames),
-          profileRaw: profile ? JSON.stringify(profile) : null,
-          raw: JSON.stringify({ reconciledFromAppointments: true, stylistId: sid }),
-          syncedAt: now,
-        };
-        const existing = db.select().from(schema.stylists).where(eq(schema.stylists.id, values.id)).all();
-        if (existing.length) {
-          db.update(schema.stylists).set({ ...values }).where(eq(schema.stylists.id, values.id)).run();
-        } else {
-          db.insert(schema.stylists).values(values).run();
-        }
-        orphansReconciled++;
-        rowsWritten++;
-      }
-
       upsertSyncState(db, teamId, 'stylists', { lastSyncedAt: now, lastSuccessAt: now, lastError: null, rowCount: rowsWritten });
-      db.update(schema.syncRuns).set({ status: 'success', completedAt: now, rowsSeen, rowsWritten, pageCount: activeLocations.length, notes: `locations=${activeLocations.length} orphansReconciled=${orphansReconciled}` }).where(eq(schema.syncRuns.id, runId)).run();
-      return { status: 200, data: { ok: true, synced: rowsWritten, rowsSeen, locationCount: activeLocations.length, orphansReconciled, startedAt, completedAt: now } };
+      db.update(schema.syncRuns).set({ status: 'success', completedAt: now, rowsSeen, rowsWritten, pageCount: activeLocations.length, notes: `locations=${activeLocations.length}` }).where(eq(schema.syncRuns.id, runId)).run();
+      return { status: 200, data: { ok: true, synced: rowsWritten, rowsSeen, locationCount: activeLocations.length, startedAt, completedAt: now } };
     } catch (error: any) {
       const errMsg = error?.message || String(error);
       const now = new Date().toISOString();
@@ -3527,12 +3501,17 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       ? Math.max(0, Math.min(parseInt(req.query.forwardDays || '0', 10) || 0, 365))
       : 0;
     try {
-      const { db } = initializeDatabase(teamId);
+      const { db, sqlite } = initializeDatabase(teamId);
       db.insert(schema.syncRuns).values({ id: runId, teamId, resource: 'appointments', status: 'running', startedAt, notes: `lookbackDays=${lookbackDays}${explicitLookback ? '' : ' (auto-resume)'}; forwardDays=${forwardDays}` }).run();
       const locations = await fetchLocations(config);
       const activeLocations = locations.filter((item) => item?.id != null && item?.active !== false);
       const now = new Date().toISOString();
       const nowMs = Date.now();
+      let appointmentsPruned = 0;
+      // The window the feed covers this run — used to scope pruning so we never
+      // touch historical rows outside what was re-fetched.
+      const windowStartDate = new Date(nowMs - lookbackDays * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      const windowEndDate = new Date(nowMs + forwardDays * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
       const enddate = nowMs + forwardDays * 24 * 60 * 60 * 1000;
       const date = nowMs - lookbackDays * 24 * 60 * 60 * 1000;
       let rowsSeen = 0;
@@ -3622,11 +3601,50 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
           }
           rowsWritten++;
         }
+
+        // Prune this location's cached appointments that fall inside the
+        // fetched window but the current feed no longer returns (e.g. a stylist
+        // who left the shop — their appointments drop out of /appointmentsrange
+        // but the upsert-only sync would otherwise keep them forever). Guarded
+        // by a non-empty feed so a zombie/empty response can't wipe good data.
+        const seen = new Set(
+          appointments.map((a: any) => (a?.appointmentId != null ? String(a.appointmentId) : '')).filter(Boolean),
+        );
+        if (seen.size > 0) {
+          const cached = sqlite.prepare(
+            `SELECT id, appointment_id AS appointmentId, start_at AS startAt
+               FROM appointments WHERE team_id = ? AND location_id = ?`,
+          ).all(teamId, locationId) as Array<{ id: string; appointmentId: string | null; startAt: string | null }>;
+          for (const staleId of selectStaleAppointmentRows(cached, seen, windowStartDate, windowEndDate)) {
+            db.delete(schema.appointments).where(eq(schema.appointments.id, staleId)).run();
+            appointmentsPruned++;
+          }
+        }
         locationsSynced++;
       }
+
+      // Safety net for the rare case where the same appointment is returned
+      // under two locations within a single run: collapse any appointmentId
+      // still cached under >1 location to a single best copy.
+      let duplicatesPruned = 0;
+      if (rowsWritten > 0) {
+        const dupRows = sqlite.prepare(
+          `SELECT id, appointment_id AS appointmentId, status_description AS statusDescription, synced_at AS syncedAt
+             FROM appointments
+            WHERE team_id = ? AND appointment_id IN (
+              SELECT appointment_id FROM appointments
+               WHERE team_id = ? AND appointment_id IS NOT NULL
+               GROUP BY appointment_id HAVING COUNT(DISTINCT location_id) > 1)`,
+        ).all(teamId, teamId) as Array<{ id: string; appointmentId: string | null; statusDescription: string | null; syncedAt: string | null }>;
+        for (const dupId of selectDuplicateAppointmentRows(dupRows)) {
+          db.delete(schema.appointments).where(eq(schema.appointments.id, dupId)).run();
+          duplicatesPruned++;
+        }
+      }
+
       upsertSyncState(db, teamId, 'appointments', { lastSyncedAt: now, lastSuccessAt: now, lastError: null, rowCount: rowsWritten });
-      db.update(schema.syncRuns).set({ status: 'success', completedAt: now, rowsSeen, rowsWritten, pageCount: locationsSynced, notes: `lookbackDays=${lookbackDays}; locations=${locationsSynced}` }).where(eq(schema.syncRuns.id, runId)).run();
-      return { status: 200, data: { ok: true, synced: rowsWritten, rowsSeen, locationCount: locationsSynced, lookbackDays, startedAt, completedAt: now } };
+      db.update(schema.syncRuns).set({ status: 'success', completedAt: now, rowsSeen, rowsWritten, pageCount: locationsSynced, notes: `lookbackDays=${lookbackDays}; locations=${locationsSynced}; appointmentsPruned=${appointmentsPruned}; duplicatesPruned=${duplicatesPruned}` }).where(eq(schema.syncRuns.id, runId)).run();
+      return { status: 200, data: { ok: true, synced: rowsWritten, rowsSeen, locationCount: locationsSynced, lookbackDays, appointmentsPruned, duplicatesPruned, startedAt, completedAt: now } };
     } catch (error: any) {
       const errMsg = error?.message || String(error);
       const now = new Date().toISOString();
