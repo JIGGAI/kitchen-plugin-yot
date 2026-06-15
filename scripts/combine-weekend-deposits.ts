@@ -12,8 +12,10 @@
 // Merge rule: group by (staff id, location). A stylist who worked the SAME
 // shop on both days collapses to one row with the two amounts summed and a
 // fresh transaction id encoding the summed amount (Branch rejects duplicate
-// ids), dated Monday for disbursement. Entries at DIFFERENT locations are kept
-// as separate rows. Single-day stylists pass through unchanged.
+// ids). Entries at DIFFERENT locations are kept as separate rows. Single-day
+// stylists pass through unchanged except for their disbursement date. Every
+// row in the combined file is dated Monday — Branch doesn't pay out on the
+// weekend, so the Saturday rows' Sunday date is moved forward to Monday.
 //
 // This is ADDITIVE: the individual Saturday and Sunday emails still go out at
 // their normal export times. This job does NOT touch the export, the live
@@ -184,7 +186,7 @@ async function main() {
 
   // disbursements columns: ID, First, Last, Type, Amount, Transaction ID,
   // Location, Disbursement Date (YYYY-MM-DD), Description.
-  const ID = 0, FIRST = 1, LAST = 2, TYPE = 3, AMOUNT = 4, LOCATION = 6;
+  const ID = 0, FIRST = 1, LAST = 2, TYPE = 3, AMOUNT = 4, LOCATION = 6, DATE = 7, DESCRIPTION = 8;
   const satRows = satLines.slice(1).map((raw) => ({ raw, fields: parseCsvLine(raw) }));
   const sunRows = sunLines.slice(1).map((raw) => ({ raw, fields: parseCsvLine(raw) }));
 
@@ -192,8 +194,9 @@ async function main() {
   // days collapses into one row with their two amounts summed and a fresh
   // transaction id (Branch rejects duplicate ids, and an id encodes its
   // amount). Entries at DIFFERENT locations are never combined — they stay as
-  // separate rows. Single-entry stylists pass through byte-for-byte. Sat rows
-  // are inserted before Sun rows so output order is stable.
+  // separate rows. Single-entry stylists pass through with only their
+  // Disbursement Date column rewritten to Monday (see below). Sat rows are
+  // inserted before Sun rows so output order is stable.
   const groups = new Map<string, Array<{ raw: string; fields: string[] }>>();
   const order: string[] = [];
   for (const row of [...satRows, ...sunRows]) {
@@ -202,13 +205,23 @@ async function main() {
     groups.get(key)!.push(row);
   }
 
-  const monday = nextDayIso(sunday); // disbursement date for merged weekend rows
+  // All weekend disbursements settle on Monday — the nightly export stamps each
+  // day's rows as run-date + 1 (Saturday rows → Sunday, Sunday rows → Monday),
+  // but Branch doesn't pay out on the weekend, so every row in the combined
+  // file is forced onto Monday's date (merged rows below are built with it
+  // directly; single-day rows have only their date column rewritten).
+  const monday = nextDayIso(sunday);
   let mergedStylistCount = 0;
   const outRows: string[] = [];
   for (const key of order) {
     const list = groups.get(key)!;
     if (list.length === 1) {
-      outRows.push(list[0]!.raw); // untouched single-day entry
+      // Single-day entry: keep every cell as-is, just move its disbursement
+      // date to Monday (Saturday-only rows would otherwise read Sunday).
+      const f = [...list[0]!.fields];
+      while (f.length <= DESCRIPTION) f.push('');
+      f[DATE] = monday;
+      outRows.push(f.map(formatCsvCell).join(','));
       continue;
     }
     mergedStylistCount += 1;
@@ -242,7 +255,7 @@ async function main() {
   Sunday   ${sunday}: ${sunRows.length} deposits
   Combined: ${outRows.length} deposits, $${totalStr}
 
-${mergedNote} A stylist who worked two DIFFERENT locations over the weekend keeps a separate row per location. Merged rows carry a fresh transaction id for the summed amount and a Monday (${monday}) disbursement date. Auto-generated Sunday afternoon.`;
+${mergedNote} A stylist who worked two DIFFERENT locations over the weekend keeps a separate row per location. Every row carries a Monday (${monday}) disbursement date, and merged rows also carry a fresh transaction id for the summed amount. Auto-generated Sunday afternoon.`;
 
   let emailStatus: 'sent' | 'skipped' | 'failed' = 'skipped';
   if (args.dryRun || args.skipEmail) {
