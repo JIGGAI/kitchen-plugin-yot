@@ -3247,74 +3247,118 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
 
     const startedAt = new Date().toISOString();
     const runId = randomUUID();
+    // Per-page request timeout: YOT holds the connection open (no response)
+    // past ~page 7500, so without this a walk could hang indefinitely.
+    const PAGE_TIMEOUT_MS = Math.min(parseInt(String(req.query.pageTimeoutMs || '25000'), 10) || 25000, 60000);
     try {
-      const MAX_PAGES = Math.min(parseInt(String(req.query.maxPages || '200'), 10) || 200, 2000);
+      // Pages to walk THIS call (a chunk). Cap raised well above the old 2000
+      // so a single call can cover the full ~7400-page tenant if desired; the
+      // scheduler normally chunks and relies on the resume cursor.
+      const MAX_PAGES = Math.min(parseInt(String(req.query.maxPages || '500'), 10) || 500, 20000);
       const locationIdRaw = cleanString(req.query.locationId);
       const locationId = locationIdRaw ? Number(locationIdRaw) : undefined;
-      const { db } = initializeDatabase(teamId);
-      db.insert(schema.syncRuns).values({ id: runId, teamId, resource: 'clients', status: 'running', startedAt, notes: locationIdRaw ? `locationId=${locationIdRaw}` : null }).run();
+      const { db, sqlite } = initializeDatabase(teamId);
 
-      const raw: Record<string, any>[] = [];
-      let pageCount = 0;
-      let stoppedBecause = 'maxPages';
-      for (let page = 1; page <= MAX_PAGES; page++) {
-        const chunk = await fetchClients(config, { page, locationId });
-        pageCount = page;
-        if (!chunk.length) {
-          stoppedBecause = 'empty-page';
-          break;
+      // Resume cursor: explicit ?startPage wins; otherwise continue from the
+      // persisted resume_page; otherwise start a fresh pass at page 1.
+      const stateRow = db.select().from(schema.syncState)
+        .where(and(eq(schema.syncState.teamId, teamId), eq(schema.syncState.resource, 'clients'))).all()[0] as any;
+      const explicitStart = parseInt(String(req.query.startPage || ''), 10);
+      const startPage = Number.isFinite(explicitStart) && explicitStart > 0
+        ? explicitStart
+        : (stateRow?.resumePage && stateRow.resumePage > 0 ? stateRow.resumePage : 1);
+
+      db.insert(schema.syncRuns).values({ id: runId, teamId, resource: 'clients', status: 'running', startedAt, notes: `startPage=${startPage}` }).run();
+      // Ensure a sync_state row exists so the cursor UPDATEs below have a target.
+      upsertSyncState(db, teamId, 'clients', { lastSyncedAt: startedAt });
+
+      const toRow = (item: Record<string, any>, now: string): schema.NewClient => ({
+        id: String(item.id ?? item.privateId),
+        teamId,
+        firstName: cleanString(item.givenName ?? item.firstName),
+        lastName: cleanString(item.surname ?? item.lastName),
+        email: cleanString(item.emailAddress ?? item.email),
+        phone: cleanString(item.mobilePhone ?? item.homePhone ?? item.businessPhone ?? item.phone),
+        address: null,
+        tags: null,
+        lastVisitAt: cleanString(item.lastVisitAt),
+        totalVisits: typeof item.totalVisits === 'number' ? item.totalVisits : null,
+        totalSpend: typeof item.totalSpend === 'number' ? item.totalSpend : null,
+        raw: JSON.stringify(item),
+        syncedAt: now,
+        privateId: cleanString(item.privateId),
+        otherName: cleanString(item.otherName),
+        fullName: normalizeFullName(item),
+        homePhone: cleanString(item.homePhone),
+        mobilePhone: cleanString(item.mobilePhone),
+        businessPhone: cleanString(item.businessPhone),
+        emailAddress: cleanString(item.emailAddress),
+        birthday: cleanString(item.birthday),
+        gender: cleanString(item.gender),
+        active: typeof item.active === 'boolean' ? item.active : null,
+        street: cleanString(item.street),
+        suburb: cleanString(item.suburb),
+        state: cleanString(item.state),
+        postcode: cleanString(item.postcode),
+        country: cleanString(item.country),
+        sourceLocationId: locationIdRaw,
+        createdAtRemote: cleanString(item.createdDate ?? item.createdAt),
+      });
+
+      // Upsert one page inside a transaction (fast); returns rows written.
+      const upsertPage = (rows: Record<string, any>[], now: string): number => sqlite.transaction(() => {
+        let n = 0;
+        for (const item of rows) {
+          if (!item?.id && !item?.privateId) continue;
+          const values = toRow(item, now);
+          const existing = db.select().from(schema.clients).where(eq(schema.clients.id, values.id)).all();
+          if (existing.length) db.update(schema.clients).set({ ...values }).where(eq(schema.clients.id, values.id)).run();
+          else db.insert(schema.clients).values(values).run();
+          n++;
         }
-        raw.push(...chunk);
-      }
+        return n;
+      })();
 
-      const now = new Date().toISOString();
+      const endPage = startPage + MAX_PAGES - 1;
       let upserts = 0;
-      for (const item of raw) {
-        if (!item?.id && !item?.privateId) continue;
-        const values: schema.NewClient = {
-          id: String(item.id ?? item.privateId),
-          teamId,
-          firstName: cleanString(item.givenName ?? item.firstName),
-          lastName: cleanString(item.surname ?? item.lastName),
-          email: cleanString(item.emailAddress ?? item.email),
-          phone: cleanString(item.mobilePhone ?? item.homePhone ?? item.businessPhone ?? item.phone),
-          address: null,
-          tags: null,
-          lastVisitAt: cleanString(item.lastVisitAt),
-          totalVisits: typeof item.totalVisits === 'number' ? item.totalVisits : null,
-          totalSpend: typeof item.totalSpend === 'number' ? item.totalSpend : null,
-          raw: JSON.stringify(item),
-          syncedAt: now,
-          privateId: cleanString(item.privateId),
-          otherName: cleanString(item.otherName),
-          fullName: normalizeFullName(item),
-          homePhone: cleanString(item.homePhone),
-          mobilePhone: cleanString(item.mobilePhone),
-          businessPhone: cleanString(item.businessPhone),
-          emailAddress: cleanString(item.emailAddress),
-          birthday: cleanString(item.birthday),
-          gender: cleanString(item.gender),
-          active: typeof item.active === 'boolean' ? item.active : null,
-          street: cleanString(item.street),
-          suburb: cleanString(item.suburb),
-          state: cleanString(item.state),
-          postcode: cleanString(item.postcode),
-          country: cleanString(item.country),
-          sourceLocationId: locationIdRaw,
-          createdAtRemote: cleanString(item.createdDate ?? item.createdAt),
-        };
-        const existing = db.select().from(schema.clients).where(eq(schema.clients.id, values.id)).all();
-        if (existing.length) {
-          db.update(schema.clients).set({ ...values }).where(eq(schema.clients.id, values.id)).run();
-        } else {
-          db.insert(schema.clients).values(values).run();
+      let lastPage = startPage - 1;       // last page successfully ingested
+      let stoppedBecause = 'maxPages';
+      let errMsg: string | null = null;
+
+      for (let page = startPage; page <= endPage; page++) {
+        let chunk: Record<string, any>[];
+        try {
+          chunk = await fetchClients(config, { page, locationId, timeoutMs: PAGE_TIMEOUT_MS });
+        } catch (e: any) {
+          stoppedBecause = 'error';
+          errMsg = e?.message || String(e);
+          break; // leave resume cursor at this page so the next run retries it
         }
-        upserts++;
+        if (!chunk.length) { stoppedBecause = 'empty-page'; break; } // full pass complete
+        const now = new Date().toISOString();
+        upserts += upsertPage(chunk, now);
+        lastPage = page;
+        // Persist the cursor every page so a killed process resumes cleanly.
+        db.run(sql`UPDATE sync_state SET resume_page = ${page + 1}, last_synced_at = ${now} WHERE team_id = ${teamId} AND resource = 'clients'`);
       }
 
-      upsertSyncState(db, teamId, 'clients', { lastSyncedAt: now, lastSuccessAt: now, lastError: null, rowCount: upserts });
-      db.update(schema.syncRuns).set({ status: 'success', completedAt: now, rowsSeen: raw.length, rowsWritten: upserts, pageCount, notes: `${locationIdRaw ? `locationId=${locationIdRaw}; ` : ''}stop=${stoppedBecause}` }).where(eq(schema.syncRuns.id, runId)).run();
-      return { status: 200, data: { ok: true, synced: upserts, rowsSeen: raw.length, pageCount, stoppedBecause, startedAt, completedAt: now } };
+      const completedAt = new Date().toISOString();
+      const complete = stoppedBecause === 'empty-page';
+      const nextPage = complete ? null : lastPage + 1;
+      const totalClients = (db.select().from(schema.clients).where(eq(schema.clients.teamId, teamId)).all() as any[]).length;
+
+      // On a completed full pass, clear the cursor so the NEXT run starts fresh.
+      db.run(sql`UPDATE sync_state SET resume_page = ${nextPage}, row_count = ${totalClients},
+                 last_success_at = ${complete ? completedAt : (stateRow?.lastSuccessAt ?? null)},
+                 last_error = ${errMsg} WHERE team_id = ${teamId} AND resource = 'clients'`);
+      db.update(schema.syncRuns).set({
+        status: errMsg ? 'error' : 'success', completedAt,
+        rowsWritten: upserts, pageCount: Math.max(0, lastPage - startPage + 1),
+        notes: `startPage=${startPage}; lastPage=${lastPage}; stop=${stoppedBecause}; nextPage=${nextPage ?? 'done'}`,
+        error: errMsg,
+      }).where(eq(schema.syncRuns.id, runId)).run();
+
+      return { status: 200, data: { ok: true, synced: upserts, fromPage: startPage, lastPage, nextPage, complete, stoppedBecause, totalClients, startedAt, completedAt, error: errMsg } };
     } catch (error: any) {
       const errMsg = error?.message || String(error);
       const now = new Date().toISOString();
