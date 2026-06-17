@@ -324,6 +324,7 @@ export const syncState = sqliteTable('sync_state', {
   lastSuccessAt: text('last_success_at'),
   lastError: text('last_error'),
   rowCount: integer('row_count'),
+  resumePage: integer('resume_page'),
 }, (t) => ({
   pk: primaryKey({ columns: [t.teamId, t.resource] }),
 }));

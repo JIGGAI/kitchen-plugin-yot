@@ -10,18 +10,29 @@ function resolveBaseUrl(config: YotConfig): string {
   return String(config.baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, '');
 }
 
-async function yotFetch(config: YotConfig, path: string, init: RequestInit = {}): Promise<Response> {
+async function yotFetch(config: YotConfig, path: string, init: RequestInit & { timeoutMs?: number } = {}): Promise<Response> {
   const rel = path.startsWith('/') ? path : '/' + path;
   const prefixed = rel.startsWith(API_PREFIX) ? rel : `${API_PREFIX}${rel}`;
   const url = `${resolveBaseUrl(config)}${prefixed}`;
-  return fetch(url, {
-    ...init,
-    headers: {
-      accept: 'application/json',
-      APIKey: config.apiKey,
-      ...(init.headers || {}),
-    },
-  });
+  const { timeoutMs, ...rest } = init;
+  // Abort a hung request so a paginated walk can't stall forever — YOT's
+  // /clients endpoint stops responding past ~page 7500 (it holds the
+  // connection open rather than returning), which would otherwise hang a sync.
+  const controller = timeoutMs ? new AbortController() : undefined;
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
+  try {
+    return await fetch(url, {
+      ...rest,
+      signal: controller?.signal,
+      headers: {
+        accept: 'application/json',
+        APIKey: config.apiKey,
+        ...(rest.headers || {}),
+      },
+    });
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 export async function ping(config: YotConfig): Promise<{ ok: boolean; status?: number; error?: string; business?: string }> {
@@ -50,14 +61,14 @@ export async function fetchLocations(config: YotConfig): Promise<Record<string, 
 
 export async function fetchClients(
   config: YotConfig,
-  opts: { locationId?: number; page?: number; search?: string } = {},
+  opts: { locationId?: number; page?: number; search?: string; timeoutMs?: number } = {},
 ): Promise<Record<string, any>[]> {
   const params = new URLSearchParams();
   if (opts.locationId !== undefined) params.set('locationId', String(opts.locationId));
   if (opts.page !== undefined) params.set('page', String(opts.page));
   if (opts.search) params.set('search', opts.search);
   const qs = params.toString();
-  const res = await yotFetch(config, `/clients${qs ? `?${qs}` : ''}`);
+  const res = await yotFetch(config, `/clients${qs ? `?${qs}` : ''}`, { timeoutMs: opts.timeoutMs });
   if (!res.ok) throw new Error(`YOT /clients failed: ${res.status}`);
   const data = await res.json().catch(() => ({}));
   if (Array.isArray(data)) return data as Record<string, any>[];
