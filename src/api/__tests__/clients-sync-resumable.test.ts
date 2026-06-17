@@ -76,16 +76,44 @@ describe('/clients/sync (resumable, streaming)', () => {
     expect(stateRow(teamId).resumePage).toBeNull();
   });
 
-  it('preserves the cursor at the failing page when a fetch errors', async () => {
+  it('preserves the cursor at the failing page when a fetch errors persistently', async () => {
     fetchClientsMock.mockImplementation(async (_config: any, { page }: { page: number }) => {
       if (page === 1) return makePage(1);
       throw new Error('timeout past page boundary');
     });
     const teamId = freshTeam();
-    const res: any = await sync(teamId, { maxPages: '10' });
+    const res: any = await sync(teamId, { maxPages: '10', retryBackoffMs: '0' });
     expect(res.data).toMatchObject({ complete: false, lastPage: 1, nextPage: 2, stoppedBecause: 'error' });
     expect(res.data.error).toMatch(/timeout/);
     expect(stateRow(teamId).resumePage).toBe(2); // retry from the failed page next run
     expect(clientCount(teamId)).toBe(25);         // page 1 persisted despite the later failure
+  });
+
+  it('retries a transient page error within the chunk and keeps going', async () => {
+    const attempts: Record<number, number> = {};
+    fetchClientsMock.mockImplementation(async (_config: any, { page }: { page: number }) => {
+      attempts[page] = (attempts[page] || 0) + 1;
+      if (page === 2 && attempts[page] === 1) throw new Error('transient 500'); // fails once, then succeeds
+      return page <= 3 ? makePage(page) : [];
+    });
+    const teamId = freshTeam();
+    const res: any = await sync(teamId, { maxPages: '10', retryBackoffMs: '0' });
+    expect(res.data).toMatchObject({ complete: true, lastPage: 3, nextPage: null, stoppedBecause: 'empty-page' });
+    expect(clientCount(teamId)).toBe(75);   // all 3 pages landed despite the blip
+    expect(attempts[2]).toBe(2);            // page 2 was retried once and recovered
+    expect(stateRow(teamId).resumePage).toBeNull();
+  });
+
+  it('gives up after pageRetries attempts on a stuck page', async () => {
+    const attempts: Record<number, number> = {};
+    fetchClientsMock.mockImplementation(async (_config: any, { page }: { page: number }) => {
+      attempts[page] = (attempts[page] || 0) + 1;
+      if (page === 1) return makePage(1);
+      throw new Error('stuck');
+    });
+    const teamId = freshTeam();
+    const res: any = await sync(teamId, { maxPages: '10', pageRetries: '3', retryBackoffMs: '0' });
+    expect(res.data).toMatchObject({ stoppedBecause: 'error', lastPage: 1 });
+    expect(attempts[2]).toBe(3); // tried 3 times before giving up
   });
 });
