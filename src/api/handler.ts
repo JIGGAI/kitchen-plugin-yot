@@ -4122,6 +4122,62 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     return { status: 200, data: { start, end, ratios, averagingDays, data: filtered } };
   }
 
+  // Coverage day comments — a shared note thread on one (location, date),
+  // shown under the stylist schedule in the drill-down modal.
+  // GET /coverage/day-comments?locationId=X&date=YYYY-MM-DD → newest first.
+  if (req.path === '/coverage/day-comments' && req.method === 'GET') {
+    const locationId = cleanString(req.query.locationId);
+    const date = cleanString(req.query.date);
+    if (!locationId || !date) return apiError(400, 'BAD_REQUEST', 'locationId and date required');
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return apiError(400, 'BAD_REQUEST', 'date must be YYYY-MM-DD');
+    const { sqlite } = initializeDatabase(teamId);
+    const rows = sqlite.prepare(
+      `SELECT id, author_email AS authorEmail, author_name AS authorName, body, created_at AS createdAt
+         FROM coverage_day_comments
+        WHERE team_id = ? AND location_id = ? AND date = ?
+        ORDER BY created_at DESC`
+    ).all(teamId, locationId, date);
+    return { status: 200, data: { comments: rows } };
+  }
+
+  // POST /coverage/day-comments { locationId, date, body, authorEmail, authorName }
+  if (req.path === '/coverage/day-comments' && req.method === 'POST') {
+    const body = (req.body || {}) as Record<string, unknown>;
+    const locationId = cleanString(body.locationId);
+    const date = cleanString(body.date);
+    const text = cleanString(body.body);
+    const authorEmail = cleanString(body.authorEmail);
+    const authorName = cleanString(body.authorName);
+    if (!locationId || !date) return apiError(400, 'BAD_REQUEST', 'locationId and date required');
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return apiError(400, 'BAD_REQUEST', 'date must be YYYY-MM-DD');
+    if (!text) return apiError(400, 'BAD_REQUEST', 'body required');
+    if (!authorEmail) return apiError(400, 'BAD_REQUEST', 'authorEmail required');
+    if (text.length > 4000) return apiError(400, 'BAD_REQUEST', 'comment too long (max 4000 chars)');
+    const { sqlite } = initializeDatabase(teamId);
+    const id = randomUUID();
+    const createdAt = new Date().toISOString();
+    sqlite.prepare(
+      `INSERT INTO coverage_day_comments (id, team_id, location_id, date, author_email, author_name, body, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(id, teamId, locationId, date, authorEmail, authorName, text, createdAt);
+    return { status: 200, data: { comment: { id, authorEmail, authorName, body: text, createdAt } } };
+  }
+
+  // DELETE /coverage/day-comments?id=X&authorEmail=Y — author deletes own only.
+  if (req.path === '/coverage/day-comments' && req.method === 'DELETE') {
+    const id = cleanString(req.query.id);
+    const authorEmail = cleanString(req.query.authorEmail);
+    if (!id || !authorEmail) return apiError(400, 'BAD_REQUEST', 'id and authorEmail required');
+    const { sqlite } = initializeDatabase(teamId);
+    const existing = sqlite.prepare(
+      `SELECT author_email AS authorEmail FROM coverage_day_comments WHERE team_id = ? AND id = ?`
+    ).get(teamId, id) as { authorEmail: string } | undefined;
+    if (!existing) return apiError(404, 'NOT_FOUND', 'comment not found');
+    if (existing.authorEmail !== authorEmail) return apiError(403, 'FORBIDDEN', 'you can only delete your own comments');
+    sqlite.prepare(`DELETE FROM coverage_day_comments WHERE team_id = ? AND id = ?`).run(teamId, id);
+    return { status: 200, data: { ok: true, id } };
+  }
+
   // GET /coverage/day-schedule?locationId=X&date=YYYY-MM-DD
   // Powers the calendar-style schedule grid in the staff-coverage daily
   // drill-down modal. Returns rostered stylists for the day (with their
