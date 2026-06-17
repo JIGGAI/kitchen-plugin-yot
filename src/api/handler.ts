@@ -3325,18 +3325,34 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       let stoppedBecause = 'maxPages';
       let errMsg: string | null = null;
 
+      // Per-page retry so a transient YOT blip (a 500 or a slow page) doesn't
+      // end the whole chunk and cost a full cron cycle. Only after exhausting
+      // the retries do we stop and leave the cursor for the next run.
+      const PAGE_RETRIES = Math.max(1, Math.min(parseInt(String(req.query.pageRetries || '3'), 10) || 3, 10));
+      const RETRY_BACKOFF_MS = Math.max(0, Math.min(parseInt(String(req.query.retryBackoffMs ?? '750'), 10) || 0, 10000));
+      const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
       for (let page = startPage; page <= endPage; page++) {
-        let chunk: Record<string, any>[];
-        try {
-          chunk = await fetchClients(config, { page, locationId, timeoutMs: PAGE_TIMEOUT_MS });
-        } catch (e: any) {
-          stoppedBecause = 'error';
-          errMsg = e?.message || String(e);
-          break; // leave resume cursor at this page so the next run retries it
+        let chunk: Record<string, any>[] | null = null;
+        let pageErr: string | null = null;
+        for (let attempt = 1; attempt <= PAGE_RETRIES; attempt++) {
+          try {
+            chunk = await fetchClients(config, { page, locationId, timeoutMs: PAGE_TIMEOUT_MS });
+            pageErr = null;
+            break;
+          } catch (e: any) {
+            pageErr = e?.message || String(e);
+            if (attempt < PAGE_RETRIES && RETRY_BACKOFF_MS) await sleep(RETRY_BACKOFF_MS * attempt);
+          }
         }
-        if (!chunk.length) { stoppedBecause = 'empty-page'; break; } // full pass complete
+        if (pageErr !== null) {
+          stoppedBecause = 'error';
+          errMsg = pageErr;
+          break; // retries exhausted — leave resume cursor at this page for the next run
+        }
+        if (!chunk!.length) { stoppedBecause = 'empty-page'; break; } // full pass complete
         const now = new Date().toISOString();
-        upserts += upsertPage(chunk, now);
+        upserts += upsertPage(chunk!, now);
         lastPage = page;
         // Persist the cursor every page so a killed process resumes cleanly.
         db.run(sql`UPDATE sync_state SET resume_page = ${page + 1}, last_synced_at = ${now} WHERE team_id = ${teamId} AND resource = 'clients'`);
