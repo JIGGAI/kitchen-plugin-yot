@@ -45,6 +45,13 @@ function createDatabase(teamId: string) {
   const { drizzle } = require('drizzle-orm/better-sqlite3');
 
   const sqlite = new Database(dbFile);
+  // Durability + concurrency pragmas. Without busy_timeout, concurrent writers
+  // (the gateway + out-of-process sync scripts) fail fast with SQLITE_BUSY;
+  // with WAL + synchronous=NORMAL we keep crash-safety while staying fast.
+  // These are cheap and idempotent per connection.
+  sqlite.pragma('journal_mode = WAL');
+  sqlite.pragma('synchronous = NORMAL');
+  sqlite.pragma('busy_timeout = 5000');
   const db = drizzle(sqlite, { schema });
   return { db, sqlite };
 }
@@ -91,7 +98,16 @@ function runMigrations(sqlite: any) {
   }
 }
 
-const connections = new Map<string, { db: any; sqlite: any }>();
+// Cache connections on globalThis, not a module-local Map. The kitchen gateway
+// re-evaluates this module per request/plugin-load, which gives each evaluation
+// a fresh module-local Map — so a plain `const connections = new Map()` never
+// actually reuses a connection and the process leaks ~2 SQLite handles/request
+// (observed: ~1000 open handles to one WAL db, which contributed to a DB
+// corruption when the gateway was restarted mid-write). A process-global cache
+// survives module re-evaluation, so a given process holds ONE connection/team.
+const GLOBAL_KEY = '__yotDbConnections__';
+const g = globalThis as any;
+const connections: Map<string, { db: any; sqlite: any }> = g[GLOBAL_KEY] || (g[GLOBAL_KEY] = new Map());
 
 export function initializeDatabase(teamId: string) {
   const cached = connections.get(teamId);
@@ -101,6 +117,19 @@ export function initializeDatabase(teamId: string) {
   const entry = { db, sqlite };
   connections.set(teamId, entry);
   return entry;
+}
+
+/**
+ * Close and forget a team's cached connection. Short-lived scripts (e.g. the
+ * out-of-process clients sync) call this on exit so they checkpoint the WAL and
+ * release the file cleanly rather than leaving a connection dangling.
+ */
+export function closeDatabase(teamId: string) {
+  const cached = connections.get(teamId);
+  if (!cached) return;
+  try { cached.sqlite.pragma('wal_checkpoint(TRUNCATE)'); } catch {}
+  try { cached.sqlite.close(); } catch {}
+  connections.delete(teamId);
 }
 
 export type DatabaseConnection = ReturnType<typeof initializeDatabase>;
