@@ -13,6 +13,7 @@ import { listAppointmentsForRequest } from './list-appointments';
 import { stylistsByLocationForRange } from './stylists-by-location';
 import { buildAppointmentLookupsForRows } from './appointment-lookups';
 import { characterizeClientPaging, extractAppointmentsRangeRows, fetchAppointmentsRange, fetchBusiness, fetchClients, fetchLocationServices, fetchLocationStaff, fetchLocations, fetchStaffProfile, ping } from '../drivers/yot-client';
+import { runClientsSync, NotConfiguredError } from '../sync/sync-clients';
 import { runStaffCashoutReport } from '../reports/run-staff-cashout';
 import { listStaffCashoutFacts, syncStaffCashoutFromReport } from '../reports/sync-staff-cashout';
 import { syncPromotionUsageRange } from '../reports/sync-promotion-usage';
@@ -3242,148 +3243,23 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
   }
 
   if (req.path === '/clients/sync' && req.method === 'POST') {
-    const config = readYotConfig(teamId);
-    if (!config) return apiError(400, 'NOT_CONFIGURED', 'YOT apiKey not set for this team. POST /config first.');
-
-    const startedAt = new Date().toISOString();
-    const runId = randomUUID();
-    // Per-page request timeout: YOT holds the connection open (no response)
-    // past ~page 7500, so without this a walk could hang indefinitely.
-    const PAGE_TIMEOUT_MS = Math.min(parseInt(String(req.query.pageTimeoutMs || '25000'), 10) || 25000, 60000);
+    // The heavy clients walk is implemented in ../sync/sync-clients so it can
+    // also run OUT-OF-PROCESS (scripts/sync-clients.ts) — see that module's
+    // header for why (DB-corruption avoidance). This route is a thin adapter.
     try {
-      // Pages to walk THIS call (a chunk). Cap raised well above the old 2000
-      // so a single call can cover the full ~7400-page tenant if desired; the
-      // scheduler normally chunks and relies on the resume cursor.
-      const MAX_PAGES = Math.min(parseInt(String(req.query.maxPages || '500'), 10) || 500, 20000);
-      const locationIdRaw = cleanString(req.query.locationId);
-      const locationId = locationIdRaw ? Number(locationIdRaw) : undefined;
-      const { db, sqlite } = initializeDatabase(teamId);
-
-      // Resume cursor: explicit ?startPage wins; otherwise continue from the
-      // persisted resume_page; otherwise start a fresh pass at page 1.
-      const stateRow = db.select().from(schema.syncState)
-        .where(and(eq(schema.syncState.teamId, teamId), eq(schema.syncState.resource, 'clients'))).all()[0] as any;
-      const explicitStart = parseInt(String(req.query.startPage || ''), 10);
-      const startPage = Number.isFinite(explicitStart) && explicitStart > 0
-        ? explicitStart
-        : (stateRow?.resumePage && stateRow.resumePage > 0 ? stateRow.resumePage : 1);
-
-      db.insert(schema.syncRuns).values({ id: runId, teamId, resource: 'clients', status: 'running', startedAt, notes: `startPage=${startPage}` }).run();
-      // Ensure a sync_state row exists so the cursor UPDATEs below have a target.
-      upsertSyncState(db, teamId, 'clients', { lastSyncedAt: startedAt });
-
-      const toRow = (item: Record<string, any>, now: string): schema.NewClient => ({
-        id: String(item.id ?? item.privateId),
+      const result = await runClientsSync({
         teamId,
-        firstName: cleanString(item.givenName ?? item.firstName),
-        lastName: cleanString(item.surname ?? item.lastName),
-        email: cleanString(item.emailAddress ?? item.email),
-        phone: cleanString(item.mobilePhone ?? item.homePhone ?? item.businessPhone ?? item.phone),
-        address: null,
-        tags: null,
-        lastVisitAt: cleanString(item.lastVisitAt),
-        totalVisits: typeof item.totalVisits === 'number' ? item.totalVisits : null,
-        totalSpend: typeof item.totalSpend === 'number' ? item.totalSpend : null,
-        raw: JSON.stringify(item),
-        syncedAt: now,
-        privateId: cleanString(item.privateId),
-        otherName: cleanString(item.otherName),
-        fullName: normalizeFullName(item),
-        homePhone: cleanString(item.homePhone),
-        mobilePhone: cleanString(item.mobilePhone),
-        businessPhone: cleanString(item.businessPhone),
-        emailAddress: cleanString(item.emailAddress),
-        birthday: cleanString(item.birthday),
-        gender: cleanString(item.gender),
-        active: typeof item.active === 'boolean' ? item.active : null,
-        street: cleanString(item.street),
-        suburb: cleanString(item.suburb),
-        state: cleanString(item.state),
-        postcode: cleanString(item.postcode),
-        country: cleanString(item.country),
-        sourceLocationId: locationIdRaw,
-        createdAtRemote: cleanString(item.createdDate ?? item.createdAt),
+        startPage: req.query.startPage != null && req.query.startPage !== '' ? Number(req.query.startPage) : undefined,
+        maxPages: req.query.maxPages != null && req.query.maxPages !== '' ? Number(req.query.maxPages) : undefined,
+        locationId: cleanString(req.query.locationId) ? Number(cleanString(req.query.locationId)) : undefined,
+        pageTimeoutMs: req.query.pageTimeoutMs != null && req.query.pageTimeoutMs !== '' ? Number(req.query.pageTimeoutMs) : undefined,
+        pageRetries: req.query.pageRetries != null && req.query.pageRetries !== '' ? Number(req.query.pageRetries) : undefined,
+        retryBackoffMs: req.query.retryBackoffMs != null && req.query.retryBackoffMs !== '' ? Number(req.query.retryBackoffMs) : undefined,
       });
-
-      // Upsert one page inside a transaction (fast); returns rows written.
-      const upsertPage = (rows: Record<string, any>[], now: string): number => sqlite.transaction(() => {
-        let n = 0;
-        for (const item of rows) {
-          if (!item?.id && !item?.privateId) continue;
-          const values = toRow(item, now);
-          const existing = db.select().from(schema.clients).where(eq(schema.clients.id, values.id)).all();
-          if (existing.length) db.update(schema.clients).set({ ...values }).where(eq(schema.clients.id, values.id)).run();
-          else db.insert(schema.clients).values(values).run();
-          n++;
-        }
-        return n;
-      })();
-
-      const endPage = startPage + MAX_PAGES - 1;
-      let upserts = 0;
-      let lastPage = startPage - 1;       // last page successfully ingested
-      let stoppedBecause = 'maxPages';
-      let errMsg: string | null = null;
-
-      // Per-page retry so a transient YOT blip (a 500 or a slow page) doesn't
-      // end the whole chunk and cost a full cron cycle. Only after exhausting
-      // the retries do we stop and leave the cursor for the next run.
-      const PAGE_RETRIES = Math.max(1, Math.min(parseInt(String(req.query.pageRetries || '3'), 10) || 3, 10));
-      const RETRY_BACKOFF_MS = Math.max(0, Math.min(parseInt(String(req.query.retryBackoffMs ?? '750'), 10) || 0, 10000));
-      const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-      for (let page = startPage; page <= endPage; page++) {
-        let chunk: Record<string, any>[] | null = null;
-        let pageErr: string | null = null;
-        for (let attempt = 1; attempt <= PAGE_RETRIES; attempt++) {
-          try {
-            chunk = await fetchClients(config, { page, locationId, timeoutMs: PAGE_TIMEOUT_MS });
-            pageErr = null;
-            break;
-          } catch (e: any) {
-            pageErr = e?.message || String(e);
-            if (attempt < PAGE_RETRIES && RETRY_BACKOFF_MS) await sleep(RETRY_BACKOFF_MS * attempt);
-          }
-        }
-        if (pageErr !== null) {
-          stoppedBecause = 'error';
-          errMsg = pageErr;
-          break; // retries exhausted — leave resume cursor at this page for the next run
-        }
-        if (!chunk!.length) { stoppedBecause = 'empty-page'; break; } // full pass complete
-        const now = new Date().toISOString();
-        upserts += upsertPage(chunk!, now);
-        lastPage = page;
-        // Persist the cursor every page so a killed process resumes cleanly.
-        db.run(sql`UPDATE sync_state SET resume_page = ${page + 1}, last_synced_at = ${now} WHERE team_id = ${teamId} AND resource = 'clients'`);
-      }
-
-      const completedAt = new Date().toISOString();
-      const complete = stoppedBecause === 'empty-page';
-      const nextPage = complete ? null : lastPage + 1;
-      const totalClients = (db.select().from(schema.clients).where(eq(schema.clients.teamId, teamId)).all() as any[]).length;
-
-      // On a completed full pass, clear the cursor so the NEXT run starts fresh.
-      db.run(sql`UPDATE sync_state SET resume_page = ${nextPage}, row_count = ${totalClients},
-                 last_success_at = ${complete ? completedAt : (stateRow?.lastSuccessAt ?? null)},
-                 last_error = ${errMsg} WHERE team_id = ${teamId} AND resource = 'clients'`);
-      db.update(schema.syncRuns).set({
-        status: errMsg ? 'error' : 'success', completedAt,
-        rowsWritten: upserts, pageCount: Math.max(0, lastPage - startPage + 1),
-        notes: `startPage=${startPage}; lastPage=${lastPage}; stop=${stoppedBecause}; nextPage=${nextPage ?? 'done'}`,
-        error: errMsg,
-      }).where(eq(schema.syncRuns.id, runId)).run();
-
-      return { status: 200, data: { ok: true, synced: upserts, fromPage: startPage, lastPage, nextPage, complete, stoppedBecause, totalClients, startedAt, completedAt, error: errMsg } };
+      return { status: 200, data: result };
     } catch (error: any) {
-      const errMsg = error?.message || String(error);
-      const now = new Date().toISOString();
-      try {
-        const { db } = initializeDatabase(teamId);
-        db.update(schema.syncRuns).set({ status: 'error', completedAt: now, error: errMsg }).where(eq(schema.syncRuns.id, runId)).run();
-        upsertSyncState(db, teamId, 'clients', { lastSyncedAt: now, lastError: errMsg });
-      } catch {}
-      return apiError(502, 'YOT_ERROR', errMsg);
+      if (error instanceof NotConfiguredError) return apiError(400, 'NOT_CONFIGURED', error.message);
+      return apiError(502, 'YOT_ERROR', error?.message || String(error));
     }
   }
 
