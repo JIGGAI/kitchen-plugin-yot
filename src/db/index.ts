@@ -46,12 +46,21 @@ function createDatabase(teamId: string) {
 
   const sqlite = new Database(dbFile);
   // Durability + concurrency pragmas. Without busy_timeout, concurrent writers
-  // (the gateway + out-of-process sync scripts) fail fast with SQLITE_BUSY;
-  // with WAL + synchronous=NORMAL we keep crash-safety while staying fast.
-  // These are cheap and idempotent per connection.
+  // (the gateway + dashboard in-process handler + out-of-process sync scripts)
+  // fail fast with SQLITE_BUSY; with WAL + synchronous=NORMAL we keep
+  // crash-safety while staying fast. These are cheap and idempotent per
+  // connection.
+  //
+  // 30s (not 5s): three processes write this one file — the kitchen gateway,
+  // the dashboard's in-process handler, and the weekly out-of-process clients
+  // sync. During the sync's multi-hour deep-page walk, a contended write or a
+  // WAL checkpoint held by another process can exceed a short timeout and throw
+  // "database is locked" (observed 2026-06-23, stalling the resume cursor on one
+  // page). A batch sync can patiently wait tens of seconds for the lock to
+  // clear, so a generous timeout absorbs that contention instead of erroring.
   sqlite.pragma('journal_mode = WAL');
   sqlite.pragma('synchronous = NORMAL');
-  sqlite.pragma('busy_timeout = 5000');
+  sqlite.pragma('busy_timeout = 30000');
   const db = drizzle(sqlite, { schema });
   return { db, sqlite };
 }
