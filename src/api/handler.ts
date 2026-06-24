@@ -4114,6 +4114,29 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     return { status: 200, data: { ok: true, id } };
   }
 
+  // GET /coverage/day-comments/range?start=YYYY-MM-DD&end=YYYY-MM-DD
+  // Every comment across all locations in [start, end] — powers the Coverage
+  // Notes roll-up page. Ordered by location, then date, then newest-first.
+  if (req.path === '/coverage/day-comments/range' && req.method === 'GET') {
+    const start = cleanString(req.query.start);
+    const end = cleanString(req.query.end);
+    const ymd = /^\d{4}-\d{2}-\d{2}$/;
+    if (!start || !end) return apiError(400, 'BAD_REQUEST', 'start and end required');
+    if (!ymd.test(start) || !ymd.test(end)) return apiError(400, 'BAD_REQUEST', 'start and end must be YYYY-MM-DD');
+    if (start > end) return apiError(400, 'BAD_REQUEST', 'start must be <= end');
+    const span = Math.round((Date.parse(`${end}T00:00:00Z`) - Date.parse(`${start}T00:00:00Z`)) / 86400000) + 1;
+    if (span > 31) return apiError(400, 'BAD_REQUEST', 'range too wide (max 31 days)');
+    const { sqlite } = initializeDatabase(teamId);
+    const rows = sqlite.prepare(
+      `SELECT id, location_id AS locationId, date, author_email AS authorEmail,
+              author_name AS authorName, body, created_at AS createdAt
+         FROM coverage_day_comments
+        WHERE team_id = ? AND date >= ? AND date <= ?
+        ORDER BY location_id ASC, date ASC, created_at DESC`
+    ).all(teamId, start, end);
+    return { status: 200, data: { comments: rows } };
+  }
+
   // GET /coverage/day-schedule?locationId=X&date=YYYY-MM-DD
   // Powers the calendar-style schedule grid in the staff-coverage daily
   // drill-down modal. Returns rostered stylists for the day (with their
