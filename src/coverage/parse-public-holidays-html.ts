@@ -42,6 +42,37 @@ function toIsoDate(mdy: string): string {
   return `${m[3]}-${mm}-${dd}`;
 }
 
+/**
+ * Parse the per-holiday EDIT page (/Staff/PublicHolidays/Edit/{id}) and return
+ * the location ids the holiday CLOSES — i.e. the `selected` <option>s of the
+ * `Locations.Locations` multiselect ("Public holiday locations").
+ *
+ *   <select id="Locations_Locations" multiple name="Locations.Locations">
+ *     <option selected="selected" value="2107">Auburn Hills MI</option>
+ *     <option value="8192">Middleburg Fl</option>   <-- open (not selected)
+ *   </select>
+ *
+ * Returns { found, closedLocationIds }. `found=false` means the select was
+ * absent (e.g. an auth-expired/zombie page or markup change) — the caller
+ * should treat that as "don't know the scope" and NOT persist an empty set
+ * (which would be indistinguishable from "closes nothing"). When `found=true`
+ * and the array is empty, the holiday genuinely closes no locations.
+ */
+export function parseHolidayEditLocations(html: string): { found: boolean; closedLocationIds: string[] } {
+  const sel = html.match(/<select[^>]*id=["']Locations_Locations["'][\s\S]*?<\/select>/i);
+  if (!sel) return { found: false, closedLocationIds: [] };
+  const closed: string[] = [];
+  const optRe = /<option\b([^>]*)>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = optRe.exec(sel[0]))) {
+    const attrs = m[1];
+    if (!/\bselected\b/i.test(attrs)) continue;
+    const valMatch = attrs.match(/\bvalue=["']([^"']*)["']/i);
+    if (valMatch && valMatch[1]) closed.push(valMatch[1]);
+  }
+  return { found: true, closedLocationIds: closed };
+}
+
 export function parsePublicHolidaysHtml(html: string): PublicHolidayEntry[] {
   const out: PublicHolidayEntry[] = [];
   for (const match of html.matchAll(LI_RE)) {

@@ -86,6 +86,20 @@ export const publicHolidays = sqliteTable('public_holidays', {
 export type PublicHoliday = typeof publicHolidays.$inferSelect;
 export type NewPublicHoliday = typeof publicHolidays.$inferInsert;
 
+// Per-holiday location scoping (from /Staff/PublicHolidays/Edit/{id}). A row
+// means the holiday closes that location. A holiday with NO rows closes all
+// locations (unscraped/back-compat fallback). See migration 0020.
+export const publicHolidayLocations = sqliteTable('public_holiday_locations', {
+  teamId: text('team_id').notNull(),
+  holidayId: text('holiday_id').notNull(),
+  locationId: text('location_id').notNull(),
+}, (t) => ({
+  pk: primaryKey({ columns: [t.teamId, t.holidayId, t.locationId] }),
+}));
+
+export type PublicHolidayLocation = typeof publicHolidayLocations.$inferSelect;
+export type NewPublicHolidayLocation = typeof publicHolidayLocations.$inferInsert;
+
 export const stylists = sqliteTable('stylists', {
   id: text('id').primaryKey(),
   teamId: text('team_id').notNull(),

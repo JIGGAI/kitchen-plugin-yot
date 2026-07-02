@@ -316,6 +316,28 @@ export async function fetchFranchisesHtml(config: YotConfig): Promise<string> {
   return pages.join('\n');
 }
 
+/**
+ * Fetch the per-holiday EDIT page from /Staff/PublicHolidays/Edit/{id}. Unlike
+ * the List page, this one carries the "Public holiday locations" multiselect
+ * that scopes which locations the holiday closes. Returns the raw HTML; the
+ * caller passes it to parseHolidayEditLocations.
+ */
+export async function fetchPublicHolidayEditHtml(config: YotConfig, holidayId: string | number): Promise<string> {
+  const baseUrl = resolveBaseUrl(config);
+  const res = await mvcFetch(config, `/Staff/PublicHolidays/Edit/${holidayId}`, {
+    method: 'GET',
+    headers: {
+      accept: 'text/html,*/*',
+      referer: `${baseUrl}/Staff/PublicHolidays/Index`,
+    },
+  });
+  if (!res.ok) {
+    const snippet = (await res.text()).slice(0, 240);
+    throw new Error(`YOT MVC holiday-edit fetch failed (id=${holidayId}): HTTP ${res.status} ${snippet}`);
+  }
+  return res.text();
+}
+
 export { parseFranchisesHtml } from '../coverage/parse-franchises-html';
 export type { FranchiseEntry } from '../coverage/parse-franchises-html';
 
