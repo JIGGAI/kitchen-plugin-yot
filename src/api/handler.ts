@@ -3790,7 +3790,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         lastSyncedAt: now, lastSuccessAt: now, lastError: null, rowCount,
       });
       const { holidaysByDate } = await import('../coverage/sync-holidays');
-      const holidayName = holidaysByDate(covSqlite, teamId, [body.date!]).get(body.date!) ?? null;
+      const holidayName = holidaysByDate(covSqlite, teamId, [body.date!], body.locationId).get(body.date!) ?? null;
       return { status: 200, data: { ...result, holiday: holidayName ? { name: holidayName } : null } };
     } catch (err: any) {
       const msg = err?.message || 'Coverage sync failed';
@@ -3811,7 +3811,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     if (!cached) return apiError(404, 'NO_COVERAGE_CACHE', 'Run /coverage/sync first');
     const { holidaysByDate } = await import('../coverage/sync-holidays');
     const { sqlite: covSqlite } = initializeDatabase(teamId);
-    const holidayName = holidaysByDate(covSqlite, teamId, [date]).get(date) ?? null;
+    const holidayName = holidaysByDate(covSqlite, teamId, [date], locationId).get(date) ?? null;
     return { status: 200, data: { ...cached, holiday: holidayName ? { name: holidayName } : null } };
   }
 
@@ -4044,7 +4044,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         const underCover = lightHours >= LIGHT_HOURS_RED_THRESHOLD;
         return { date, stylists, appts, required, lightHours, underCover, closed: false, hasRoster: !!meta };
       });
-      return { locationId, days: attachHolidayToCells(out, holidaysByDate(sqlite, teamId, days)) };
+      return { locationId, days: attachHolidayToCells(out, holidaysByDate(sqlite, teamId, days, locationId)) };
     });
 
     // Mirror the daily heatmap's isRowInactive filter: drop locations where
