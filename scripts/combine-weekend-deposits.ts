@@ -35,6 +35,10 @@ const NEW_YORK_TZ = 'America/New_York';
 const DEFAULT_OUTPUT_DIR = path.join(homedir(), 'hmx-reports');
 const DEFAULT_ACCOUNT = 'govna.assistant@gmail.com';
 const DEFAULT_RECIPIENT = 'Miranda.hmx.corp@hairmx.net';
+// Additional recipients CC'd on the combined weekend disbursements email
+// so the corporate inbox has visibility alongside Miranda. Skipped when
+// --test-recipient redirects the run (test sends stay isolated).
+const ADDITIONAL_RECIPIENTS: readonly string[] = ['info@hairmx.net'];
 // Where missing-file / send-failure alerts go — RJ's personal Gmail, kept
 // independent of the corporate inbox the combined file is destined for.
 const FAILURE_ALERT_TO = 'rjdjohnston@gmail.com';
@@ -245,6 +249,9 @@ async function main() {
   const totalStr = total.toFixed(2);
 
   const recipient = args.testRecipient || DEFAULT_RECIPIENT;
+  const sendTo: string | string[] = args.testRecipient
+    ? recipient
+    : [recipient, ...ADDITIONAL_RECIPIENTS];
   const subject = `HMX Disbursements WEEKEND ${saturday} + ${sunday} — ${outRows.length} deposits, $${totalStr}`;
   const mergedNote = mergedStylistCount
     ? `${mergedStylistCount} stylist${mergedStylistCount > 1 ? 's' : ''} who worked both days were merged into a single summed row each.`
@@ -259,12 +266,13 @@ ${mergedNote} A stylist who worked two DIFFERENT locations over the weekend keep
 
   let emailStatus: 'sent' | 'skipped' | 'failed' = 'skipped';
   if (args.dryRun || args.skipEmail) {
-    console.error(`[${args.dryRun ? 'dry-run' : 'skip-email'}] would email ${combinedPath} to ${recipient}: ${subject}`);
+    const displayRecipients = Array.isArray(sendTo) ? sendTo.join(', ') : sendTo;
+    console.error(`[${args.dryRun ? 'dry-run' : 'skip-email'}] would email ${combinedPath} to ${displayRecipients}: ${subject}`);
   } else {
     try {
       await sendGmail({
         from: args.account,
-        to: recipient,
+        to: sendTo,
         subject,
         text: body,
         attachments: [{ filename: path.basename(combinedPath), path: combinedPath }],

@@ -225,6 +225,10 @@ const BRANCH_MASTER_TOTAL_ROW = 21;
 const DISPURSEMENTS_SHEET_ID = '1Z9Ey0oaKAH1J4gy0JlL-m3HjLvy4PKbBYFno3dYjbH8';
 const DISPURSEMENTS_TEMPLATE_TAB = 'CSV BLANK MASTER ';
 const DEFAULT_DISPURSEMENTS_RECIPIENT = 'Miranda.hmx.corp@hairmx.net';
+// Additional recipients CC'd on the nightly disbursements email so the
+// corporate inbox has visibility alongside Miranda. Skipped when
+// --test-recipient redirects the run (test sends stay isolated).
+const ADDITIONAL_DISPURSEMENTS_RECIPIENTS: readonly string[] = ['info@hairmx.net'];
 // When the disbursements email to Miranda (or whoever the recipient is set
 // to) fails, we send a fallback alert to this address so the failure
 // doesn't sit silently in stdout. RJ's personal Gmail keeps the alert
@@ -440,10 +444,10 @@ function buildWatchdogEmailSection(args: {
   return `\n\nWatchdog messages:\n${sections.join('\n\n')}`;
 }
 
-async function emailDisbursementsCsv(filePath: string, account: string, recipient: string, subject: string, body: string): Promise<void> {
+async function emailDisbursementsCsv(filePath: string, account: string, recipients: string | string[], subject: string, body: string): Promise<void> {
   await sendGmail({
     from: account,
-    to: recipient,
+    to: recipients,
     subject,
     text: body,
     attachments: [{ filename: path.basename(filePath), path: filePath }],
@@ -1444,6 +1448,9 @@ async function main() {
   // doesn't fail the whole export — the CSV is still on disk and the
   // watchdog can surface any issues.
   const recipient = args.testRecipient || DEFAULT_DISPURSEMENTS_RECIPIENT;
+  const sendTo: string | string[] = args.testRecipient
+    ? recipient
+    : [recipient, ...ADDITIONAL_DISPURSEMENTS_RECIPIENTS];
   const totalAmount = depositRows.reduce((s, r) => s + r.amount, 0);
   // Per-stylist note when deductions zeroed out a payout — Miranda should
   // know the stylist worked but was intentionally left off the CSV.
@@ -1473,10 +1480,11 @@ Sourced from CSV MASTER on the Branch Daily Totals sheet, with garnishment + loa
   let emailStatus: 'sent' | 'skipped' | 'failed' = 'skipped';
   let failureAlertStatus: 'sent' | 'skipped' | 'failed' | 'not-needed' = 'not-needed';
   if (args.dryRun || args.skipEmail) {
-    console.error(`[${args.dryRun ? 'dry-run' : 'skip-email'}] would email ${disbursementsPath} to ${recipient}: ${subject}`);
+    const displayRecipients = Array.isArray(sendTo) ? sendTo.join(', ') : sendTo;
+    console.error(`[${args.dryRun ? 'dry-run' : 'skip-email'}] would email ${disbursementsPath} to ${displayRecipients}: ${subject}`);
   } else {
     try {
-      await emailDisbursementsCsv(disbursementsPath, args.account, recipient, subject, body);
+      await emailDisbursementsCsv(disbursementsPath, args.account, sendTo, subject, body);
       emailStatus = 'sent';
     } catch (err: any) {
       emailStatus = 'failed';
