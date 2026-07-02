@@ -38,7 +38,7 @@ const DEFAULT_RECIPIENT = 'Miranda.hmx.corp@hairmx.net';
 // Additional recipients CC'd on the combined weekend disbursements email
 // so the corporate inbox has visibility alongside Miranda. Skipped when
 // --test-recipient redirects the run (test sends stay isolated).
-const ADDITIONAL_RECIPIENTS: readonly string[] = ['info@hairmx.net'];
+const ADDITIONAL_RECIPIENTS: readonly string[] = ['info@hairmx.com'];
 // Where missing-file / send-failure alerts go — RJ's personal Gmail, kept
 // independent of the corporate inbox the combined file is destined for.
 const FAILURE_ALERT_TO = 'rjdjohnston@gmail.com';

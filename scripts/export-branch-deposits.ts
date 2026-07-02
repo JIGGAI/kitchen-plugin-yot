@@ -228,7 +228,7 @@ const DEFAULT_DISPURSEMENTS_RECIPIENT = 'Miranda.hmx.corp@hairmx.net';
 // Additional recipients CC'd on the nightly disbursements email so the
 // corporate inbox has visibility alongside Miranda. Skipped when
 // --test-recipient redirects the run (test sends stay isolated).
-const ADDITIONAL_DISPURSEMENTS_RECIPIENTS: readonly string[] = ['info@hairmx.net'];
+const ADDITIONAL_DISPURSEMENTS_RECIPIENTS: readonly string[] = ['info@hairmx.com'];
 // When the disbursements email to Miranda (or whoever the recipient is set
 // to) fails, we send a fallback alert to this address so the failure
 // doesn't sit silently in stdout. RJ's personal Gmail keeps the alert
