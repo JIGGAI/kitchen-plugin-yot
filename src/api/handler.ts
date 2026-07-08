@@ -4068,7 +4068,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return apiError(400, 'BAD_REQUEST', 'date must be YYYY-MM-DD');
     const { sqlite } = initializeDatabase(teamId);
     const rows = sqlite.prepare(
-      `SELECT id, author_email AS authorEmail, author_name AS authorName, body, created_at AS createdAt
+      `SELECT id, author_email AS authorEmail, author_name AS authorName, body, created_at AS createdAt, updated_at AS updatedAt
          FROM coverage_day_comments
         WHERE team_id = ? AND location_id = ? AND date = ?
         ORDER BY created_at DESC`
@@ -4096,7 +4096,47 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       `INSERT INTO coverage_day_comments (id, team_id, location_id, date, author_email, author_name, body, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(id, teamId, locationId, date, authorEmail, authorName, text, createdAt);
-    return { status: 200, data: { comment: { id, authorEmail, authorName, body: text, createdAt } } };
+    return { status: 200, data: { comment: { id, authorEmail, authorName, body: text, createdAt, updatedAt: null } } };
+  }
+
+  // PATCH /coverage/day-comments { id, body, authorEmail } — author edits own only.
+  if (req.path === '/coverage/day-comments' && req.method === 'PATCH') {
+    const body = (req.body || {}) as Record<string, unknown>;
+    const id = cleanString(body.id);
+    const text = cleanString(body.body);
+    const authorEmail = cleanString(body.authorEmail);
+    if (!id) return apiError(400, 'BAD_REQUEST', 'id required');
+    if (!authorEmail) return apiError(400, 'BAD_REQUEST', 'authorEmail required');
+    if (!text) return apiError(400, 'BAD_REQUEST', 'body required');
+    if (text.length > 4000) return apiError(400, 'BAD_REQUEST', 'comment too long (max 4000 chars)');
+    const { sqlite } = initializeDatabase(teamId);
+    const existing = sqlite.prepare(
+      `SELECT author_email AS authorEmail, author_name AS authorName, location_id AS locationId, date, created_at AS createdAt
+         FROM coverage_day_comments WHERE team_id = ? AND id = ?`
+    ).get(teamId, id) as
+      | { authorEmail: string; authorName: string | null; locationId: string; date: string; createdAt: string }
+      | undefined;
+    if (!existing) return apiError(404, 'NOT_FOUND', 'comment not found');
+    if (existing.authorEmail !== authorEmail) return apiError(403, 'FORBIDDEN', 'you can only edit your own comments');
+    const updatedAt = new Date().toISOString();
+    sqlite.prepare(
+      `UPDATE coverage_day_comments SET body = ?, updated_at = ? WHERE team_id = ? AND id = ?`
+    ).run(text, updatedAt, teamId, id);
+    return {
+      status: 200,
+      data: {
+        comment: {
+          id,
+          locationId: existing.locationId,
+          date: existing.date,
+          authorEmail: existing.authorEmail,
+          authorName: existing.authorName,
+          body: text,
+          createdAt: existing.createdAt,
+          updatedAt,
+        },
+      },
+    };
   }
 
   // DELETE /coverage/day-comments?id=X&authorEmail=Y — author deletes own only.
@@ -4129,7 +4169,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     const { sqlite } = initializeDatabase(teamId);
     const rows = sqlite.prepare(
       `SELECT id, location_id AS locationId, date, author_email AS authorEmail,
-              author_name AS authorName, body, created_at AS createdAt
+              author_name AS authorName, body, created_at AS createdAt, updated_at AS updatedAt
          FROM coverage_day_comments
         WHERE team_id = ? AND date >= ? AND date <= ?
         ORDER BY location_id ASC, date ASC, created_at DESC`
