@@ -106,29 +106,27 @@ export function parseClientNewCsv(buffer: Buffer): ClientNewRow[] {
   return rows;
 }
 
-// The Referrer field is a free-text box, so the raw values are a long tail of
-// variants and misspellings of a few real sources (plus individual referrer
-// names). Normalize into a small, stable bucket set. Order matters — the first
-// matching rule wins; unmatched non-blank text falls through to "Word of mouth"
-// (the vast majority of the tail is person names, i.e. someone referred them).
+// The Referrer field is a free-text box on top of YOT's native "How did you
+// hear about us" options. We preserve the native options exactly (they're the
+// values people pick from the dropdown, hence the big counts) and only fold
+// obvious spelling/format variants into them. Everything else someone typed by
+// hand — names, jokes, one-off phrases — goes to a single write-in catch-all,
+// kept distinct from the native "Other" pick. Order matters (first match wins).
+export const NATIVE_REFERRAL_OPTIONS = ['Google', 'Friend', 'Facebook', 'Radio', 'Other'];
+export const WRITE_IN_REFERRAL_SOURCE = 'Other (write-in)';
+
 export function normalizeReferralSource(raw: string | null | undefined): string {
   const s = (raw || '').trim();
   if (!s) return '';
   const l = s.toLowerCase();
-  // Non-answers / junk → Other
-  if (/^(n\/?a|na|none|no ?one|nobody|noone|nothing|self|me|myself|you|universe|idk|\.+|-+|\?+)$/.test(l)) return 'Other';
-  if (l === 'other') return 'Other';
+  // Native options + their obvious variants/misspellings.
   if (/g[o0]{2,}gle|google/.test(l)) return 'Google';
   if (/facebook|face ?book|\bfb\b/.test(l)) return 'Facebook';
-  if (/instagram|\binsta\b|\big\b/.test(l)) return 'Instagram';
-  if (/reddit|yelp|tiktok|\bsocial\b|nextdoor/.test(l)) return 'Social media';
-  if (/chat ?g[bp]t|perplexity|\bai\b/.test(l)) return 'Online search';
-  if (/web ?site|wed site|\bweb\b|inter ?nets?|inter ?webs?|online|\bsearch|reviews?|\bnet\b|billboard|\byelp\b/.test(l)) return 'Online search';
-  if (/radio|wrif|\bad\b|advert|\bmail|coupon|flyer|postal|gift ?car|billboard/.test(l)) return 'Advertising';
-  if (/walk[ -]?in|walked in|drove|driving|drive|passing|passed|saw (the|your|driving|shop|a )|new to (the )?area|just moved|noticed|check(ed)? out/.test(l)) return 'Walk-in';
-  if (/repeat|return|previous|prior|been (here|there)|establish|past client|customer (in|from)|came (here|in) (before|years)/.test(l)) return 'Returning client';
-  // friend / family / coworker / referral / a person's name → word of mouth
-  return 'Word of mouth';
+  if (/\bradio\b|wrif/.test(l)) return 'Radio';
+  if (l === 'friend' || l === 'friends' || l === 'a friend') return 'Friend';
+  if (l === 'other') return 'Other';
+  // Anyone who typed their own answer (names, web, walk-in, etc.).
+  return WRITE_IN_REFERRAL_SOURCE;
 }
 
 export type ReferralSourceCount = { source: string; count: number };

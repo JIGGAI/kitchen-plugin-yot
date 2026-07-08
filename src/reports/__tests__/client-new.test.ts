@@ -37,25 +37,30 @@ describe('parseClientNewCsv', () => {
 });
 
 describe('normalizeReferralSource', () => {
-  it('buckets variants into stable sources', () => {
+  it('preserves native options and folds their obvious variants', () => {
+    expect(normalizeReferralSource('Google')).toBe('Google');
     expect(normalizeReferralSource('google search')).toBe('Google');
     expect(normalizeReferralSource('Google.')).toBe('Google');
+    expect(normalizeReferralSource('Facebook')).toBe('Facebook');
     expect(normalizeReferralSource('Face book')).toBe('Facebook');
-    expect(normalizeReferralSource('Web site and reviews')).toBe('Online search');
-    expect(normalizeReferralSource('Chat gpt')).toBe('Online search');
-    expect(normalizeReferralSource('Radio ad')).toBe('Advertising');
-    expect(normalizeReferralSource('Mail coupon')).toBe('Advertising');
-    expect(normalizeReferralSource('Drove by and saw your store')).toBe('Walk-in');
-    expect(normalizeReferralSource('Repeat client')).toBe('Returning client');
+    expect(normalizeReferralSource('Friend')).toBe('Friend');
+    expect(normalizeReferralSource('friend')).toBe('Friend');
+    expect(normalizeReferralSource('Radio ad')).toBe('Radio');
+    expect(normalizeReferralSource('101 WRIF')).toBe('Radio');
     expect(normalizeReferralSource('Other')).toBe('Other');
-    expect(normalizeReferralSource('na')).toBe('Other');
-    // person names / friend / family fall through to word of mouth
-    expect(normalizeReferralSource('Dave Barclay')).toBe('Word of mouth');
-    expect(normalizeReferralSource('Friend')).toBe('Word of mouth');
-    expect(normalizeReferralSource('My cousin')).toBe('Word of mouth');
-    // blank stays blank
+  });
+  it('routes typed-in free text to the write-in catch-all (not a native option)', () => {
+    expect(normalizeReferralSource('Dave Barclay')).toBe('Other (write-in)');
+    expect(normalizeReferralSource('My cousin')).toBe('Other (write-in)');
+    expect(normalizeReferralSource('Web site and reviews')).toBe('Other (write-in)');
+    expect(normalizeReferralSource('Chat gpt')).toBe('Other (write-in)');
+    expect(normalizeReferralSource('Walk-in')).toBe('Other (write-in)');
+    expect(normalizeReferralSource('na')).toBe('Other (write-in)');
+  });
+  it('keeps blanks blank', () => {
     expect(normalizeReferralSource('')).toBe('');
     expect(normalizeReferralSource('   ')).toBe('');
+    expect(normalizeReferralSource(null)).toBe('');
   });
 });
 
@@ -63,12 +68,16 @@ describe('aggregateReferralSources', () => {
   it('normalizes + counts referrers, buckets blanks, sorts desc', () => {
     const agg = aggregateReferralSources([
       { referrer: 'Google' }, { referrer: 'google search' }, { referrer: 'Friend' },
-      { referrer: '' }, { referrer: null }, { referrer: '  ' },
+      { referrer: 'Dave B' }, { referrer: '' }, { referrer: null }, { referrer: '  ' },
     ] as any);
-    // Google + "google search" collapse; Friend → Word of mouth
-    expect(agg.sources).toEqual([{ source: 'Google', count: 2 }, { source: 'Word of mouth', count: 1 }]);
-    expect(agg.specifiedTotal).toBe(3);
+    // Google + "google search" collapse; Friend stays Friend; name → write-in
+    expect(agg.sources).toEqual([
+      { source: 'Google', count: 2 },
+      { source: 'Friend', count: 1 },
+      { source: 'Other (write-in)', count: 1 },
+    ]);
+    expect(agg.specifiedTotal).toBe(4);
     expect(agg.blankCount).toBe(3);
-    expect(agg.total).toBe(6);
+    expect(agg.total).toBe(7);
   });
 });
