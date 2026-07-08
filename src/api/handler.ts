@@ -3881,45 +3881,101 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     if (!Number.isFinite(organisationId)) return apiError(400, 'BAD_REQUEST', 'organisationId must be a number');
     const months = enumerateYearMonths(startDate, endDate);
     try {
-      const { runClientNewReferralAggregate } = await import('../reports/run-client-new');
+      const { runClientNewReport } = await import('../reports/run-client-new');
+      const { normalizeReferralSource } = await import('../reports/reports/client-new');
+      // Location name → id/franchise, so the dashboard's ownership filter can
+      // slice the per-location rows the same way it does other pages.
+      const { sqlite } = initializeDatabase(teamId);
+      const locRows = sqlite.prepare(
+        'SELECT id, name, franchise_id AS franchiseId, franchise_name AS franchiseName FROM locations WHERE team_id = ?',
+      ).all(teamId) as Array<{ id: string; name: string; franchiseId: string | null; franchiseName: string | null }>;
+      const locMetaByName = new Map<string, { id: string; franchiseId: string; franchiseName: string }>();
+      for (const r of locRows) {
+        if (r.name) locMetaByName.set(r.name.trim().toLowerCase(), { id: String(r.id), franchiseId: r.franchiseId ? String(r.franchiseId) : '', franchiseName: r.franchiseName || '' });
+      }
+
       const now = Date.now();
-      type MonthAgg = { sources: Array<{ source: string; count: number }>; total: number; specifiedTotal: number; blankCount: number };
-      const perMonth: Array<{ ym: string; agg: MonthAgg }> = [];
+      // Per-month, per-location aggregate (full calendar month), cached so a
+      // range reuses each month and only the current month re-runs.
+      type LocAgg = { total: number; blank: number; bySource: Record<string, number> };
+      type MonthByLoc = Record<string, LocAgg>;
+      const perMonth: Array<{ ym: string; byLoc: MonthByLoc }> = [];
       for (const ym of months) {
-        const cacheKey = `${teamId}::${ym}::${organisationId}`;
+        const cacheKey = `${teamId}::loc::${ym}::${organisationId}`;
         const hit = CLIENT_NEW_REFERRAL_CACHE.get(cacheKey);
-        let agg: MonthAgg;
+        let byLoc: MonthByLoc;
         if (hit && (now - hit.at) < CLIENT_NEW_REFERRAL_TTL_MS) {
-          agg = hit.data as MonthAgg;
+          byLoc = hit.data as MonthByLoc;
         } else {
-          agg = await runClientNewReferralAggregate({
+          const rows = await runClientNewReport({
             teamId,
             startDateIso: `${ym}-01T00:00:00`,
             endDateIso: `${endOfYearMonth(ym)}T00:00:00`,
             organisationId,
           });
-          CLIENT_NEW_REFERRAL_CACHE.set(cacheKey, { at: now, data: agg });
+          byLoc = {};
+          for (const row of rows) {
+            const locName = (row.location || '').trim() || 'Unknown';
+            const src = normalizeReferralSource(row.referrer);
+            const b = byLoc[locName] || { total: 0, blank: 0, bySource: {} };
+            b.total += 1;
+            if (!src) b.blank += 1; else b.bySource[src] = (b.bySource[src] || 0) + 1;
+            byLoc[locName] = b;
+          }
+          CLIENT_NEW_REFERRAL_CACHE.set(cacheKey, { at: now, data: byLoc });
         }
-        perMonth.push({ ym, agg });
+        perMonth.push({ ym, byLoc });
       }
 
-      // Build the source × month matrix.
-      const sourceMap = new Map<string, { source: string; total: number; byMonth: Record<string, number> }>();
-      const blankByMonth: Record<string, number> = {};
-      const totalByMonth: Record<string, number> = {};
-      let total = 0; let specifiedTotal = 0; let blankTotal = 0;
-      for (const { ym, agg } of perMonth) {
-        blankByMonth[ym] = agg.blankCount; blankTotal += agg.blankCount;
-        totalByMonth[ym] = agg.total; total += agg.total;
-        for (const s of agg.sources) {
-          specifiedTotal += s.count;
-          const entry = sourceMap.get(s.source) || { source: s.source, total: 0, byMonth: {} };
-          entry.total += s.count;
-          entry.byMonth[ym] = (entry.byMonth[ym] || 0) + s.count;
-          sourceMap.set(s.source, entry);
+      // Build per-location structure + chain-wide totals.
+      type LocEntry = {
+        locationName: string; locationId: string; franchiseId: string; franchiseName: string;
+        total: number; blankTotal: number; specifiedTotal: number;
+        sourceTotals: Record<string, number>; sourceByMonth: Record<string, Record<string, number>>;
+        blankByMonth: Record<string, number>; totalByMonth: Record<string, number>;
+      };
+      const locMap = new Map<string, LocEntry>();
+      const chainSourceTotals: Record<string, number> = {};
+      const chainSourceByMonth: Record<string, Record<string, number>> = {};
+      const chainBlankByMonth: Record<string, number> = {};
+      const chainTotalByMonth: Record<string, number> = {};
+      let chainTotal = 0; let chainBlank = 0; let chainSpecified = 0;
+      for (const { ym, byLoc } of perMonth) {
+        for (const [locName, agg] of Object.entries(byLoc)) {
+          const key = locName.toLowerCase();
+          const meta = locMetaByName.get(key);
+          const e = locMap.get(key) || {
+            locationName: locName, locationId: meta?.id || locName, franchiseId: meta?.franchiseId || '', franchiseName: meta?.franchiseName || '',
+            total: 0, blankTotal: 0, specifiedTotal: 0, sourceTotals: {}, sourceByMonth: {}, blankByMonth: {}, totalByMonth: {},
+          };
+          e.total += agg.total; e.blankTotal += agg.blank;
+          e.blankByMonth[ym] = (e.blankByMonth[ym] || 0) + agg.blank;
+          e.totalByMonth[ym] = (e.totalByMonth[ym] || 0) + agg.total;
+          for (const [src, c] of Object.entries(agg.bySource)) {
+            e.specifiedTotal += c;
+            e.sourceTotals[src] = (e.sourceTotals[src] || 0) + c;
+            (e.sourceByMonth[src] = e.sourceByMonth[src] || {})[ym] = ((e.sourceByMonth[src] || {})[ym] || 0) + c;
+            chainSpecified += c;
+            chainSourceTotals[src] = (chainSourceTotals[src] || 0) + c;
+            (chainSourceByMonth[src] = chainSourceByMonth[src] || {})[ym] = ((chainSourceByMonth[src] || {})[ym] || 0) + c;
+          }
+          locMap.set(key, e);
+          chainTotal += agg.total; chainBlank += agg.blank;
+          chainBlankByMonth[ym] = (chainBlankByMonth[ym] || 0) + agg.blank;
+          chainTotalByMonth[ym] = (chainTotalByMonth[ym] || 0) + agg.total;
         }
       }
-      const sources = [...sourceMap.values()].sort((a, b) => b.total - a.total || a.source.localeCompare(b.source));
+
+      const toSources = (totals: Record<string, number>, byMonth: Record<string, Record<string, number>>) =>
+        Object.keys(totals).map((src) => ({ source: src, total: totals[src], byMonth: byMonth[src] || {} }))
+          .sort((a, b) => b.total - a.total || a.source.localeCompare(b.source));
+      const locations = [...locMap.values()].map((e) => ({
+        locationId: e.locationId, locationName: e.locationName, franchiseId: e.franchiseId, franchiseName: e.franchiseName,
+        total: e.total, blankTotal: e.blankTotal, specifiedTotal: e.specifiedTotal,
+        sources: toSources(e.sourceTotals, e.sourceByMonth),
+        blankByMonth: e.blankByMonth, totalByMonth: e.totalByMonth,
+      })).sort((a, b) => b.total - a.total || a.locationName.localeCompare(b.locationName));
+
       return {
         status: 200,
         data: {
@@ -3927,12 +3983,13 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
           endDate,
           organisationId,
           months: months.map((ym) => ({ periodKey: ym, label: yearMonthLabel(ym) })),
-          sources,
-          blankByMonth,
-          blankTotal,
-          totalByMonth,
-          total,
-          specifiedTotal,
+          sources: toSources(chainSourceTotals, chainSourceByMonth),
+          blankByMonth: chainBlankByMonth,
+          blankTotal: chainBlank,
+          totalByMonth: chainTotalByMonth,
+          total: chainTotal,
+          specifiedTotal: chainSpecified,
+          locations,
         },
       };
     } catch (error: any) {
