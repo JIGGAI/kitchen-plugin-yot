@@ -3,6 +3,7 @@ import {
   parseCsvLine,
   parseClientNewCsv,
   aggregateReferralSources,
+  normalizeReferralSource,
 } from '../reports/client-new';
 
 describe('parseCsvLine', () => {
@@ -35,13 +36,37 @@ describe('parseClientNewCsv', () => {
   });
 });
 
+describe('normalizeReferralSource', () => {
+  it('buckets variants into stable sources', () => {
+    expect(normalizeReferralSource('google search')).toBe('Google');
+    expect(normalizeReferralSource('Google.')).toBe('Google');
+    expect(normalizeReferralSource('Face book')).toBe('Facebook');
+    expect(normalizeReferralSource('Web site and reviews')).toBe('Online search');
+    expect(normalizeReferralSource('Chat gpt')).toBe('Online search');
+    expect(normalizeReferralSource('Radio ad')).toBe('Advertising');
+    expect(normalizeReferralSource('Mail coupon')).toBe('Advertising');
+    expect(normalizeReferralSource('Drove by and saw your store')).toBe('Walk-in');
+    expect(normalizeReferralSource('Repeat client')).toBe('Returning client');
+    expect(normalizeReferralSource('Other')).toBe('Other');
+    expect(normalizeReferralSource('na')).toBe('Other');
+    // person names / friend / family fall through to word of mouth
+    expect(normalizeReferralSource('Dave Barclay')).toBe('Word of mouth');
+    expect(normalizeReferralSource('Friend')).toBe('Word of mouth');
+    expect(normalizeReferralSource('My cousin')).toBe('Word of mouth');
+    // blank stays blank
+    expect(normalizeReferralSource('')).toBe('');
+    expect(normalizeReferralSource('   ')).toBe('');
+  });
+});
+
 describe('aggregateReferralSources', () => {
-  it('counts non-blank referrers, buckets blanks, sorts desc', () => {
+  it('normalizes + counts referrers, buckets blanks, sorts desc', () => {
     const agg = aggregateReferralSources([
-      { referrer: 'Google' }, { referrer: 'Google' }, { referrer: 'Friend' },
+      { referrer: 'Google' }, { referrer: 'google search' }, { referrer: 'Friend' },
       { referrer: '' }, { referrer: null }, { referrer: '  ' },
     ] as any);
-    expect(agg.sources).toEqual([{ source: 'Google', count: 2 }, { source: 'Friend', count: 1 }]);
+    // Google + "google search" collapse; Friend → Word of mouth
+    expect(agg.sources).toEqual([{ source: 'Google', count: 2 }, { source: 'Word of mouth', count: 1 }]);
     expect(agg.specifiedTotal).toBe(3);
     expect(agg.blankCount).toBe(3);
     expect(agg.total).toBe(6);

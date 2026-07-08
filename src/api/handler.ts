@@ -374,6 +374,31 @@ const PAYOUT_EXPORT_DIR = '/Users/hairmx/hmx-reports';
 const CLIENT_NEW_REFERRAL_TTL_MS = 6 * 60 * 60 * 1000;
 const CLIENT_NEW_REFERRAL_CACHE = new Map<string, { at: number; data: unknown }>();
 
+const REFERRAL_MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December'];
+// Calendar months (YYYY-MM) overlapping [startDate, endDate], oldest → newest.
+function enumerateYearMonths(startDate: string, endDate: string): string[] {
+  const out: string[] = [];
+  const [sy, sm] = startDate.split('-').map(Number);
+  const [ey, em] = endDate.split('-').map(Number);
+  let y = sy; let m = sm; let guard = 0;
+  while ((y < ey || (y === ey && m <= em)) && guard < 36) {
+    out.push(`${y}-${String(m).padStart(2, '0')}`);
+    m += 1; if (m > 12) { m = 1; y += 1; }
+    guard += 1;
+  }
+  return out;
+}
+function endOfYearMonth(ym: string): string {
+  const [y, m] = ym.split('-').map(Number);
+  const last = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  return `${ym}-${String(last).padStart(2, '0')}`;
+}
+function yearMonthLabel(ym: string): string {
+  const [y, m] = ym.split('-').map(Number);
+  return `${REFERRAL_MONTH_NAMES[m - 1]} ${y}`;
+}
+
 function mostRecentIso(a: string | null, b: string | null): string | null {
   if (!a) return b;
   if (!b) return a;
@@ -3843,32 +3868,73 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
   //                stylist count fell below the day's `required` value
   //   underCover = lightHours >= LIGHT_HOURS_RED_THRESHOLD (3)
   // Locations with zero appointments across the entire window are omitted.
-  // New-client referral sources: run YOT's ClientNew_2121 report for the range
-  // and roll the Referrer column up into per-source counts (one report run
-  // returns the whole period). TTL-cached — see CLIENT_NEW_REFERRAL_CACHE.
+  // New-client referral sources, broken out by calendar month. For each month
+  // overlapping the range we run YOT's ClientNew_2121 report (full calendar
+  // month, like /monthly-leadership's per-month figures) and roll the Referrer
+  // column up into normalized per-source counts. Cached per (team, month, org)
+  // so ranges reuse each month's result and only the current month re-runs.
   if (req.path === '/new-client-referrals' && req.method === 'GET') {
     const startDate = toDateOnlyInput(req.query.startDate || req.query.start);
     const endDate = toDateOnlyInput(req.query.endDate || req.query.end);
     if (!startDate || !endDate) return apiError(400, 'BAD_REQUEST', 'startDate and endDate required (YYYY-MM-DD)');
     const organisationId = Number(cleanString(req.query.organisationId || req.query.org) || String(DEFAULT_REVENUE_ORGANISATION_ID));
     if (!Number.isFinite(organisationId)) return apiError(400, 'BAD_REQUEST', 'organisationId must be a number');
-    const now = Date.now();
-    const cacheKey = `${teamId}::${startDate}::${endDate}::${organisationId}`;
-    const hit = CLIENT_NEW_REFERRAL_CACHE.get(cacheKey);
-    if (hit && (now - hit.at) < CLIENT_NEW_REFERRAL_TTL_MS) {
-      return { status: 200, data: { ...(hit.data as object), cacheHit: true } };
-    }
+    const months = enumerateYearMonths(startDate, endDate);
     try {
       const { runClientNewReferralAggregate } = await import('../reports/run-client-new');
-      const agg = await runClientNewReferralAggregate({
-        teamId,
-        startDateIso: `${startDate}T00:00:00`,
-        endDateIso: `${endDate}T00:00:00`,
-        organisationId,
-      });
-      const data = { startDate, endDate, organisationId, ...agg };
-      CLIENT_NEW_REFERRAL_CACHE.set(cacheKey, { at: now, data });
-      return { status: 200, data };
+      const now = Date.now();
+      type MonthAgg = { sources: Array<{ source: string; count: number }>; total: number; specifiedTotal: number; blankCount: number };
+      const perMonth: Array<{ ym: string; agg: MonthAgg }> = [];
+      for (const ym of months) {
+        const cacheKey = `${teamId}::${ym}::${organisationId}`;
+        const hit = CLIENT_NEW_REFERRAL_CACHE.get(cacheKey);
+        let agg: MonthAgg;
+        if (hit && (now - hit.at) < CLIENT_NEW_REFERRAL_TTL_MS) {
+          agg = hit.data as MonthAgg;
+        } else {
+          agg = await runClientNewReferralAggregate({
+            teamId,
+            startDateIso: `${ym}-01T00:00:00`,
+            endDateIso: `${endOfYearMonth(ym)}T00:00:00`,
+            organisationId,
+          });
+          CLIENT_NEW_REFERRAL_CACHE.set(cacheKey, { at: now, data: agg });
+        }
+        perMonth.push({ ym, agg });
+      }
+
+      // Build the source × month matrix.
+      const sourceMap = new Map<string, { source: string; total: number; byMonth: Record<string, number> }>();
+      const blankByMonth: Record<string, number> = {};
+      const totalByMonth: Record<string, number> = {};
+      let total = 0; let specifiedTotal = 0; let blankTotal = 0;
+      for (const { ym, agg } of perMonth) {
+        blankByMonth[ym] = agg.blankCount; blankTotal += agg.blankCount;
+        totalByMonth[ym] = agg.total; total += agg.total;
+        for (const s of agg.sources) {
+          specifiedTotal += s.count;
+          const entry = sourceMap.get(s.source) || { source: s.source, total: 0, byMonth: {} };
+          entry.total += s.count;
+          entry.byMonth[ym] = (entry.byMonth[ym] || 0) + s.count;
+          sourceMap.set(s.source, entry);
+        }
+      }
+      const sources = [...sourceMap.values()].sort((a, b) => b.total - a.total || a.source.localeCompare(b.source));
+      return {
+        status: 200,
+        data: {
+          startDate,
+          endDate,
+          organisationId,
+          months: months.map((ym) => ({ periodKey: ym, label: yearMonthLabel(ym) })),
+          sources,
+          blankByMonth,
+          blankTotal,
+          totalByMonth,
+          total,
+          specifiedTotal,
+        },
+      };
     } catch (error: any) {
       return apiError(502, 'YOT_ERROR', error?.message || 'Failed to run ClientNew referral report');
     }

@@ -106,6 +106,31 @@ export function parseClientNewCsv(buffer: Buffer): ClientNewRow[] {
   return rows;
 }
 
+// The Referrer field is a free-text box, so the raw values are a long tail of
+// variants and misspellings of a few real sources (plus individual referrer
+// names). Normalize into a small, stable bucket set. Order matters — the first
+// matching rule wins; unmatched non-blank text falls through to "Word of mouth"
+// (the vast majority of the tail is person names, i.e. someone referred them).
+export function normalizeReferralSource(raw: string | null | undefined): string {
+  const s = (raw || '').trim();
+  if (!s) return '';
+  const l = s.toLowerCase();
+  // Non-answers / junk → Other
+  if (/^(n\/?a|na|none|no ?one|nobody|noone|nothing|self|me|myself|you|universe|idk|\.+|-+|\?+)$/.test(l)) return 'Other';
+  if (l === 'other') return 'Other';
+  if (/g[o0]{2,}gle|google/.test(l)) return 'Google';
+  if (/facebook|face ?book|\bfb\b/.test(l)) return 'Facebook';
+  if (/instagram|\binsta\b|\big\b/.test(l)) return 'Instagram';
+  if (/reddit|yelp|tiktok|\bsocial\b|nextdoor/.test(l)) return 'Social media';
+  if (/chat ?g[bp]t|perplexity|\bai\b/.test(l)) return 'Online search';
+  if (/web ?site|wed site|\bweb\b|inter ?nets?|inter ?webs?|online|\bsearch|reviews?|\bnet\b|billboard|\byelp\b/.test(l)) return 'Online search';
+  if (/radio|wrif|\bad\b|advert|\bmail|coupon|flyer|postal|gift ?car|billboard/.test(l)) return 'Advertising';
+  if (/walk[ -]?in|walked in|drove|driving|drive|passing|passed|saw (the|your|driving|shop|a )|new to (the )?area|just moved|noticed|check(ed)? out/.test(l)) return 'Walk-in';
+  if (/repeat|return|previous|prior|been (here|there)|establish|past client|customer (in|from)|came (here|in) (before|years)/.test(l)) return 'Returning client';
+  // friend / family / coworker / referral / a person's name → word of mouth
+  return 'Word of mouth';
+}
+
 export type ReferralSourceCount = { source: string; count: number };
 export type ClientNewReferralAggregate = {
   sources: ReferralSourceCount[];   // specified sources, desc by count
@@ -120,9 +145,9 @@ export function aggregateReferralSources(rows: ClientNewRow[]): ClientNewReferra
   const counts = new Map<string, number>();
   let blankCount = 0;
   for (const row of rows) {
-    const ref = (row.referrer || '').trim();
-    if (!ref) { blankCount += 1; continue; }
-    counts.set(ref, (counts.get(ref) || 0) + 1);
+    const source = normalizeReferralSource(row.referrer);
+    if (!source) { blankCount += 1; continue; }
+    counts.set(source, (counts.get(source) || 0) + 1);
   }
   const sources = [...counts.entries()]
     .map(([source, count]) => ({ source, count }))
