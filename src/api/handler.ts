@@ -368,6 +368,12 @@ const REPORTS_TIME_ZONE = 'America/New_York';
 const DEFAULT_REVENUE_ORGANISATION_ID = 11082;
 const PAYOUT_EXPORT_DIR = '/Users/hairmx/hmx-reports';
 
+// New-client referral aggregate is backed by a live Telerik report run (several
+// seconds), so results are TTL-cached per (team, range, org). New-client counts
+// settle daily, so a multi-hour TTL keeps the page snappy without going stale.
+const CLIENT_NEW_REFERRAL_TTL_MS = 6 * 60 * 60 * 1000;
+const CLIENT_NEW_REFERRAL_CACHE = new Map<string, { at: number; data: unknown }>();
+
 function mostRecentIso(a: string | null, b: string | null): string | null {
   if (!a) return b;
   if (!b) return a;
@@ -3837,6 +3843,37 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
   //                stylist count fell below the day's `required` value
   //   underCover = lightHours >= LIGHT_HOURS_RED_THRESHOLD (3)
   // Locations with zero appointments across the entire window are omitted.
+  // New-client referral sources: run YOT's ClientNew_2121 report for the range
+  // and roll the Referrer column up into per-source counts (one report run
+  // returns the whole period). TTL-cached — see CLIENT_NEW_REFERRAL_CACHE.
+  if (req.path === '/new-client-referrals' && req.method === 'GET') {
+    const startDate = toDateOnlyInput(req.query.startDate || req.query.start);
+    const endDate = toDateOnlyInput(req.query.endDate || req.query.end);
+    if (!startDate || !endDate) return apiError(400, 'BAD_REQUEST', 'startDate and endDate required (YYYY-MM-DD)');
+    const organisationId = Number(cleanString(req.query.organisationId || req.query.org) || String(DEFAULT_REVENUE_ORGANISATION_ID));
+    if (!Number.isFinite(organisationId)) return apiError(400, 'BAD_REQUEST', 'organisationId must be a number');
+    const now = Date.now();
+    const cacheKey = `${teamId}::${startDate}::${endDate}::${organisationId}`;
+    const hit = CLIENT_NEW_REFERRAL_CACHE.get(cacheKey);
+    if (hit && (now - hit.at) < CLIENT_NEW_REFERRAL_TTL_MS) {
+      return { status: 200, data: { ...(hit.data as object), cacheHit: true } };
+    }
+    try {
+      const { runClientNewReferralAggregate } = await import('../reports/run-client-new');
+      const agg = await runClientNewReferralAggregate({
+        teamId,
+        startDateIso: `${startDate}T00:00:00`,
+        endDateIso: `${endDate}T00:00:00`,
+        organisationId,
+      });
+      const data = { startDate, endDate, organisationId, ...agg };
+      CLIENT_NEW_REFERRAL_CACHE.set(cacheKey, { at: now, data });
+      return { status: 200, data };
+    } catch (error: any) {
+      return apiError(502, 'YOT_ERROR', error?.message || 'Failed to run ClientNew referral report');
+    }
+  }
+
   if (req.path === '/coverage/history' && req.method === 'GET') {
     const start = cleanString(req.query.start);
     const end = cleanString(req.query.end);
