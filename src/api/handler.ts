@@ -368,6 +368,37 @@ const REPORTS_TIME_ZONE = 'America/New_York';
 const DEFAULT_REVENUE_ORGANISATION_ID = 11082;
 const PAYOUT_EXPORT_DIR = '/Users/hairmx/hmx-reports';
 
+// New-client referral aggregate is backed by a live Telerik report run (several
+// seconds), so results are TTL-cached per (team, range, org). New-client counts
+// settle daily, so a multi-hour TTL keeps the page snappy without going stale.
+const CLIENT_NEW_REFERRAL_TTL_MS = 6 * 60 * 60 * 1000;
+const CLIENT_NEW_REFERRAL_CACHE = new Map<string, { at: number; data: unknown }>();
+
+const REFERRAL_MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December'];
+// Calendar months (YYYY-MM) overlapping [startDate, endDate], oldest → newest.
+function enumerateYearMonths(startDate: string, endDate: string): string[] {
+  const out: string[] = [];
+  const [sy, sm] = startDate.split('-').map(Number);
+  const [ey, em] = endDate.split('-').map(Number);
+  let y = sy; let m = sm; let guard = 0;
+  while ((y < ey || (y === ey && m <= em)) && guard < 36) {
+    out.push(`${y}-${String(m).padStart(2, '0')}`);
+    m += 1; if (m > 12) { m = 1; y += 1; }
+    guard += 1;
+  }
+  return out;
+}
+function endOfYearMonth(ym: string): string {
+  const [y, m] = ym.split('-').map(Number);
+  const last = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  return `${ym}-${String(last).padStart(2, '0')}`;
+}
+function yearMonthLabel(ym: string): string {
+  const [y, m] = ym.split('-').map(Number);
+  return `${REFERRAL_MONTH_NAMES[m - 1]} ${y}`;
+}
+
 function mostRecentIso(a: string | null, b: string | null): string | null {
   if (!a) return b;
   if (!b) return a;
@@ -3837,6 +3868,135 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
   //                stylist count fell below the day's `required` value
   //   underCover = lightHours >= LIGHT_HOURS_RED_THRESHOLD (3)
   // Locations with zero appointments across the entire window are omitted.
+  // New-client referral sources, broken out by calendar month. For each month
+  // overlapping the range we run YOT's ClientNew_2121 report (full calendar
+  // month, like /monthly-leadership's per-month figures) and roll the Referrer
+  // column up into normalized per-source counts. Cached per (team, month, org)
+  // so ranges reuse each month's result and only the current month re-runs.
+  if (req.path === '/new-client-referrals' && req.method === 'GET') {
+    const startDate = toDateOnlyInput(req.query.startDate || req.query.start);
+    const endDate = toDateOnlyInput(req.query.endDate || req.query.end);
+    if (!startDate || !endDate) return apiError(400, 'BAD_REQUEST', 'startDate and endDate required (YYYY-MM-DD)');
+    const organisationId = Number(cleanString(req.query.organisationId || req.query.org) || String(DEFAULT_REVENUE_ORGANISATION_ID));
+    if (!Number.isFinite(organisationId)) return apiError(400, 'BAD_REQUEST', 'organisationId must be a number');
+    const months = enumerateYearMonths(startDate, endDate);
+    try {
+      const { runClientNewReport } = await import('../reports/run-client-new');
+      const { normalizeReferralSource } = await import('../reports/reports/client-new');
+      // Location name → id/franchise, so the dashboard's ownership filter can
+      // slice the per-location rows the same way it does other pages.
+      const { sqlite } = initializeDatabase(teamId);
+      const locRows = sqlite.prepare(
+        'SELECT id, name, franchise_id AS franchiseId, franchise_name AS franchiseName FROM locations WHERE team_id = ?',
+      ).all(teamId) as Array<{ id: string; name: string; franchiseId: string | null; franchiseName: string | null }>;
+      const locMetaByName = new Map<string, { id: string; franchiseId: string; franchiseName: string }>();
+      for (const r of locRows) {
+        if (r.name) locMetaByName.set(r.name.trim().toLowerCase(), { id: String(r.id), franchiseId: r.franchiseId ? String(r.franchiseId) : '', franchiseName: r.franchiseName || '' });
+      }
+
+      const now = Date.now();
+      // Per-month, per-location aggregate (full calendar month), cached so a
+      // range reuses each month and only the current month re-runs.
+      type LocAgg = { total: number; blank: number; bySource: Record<string, number> };
+      type MonthByLoc = Record<string, LocAgg>;
+      const perMonth: Array<{ ym: string; byLoc: MonthByLoc }> = [];
+      for (const ym of months) {
+        const cacheKey = `${teamId}::loc::${ym}::${organisationId}`;
+        const hit = CLIENT_NEW_REFERRAL_CACHE.get(cacheKey);
+        let byLoc: MonthByLoc;
+        if (hit && (now - hit.at) < CLIENT_NEW_REFERRAL_TTL_MS) {
+          byLoc = hit.data as MonthByLoc;
+        } else {
+          const rows = await runClientNewReport({
+            teamId,
+            startDateIso: `${ym}-01T00:00:00`,
+            endDateIso: `${endOfYearMonth(ym)}T00:00:00`,
+            organisationId,
+          });
+          byLoc = {};
+          for (const row of rows) {
+            const locName = (row.location || '').trim() || 'Unknown';
+            const src = normalizeReferralSource(row.referrer);
+            const b = byLoc[locName] || { total: 0, blank: 0, bySource: {} };
+            b.total += 1;
+            if (!src) b.blank += 1; else b.bySource[src] = (b.bySource[src] || 0) + 1;
+            byLoc[locName] = b;
+          }
+          CLIENT_NEW_REFERRAL_CACHE.set(cacheKey, { at: now, data: byLoc });
+        }
+        perMonth.push({ ym, byLoc });
+      }
+
+      // Build per-location structure + chain-wide totals.
+      type LocEntry = {
+        locationName: string; locationId: string; franchiseId: string; franchiseName: string;
+        total: number; blankTotal: number; specifiedTotal: number;
+        sourceTotals: Record<string, number>; sourceByMonth: Record<string, Record<string, number>>;
+        blankByMonth: Record<string, number>; totalByMonth: Record<string, number>;
+      };
+      const locMap = new Map<string, LocEntry>();
+      const chainSourceTotals: Record<string, number> = {};
+      const chainSourceByMonth: Record<string, Record<string, number>> = {};
+      const chainBlankByMonth: Record<string, number> = {};
+      const chainTotalByMonth: Record<string, number> = {};
+      let chainTotal = 0; let chainBlank = 0; let chainSpecified = 0;
+      for (const { ym, byLoc } of perMonth) {
+        for (const [locName, agg] of Object.entries(byLoc)) {
+          const key = locName.toLowerCase();
+          const meta = locMetaByName.get(key);
+          const e = locMap.get(key) || {
+            locationName: locName, locationId: meta?.id || locName, franchiseId: meta?.franchiseId || '', franchiseName: meta?.franchiseName || '',
+            total: 0, blankTotal: 0, specifiedTotal: 0, sourceTotals: {}, sourceByMonth: {}, blankByMonth: {}, totalByMonth: {},
+          };
+          e.total += agg.total; e.blankTotal += agg.blank;
+          e.blankByMonth[ym] = (e.blankByMonth[ym] || 0) + agg.blank;
+          e.totalByMonth[ym] = (e.totalByMonth[ym] || 0) + agg.total;
+          for (const [src, c] of Object.entries(agg.bySource)) {
+            e.specifiedTotal += c;
+            e.sourceTotals[src] = (e.sourceTotals[src] || 0) + c;
+            (e.sourceByMonth[src] = e.sourceByMonth[src] || {})[ym] = ((e.sourceByMonth[src] || {})[ym] || 0) + c;
+            chainSpecified += c;
+            chainSourceTotals[src] = (chainSourceTotals[src] || 0) + c;
+            (chainSourceByMonth[src] = chainSourceByMonth[src] || {})[ym] = ((chainSourceByMonth[src] || {})[ym] || 0) + c;
+          }
+          locMap.set(key, e);
+          chainTotal += agg.total; chainBlank += agg.blank;
+          chainBlankByMonth[ym] = (chainBlankByMonth[ym] || 0) + agg.blank;
+          chainTotalByMonth[ym] = (chainTotalByMonth[ym] || 0) + agg.total;
+        }
+      }
+
+      const toSources = (totals: Record<string, number>, byMonth: Record<string, Record<string, number>>) =>
+        Object.keys(totals).map((src) => ({ source: src, total: totals[src], byMonth: byMonth[src] || {} }))
+          .sort((a, b) => b.total - a.total || a.source.localeCompare(b.source));
+      const locations = [...locMap.values()].map((e) => ({
+        locationId: e.locationId, locationName: e.locationName, franchiseId: e.franchiseId, franchiseName: e.franchiseName,
+        total: e.total, blankTotal: e.blankTotal, specifiedTotal: e.specifiedTotal,
+        sources: toSources(e.sourceTotals, e.sourceByMonth),
+        blankByMonth: e.blankByMonth, totalByMonth: e.totalByMonth,
+      })).sort((a, b) => b.total - a.total || a.locationName.localeCompare(b.locationName));
+
+      return {
+        status: 200,
+        data: {
+          startDate,
+          endDate,
+          organisationId,
+          months: months.map((ym) => ({ periodKey: ym, label: yearMonthLabel(ym) })),
+          sources: toSources(chainSourceTotals, chainSourceByMonth),
+          blankByMonth: chainBlankByMonth,
+          blankTotal: chainBlank,
+          totalByMonth: chainTotalByMonth,
+          total: chainTotal,
+          specifiedTotal: chainSpecified,
+          locations,
+        },
+      };
+    } catch (error: any) {
+      return apiError(502, 'YOT_ERROR', error?.message || 'Failed to run ClientNew referral report');
+    }
+  }
+
   if (req.path === '/coverage/history' && req.method === 'GET') {
     const start = cleanString(req.query.start);
     const end = cleanString(req.query.end);
