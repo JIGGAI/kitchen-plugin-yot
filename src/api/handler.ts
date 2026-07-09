@@ -3879,6 +3879,8 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     if (!startDate || !endDate) return apiError(400, 'BAD_REQUEST', 'startDate and endDate required (YYYY-MM-DD)');
     const organisationId = Number(cleanString(req.query.organisationId || req.query.org) || String(DEFAULT_REVENUE_ORGANISATION_ID));
     if (!Number.isFinite(organisationId)) return apiError(400, 'BAD_REQUEST', 'organisationId must be a number');
+    const refreshParam = cleanString(req.query.refresh);
+    const refresh = !!refreshParam && refreshParam !== '0' && refreshParam !== 'false';
     const months = enumerateYearMonths(startDate, endDate);
     try {
       const { runClientNewReport } = await import('../reports/run-client-new');
@@ -3904,7 +3906,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         const cacheKey = `${teamId}::loc::${ym}::${organisationId}`;
         const hit = CLIENT_NEW_REFERRAL_CACHE.get(cacheKey);
         let byLoc: MonthByLoc;
-        if (hit && (now - hit.at) < CLIENT_NEW_REFERRAL_TTL_MS) {
+        if (!refresh && hit && (now - hit.at) < CLIENT_NEW_REFERRAL_TTL_MS) {
           byLoc = hit.data as MonthByLoc;
         } else {
           const rows = await runClientNewReport({
