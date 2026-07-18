@@ -112,7 +112,11 @@ export function parseClientNewCsv(buffer: Buffer): ClientNewRow[] {
 // obvious spelling/format variants into them. Everything else someone typed by
 // hand — names, jokes, one-off phrases — goes to a single write-in catch-all,
 // kept distinct from the native "Other" pick. Order matters (first match wins).
-export const NATIVE_REFERRAL_OPTIONS = ['Google', 'Friend', 'Facebook', 'Social Media', 'TV/Radio', 'Radio', 'Drive By', 'Other'];
+export const NATIVE_REFERRAL_OPTIONS = [
+  'Google', 'Friend', 'Facebook', 'Instagram', 'TikTok', 'YouTube', 'X',
+  'Snapchat', 'LinkedIn', 'Pinterest', 'Reddit', 'Social Media',
+  'TV/Radio', 'Radio', 'Drive By', 'Other',
+];
 export const WRITE_IN_REFERRAL_SOURCE = 'Other (write-in)';
 
 export function normalizeReferralSource(raw: string | null | undefined): string {
@@ -122,7 +126,15 @@ export function normalizeReferralSource(raw: string | null | undefined): string 
   // Native options + their obvious variants/misspellings.
   if (/g[o0]{2,}gle|google/.test(l)) return 'Google';
   if (/facebook|face ?book|\bfb\b/.test(l)) return 'Facebook';
-  if (/social media|social|instagram|\big\b|tiktok|tik tok/.test(l)) return 'Social Media';
+  if (/instagram|\big\b/.test(l)) return 'Instagram';
+  if (/tiktok|tik tok/.test(l)) return 'TikTok';
+  if (/youtube|you tube/.test(l)) return 'YouTube';
+  if (l === 'x' || /\btwitter\b|x\.com/.test(l)) return 'X';
+  if (/snapchat|\bsnap\b/.test(l)) return 'Snapchat';
+  if (/linkedin|linked in/.test(l)) return 'LinkedIn';
+  if (/pinterest/.test(l)) return 'Pinterest';
+  if (/reddit/.test(l)) return 'Reddit';
+  if (/social media|social/.test(l)) return 'Social Media';
   if (/tv\s*\/\s*radio|television|cable/.test(l)) return 'TV/Radio';
   if (/\bradio\b|wrif/.test(l)) return 'Radio';
   if (/drive[- ]?by|drove by|walk[- ]?by/.test(l)) return 'Drive By';
