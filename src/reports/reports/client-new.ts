@@ -112,7 +112,7 @@ export function parseClientNewCsv(buffer: Buffer): ClientNewRow[] {
 // obvious spelling/format variants into them. Everything else someone typed by
 // hand — names, jokes, one-off phrases — goes to a single write-in catch-all,
 // kept distinct from the native "Other" pick. Order matters (first match wins).
-export const NATIVE_REFERRAL_OPTIONS = ['Google', 'Friend', 'Facebook', 'Radio', 'Drive By', 'Other'];
+export const NATIVE_REFERRAL_OPTIONS = ['Google', 'Friend', 'Facebook', 'Social Media', 'TV/Radio', 'Radio', 'Drive By', 'Other'];
 export const WRITE_IN_REFERRAL_SOURCE = 'Other (write-in)';
 
 export function normalizeReferralSource(raw: string | null | undefined): string {
@@ -122,6 +122,8 @@ export function normalizeReferralSource(raw: string | null | undefined): string 
   // Native options + their obvious variants/misspellings.
   if (/g[o0]{2,}gle|google/.test(l)) return 'Google';
   if (/facebook|face ?book|\bfb\b/.test(l)) return 'Facebook';
+  if (/social media|social|instagram|\big\b|tiktok|tik tok/.test(l)) return 'Social Media';
+  if (/tv\s*\/\s*radio|television|cable/.test(l)) return 'TV/Radio';
   if (/\bradio\b|wrif/.test(l)) return 'Radio';
   if (/drive[- ]?by|drove by|walk[- ]?by/.test(l)) return 'Drive By';
   if (l === 'friend' || l === 'friends' || l === 'a friend') return 'Friend';

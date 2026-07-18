@@ -43,6 +43,12 @@ describe('normalizeReferralSource', () => {
     expect(normalizeReferralSource('Google.')).toBe('Google');
     expect(normalizeReferralSource('Facebook')).toBe('Facebook');
     expect(normalizeReferralSource('Face book')).toBe('Facebook');
+    expect(normalizeReferralSource('Social Media')).toBe('Social Media');
+    expect(normalizeReferralSource('Instagram')).toBe('Social Media');
+    expect(normalizeReferralSource('Tik Tok')).toBe('Social Media');
+    expect(normalizeReferralSource('TV/Radio')).toBe('TV/Radio');
+    expect(normalizeReferralSource('tv / radio')).toBe('TV/Radio');
+    expect(normalizeReferralSource('Cable')).toBe('TV/Radio');
     expect(normalizeReferralSource('Friend')).toBe('Friend');
     expect(normalizeReferralSource('friend')).toBe('Friend');
     expect(normalizeReferralSource('Radio ad')).toBe('Radio');
