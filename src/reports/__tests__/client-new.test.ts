@@ -47,6 +47,9 @@ describe('normalizeReferralSource', () => {
     expect(normalizeReferralSource('friend')).toBe('Friend');
     expect(normalizeReferralSource('Radio ad')).toBe('Radio');
     expect(normalizeReferralSource('101 WRIF')).toBe('Radio');
+    expect(normalizeReferralSource('Drive By')).toBe('Drive By');
+    expect(normalizeReferralSource('drive-by')).toBe('Drive By');
+    expect(normalizeReferralSource('Drove by')).toBe('Drive By');
     expect(normalizeReferralSource('Other')).toBe('Other');
   });
   it('routes typed-in free text to the write-in catch-all (not a native option)', () => {
