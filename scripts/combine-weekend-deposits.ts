@@ -30,15 +30,11 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { sendGmail } from '../src/mail/google-mailer';
+import { resolveGroupConfig, type DisbursementGroupConfig } from '../src/disbursements/group-config';
 
 const NEW_YORK_TZ = 'America/New_York';
 const DEFAULT_OUTPUT_DIR = path.join(homedir(), 'hmx-reports');
 const DEFAULT_ACCOUNT = 'govna.assistant@gmail.com';
-const DEFAULT_RECIPIENT = 'Miranda.hmx.corp@hairmx.net';
-// Additional recipients CC'd on the combined weekend disbursements email
-// so the corporate inbox has visibility alongside Miranda. Skipped when
-// --test-recipient redirects the run (test sends stay isolated).
-const ADDITIONAL_RECIPIENTS: readonly string[] = ['info@hairmx.com'];
 // Where missing-file / send-failure alerts go — RJ's personal Gmail, kept
 // independent of the corporate inbox the combined file is destined for.
 const FAILURE_ALERT_TO = 'rjdjohnston@gmail.com';
@@ -50,6 +46,7 @@ type Args = {
   testRecipient: string | null;
   dryRun: boolean;
   skipEmail: boolean;
+  group: DisbursementGroupConfig;
 };
 
 function parseArgs(argv: string[]): Args {
@@ -69,6 +66,7 @@ function parseArgs(argv: string[]): Args {
     testRecipient: map.get('test-recipient') || null,
     dryRun: (map.get('dry-run') ?? 'false') !== 'false',
     skipEmail: (map.get('skip-email') ?? 'false') !== 'false',
+    group: resolveGroupConfig(map.get('group')),
   };
 }
 
@@ -166,15 +164,15 @@ async function main() {
     console.error(`[warn] --sunday=${sunday} is a ${weekdayName(sunday)}, not a Sunday. Combining ${saturday} (${weekdayName(saturday)}) + ${sunday} (${weekdayName(sunday)}) anyway.`);
   }
 
-  const satPath = path.join(args.outputDir, `disbursements-${saturday}.csv`);
-  const sunPath = path.join(args.outputDir, `disbursements-${sunday}.csv`);
-  const combinedPath = path.join(args.outputDir, `disbursements-weekend-${saturday}-to-${sunday}.csv`);
+  const satPath = path.join(args.outputDir, `${args.group.filePrefix}disbursements-${saturday}.csv`);
+  const sunPath = path.join(args.outputDir, `${args.group.filePrefix}disbursements-${sunday}.csv`);
+  const combinedPath = path.join(args.outputDir, `${args.group.filePrefix}disbursements-weekend-${saturday}-to-${sunday}.csv`);
 
   const missing = [satPath, sunPath].filter((p) => !existsSync(p));
   if (missing.length) {
     const msg = `Weekend disbursements combine for ${saturday} + ${sunday} could not run — missing input file(s):\n${missing.join('\n')}\n\nThe nightly export likely didn't produce one of the days. Check the nightly export / watchdog, then re-run manually:\n  cd ~/kitchen-plugin-yot && npx tsx scripts/combine-weekend-deposits.ts --sunday=${sunday}`;
     console.error(msg);
-    if (!args.dryRun && !args.skipEmail) await sendFailureAlert(args.account, `[HMX] Weekend deposit combine FAILED for ${saturday}+${sunday} — missing file`, msg);
+    if (!args.dryRun && !args.skipEmail) await sendFailureAlert(args.account, `[${args.group.emailSubjectPrefix}] Weekend deposit combine FAILED for ${saturday}+${sunday} — missing file`, msg);
     process.exit(1);
   }
 
@@ -184,7 +182,7 @@ async function main() {
   if (header !== (sunLines[0] ?? '')) {
     const msg = `Weekend disbursements combine aborted — the two files have different headers, so stacking them would misalign columns.\n  ${saturday}: ${satLines[0]}\n  ${sunday}: ${sunLines[0]}`;
     console.error(msg);
-    if (!args.dryRun && !args.skipEmail) await sendFailureAlert(args.account, `[HMX] Weekend deposit combine FAILED for ${saturday}+${sunday} — header mismatch`, msg);
+    if (!args.dryRun && !args.skipEmail) await sendFailureAlert(args.account, `[${args.group.emailSubjectPrefix}] Weekend deposit combine FAILED for ${saturday}+${sunday} — header mismatch`, msg);
     process.exit(1);
   }
 
@@ -248,11 +246,11 @@ async function main() {
   const total = [...satRows, ...sunRows].reduce((s, r) => s + parseAmount(r.fields[AMOUNT]), 0);
   const totalStr = total.toFixed(2);
 
-  const recipient = args.testRecipient || DEFAULT_RECIPIENT;
+  const recipient = args.testRecipient || args.group.emailTo;
   const sendTo: string | string[] = args.testRecipient
     ? recipient
-    : [recipient, ...ADDITIONAL_RECIPIENTS];
-  const subject = `HMX Disbursements WEEKEND ${saturday} + ${sunday} — ${outRows.length} deposits, $${totalStr}`;
+    : [recipient, ...args.group.emailCc];
+  const subject = `${args.group.emailSubjectPrefix} Disbursements WEEKEND ${saturday} + ${sunday} — ${outRows.length} deposits, $${totalStr}`;
   const mergedNote = mergedStylistCount
     ? `${mergedStylistCount} stylist${mergedStylistCount > 1 ? 's' : ''} who worked both days were merged into a single summed row each.`
     : 'No stylist worked both days, so nothing needed merging.';
@@ -282,7 +280,7 @@ ${mergedNote} A stylist who worked two DIFFERENT locations over the weekend keep
       emailStatus = 'failed';
       const errMsg = err?.message || String(err);
       console.error(`weekend combine email to ${recipient} failed: ${errMsg}`);
-      await sendFailureAlert(args.account, `[HMX] Weekend deposit combine email to ${recipient} FAILED for ${saturday}+${sunday}`,
+      await sendFailureAlert(args.account, `[${args.group.emailSubjectPrefix}] Weekend deposit combine email to ${recipient} FAILED for ${saturday}+${sunday}`,
         `The combined weekend disbursements email failed to deliver to ${recipient}.\nError: ${errMsg}\nThe file is on disk at ${combinedPath} — send it manually.`);
     }
   }
