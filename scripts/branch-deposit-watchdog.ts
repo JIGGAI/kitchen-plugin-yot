@@ -2,32 +2,38 @@
 //
 // Runs at 22:00 ET via ~/Library/LaunchAgents/com.hairmx.branch-deposit-
 // watchdog.plist (1h after the export cron). Reads
-// /Users/hairmx/hmx-reports/branch-deposits-<date>.{csv,diagnostics.json}
+// /Users/hairmx/hmx-reports/<prefix>branch-deposits-<date>.{csv,diagnostics.json}
+// for the selected --group (default corp; see src/disbursements/group-config.ts)
 // and emails rjdjohnston@gmail.com from govna.assistant@gmail.com when
-// any of three conditions trip:
+// any of these conditions trip:
 //
 //   1. CSV file missing for the target date
 //        → likely silent export failure (gog auth, kitchen API, etc.)
-//   2. CSV MASTER spelling drift vs YOT (`fuzzyMatchedRows` with
+//   2. Roster tab spelling drift vs YOT (`fuzzyMatchedRows` with
 //        matchKind = "typo")
 //        → staff got paid via Damerau-Levenshtein rescue; fix the
-//        master spelling so it's not a recurring typo alert
-//   3. YOT paid someone whose location IS represented on CSV MASTER but
-//        whose name isn't there at all (`reportRowsWithPositiveAmountBut
-//        NoBranchMatch` with `inScope: true`)
+//        roster spelling so it's not a recurring typo alert
+//   3. YOT paid someone whose location IS represented on the group's
+//        roster tab but whose name isn't there at all
+//        (`reportRowsWithPositiveAmountButNoBranchMatch` with `inScope: true`)
 //        → likely a new hire at a Branch-served shop. RJ pays them
-//        manually for today and adds them to CSV MASTER so tomorrow's
+//        manually for today and adds them to the roster tab so tomorrow's
 //        export covers them. (We deliberately do NOT auto-append a
 //        placeholder — a blank STAFF ID row would escape into the next
 //        day's CSV upload to Branch as a degenerate deposit.)
+//   4. Cross-roster collisions were found, or the collision check itself
+//        could not run — both are double-payment risks (Task 5's
+//        crossGroupCollisions / crossGroupCollisionCheckStatus).
 //
-// YOT-paid staff at locations NOT represented in CSV MASTER (Bethel
-// Park, Clearwater, etc.) are intentionally ignored — those locations
-// are paid through some other payroll path.
+// YOT-paid staff at locations NOT represented on the group's roster tab
+// (Bethel Park, Clearwater, etc.) are intentionally ignored — those
+// locations are paid through some other payroll path.
 
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, appendFileSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
+import { resolveGroupConfig, type DisbursementGroupConfig } from '../src/disbursements/group-config';
+import type { RosterCollision } from '../src/disbursements/roster-collisions';
 
 const NEW_YORK_TZ = 'America/New_York';
 const EXPORT_DIR = '/Users/hairmx/hmx-reports';
@@ -38,6 +44,7 @@ const LOG_PATH = `${process.env.HOME || ''}/.openclaw/logs/cron/branch-deposit-w
 type Args = {
   targetDate: string;
   dryRun: boolean;
+  group: DisbursementGroupConfig;
 };
 
 function parseArgs(argv: string[]): Args {
@@ -51,6 +58,7 @@ function parseArgs(argv: string[]): Args {
   return {
     targetDate: map.get('target-date') || todayInNyTz(),
     dryRun: (map.get('dry-run') ?? 'false') !== 'false',
+    group: resolveGroupConfig(map.get('group')),
   };
 }
 
@@ -110,11 +118,19 @@ type Diag = {
   date: string;
   source?: string;
   sourceLabel?: string;
+  groupId?: string;
   exportRowCount: number;
   masterRowCount?: number;
   reportRowsWithPositiveAmountButNoBranchMatch?: UnmatchedReportRow[];
   fuzzyMatchedRows?: FuzzyMatchedRow[];
   loansPaidOffToday?: LoanPaidOff[];
+  // Cross-group roster safety (Task 5). `crossGroupCollisionCheckStatus`
+  // is 'failed' when the other group's roster couldn't be read this run —
+  // in that case collisions were NOT excluded from the CSV, so the
+  // watchdog must say double-payment protection wasn't verified rather
+  // than silently reporting zero collisions.
+  crossGroupCollisions?: RosterCollision[];
+  crossGroupCollisionCheckStatus?: 'ok' | 'failed';
   // Delivery outcome (export script >= 2026-06-08). Undefined on legacy
   // diagnostics files written before the field existed.
   dryRun?: boolean;
@@ -125,10 +141,10 @@ type Diag = {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  log(`watchdog start target=${args.targetDate} dryRun=${args.dryRun}`);
+  log(`watchdog start target=${args.targetDate} dryRun=${args.dryRun} group=${args.group.id}`);
 
-  const csvPath = path.join(EXPORT_DIR, `branch-deposits-${args.targetDate}.csv`);
-  const diagPath = path.join(EXPORT_DIR, `branch-deposits-${args.targetDate}.diagnostics.json`);
+  const csvPath = path.join(EXPORT_DIR, `${args.group.filePrefix}branch-deposits-${args.targetDate}.csv`);
+  const diagPath = path.join(EXPORT_DIR, `${args.group.filePrefix}branch-deposits-${args.targetDate}.diagnostics.json`);
 
   if (!existsSync(csvPath)) {
     log(`MISSING ${csvPath}`);
@@ -202,14 +218,14 @@ Watchdog log: ${LOG_PATH}`,
 
   if (typoRows.length) {
     summaryBits.push(`${typoRows.length} typo${typoRows.length > 1 ? 's' : ''}`);
-    const lines = typoRows.map((r) => `- CSV MASTER row ${r.csvMasterRowNumber} has "${r.csvMasterName}"; YOT has "${r.reportName}" (${r.locationName || '?'}). The export paid them via fuzzy match. Please fix the spelling on CSV MASTER.`);
-    sections.push(`CSV MASTER spelling drift vs YOT:\n${lines.join('\n')}`);
+    const lines = typoRows.map((r) => `- ${args.group.rosterTab} row ${r.csvMasterRowNumber} has "${r.csvMasterName}"; YOT has "${r.reportName}" (${r.locationName || '?'}). The export paid them via fuzzy match. Please fix the spelling on ${args.group.rosterTab}.`);
+    sections.push(`${args.group.rosterTab} spelling drift vs YOT:\n${lines.join('\n')}`);
   }
 
   if (inScopeUnmatched.length) {
     summaryBits.push(`${inScopeUnmatched.length} need manual payout`);
-    const lines = inScopeUnmatched.map((r) => `- ${r.staffName || '?'} @ ${r.locationName || '?'} earned $${r.bankToBankAmount} today (YOT bank-to-bank). They aren't on CSV MASTER, so they were not in tonight's deposit CSV. Action: pay them manually for today's amount, then add them to CSV MASTER (with their Branch STAFF ID) so tomorrow's export covers them.`);
-    sections.push(`Missing from CSV MASTER (manual payout for today):\n${lines.join('\n')}`);
+    const lines = inScopeUnmatched.map((r) => `- ${r.staffName || '?'} @ ${r.locationName || '?'} earned $${r.bankToBankAmount} today (YOT bank-to-bank). They aren't on ${args.group.rosterTab}, so they were not in tonight's deposit CSV. Action: pay them manually for today's amount, then add them to ${args.group.rosterTab} (with their Branch STAFF ID) so tomorrow's export covers them.`);
+    sections.push(`Missing from ${args.group.rosterTab} (manual payout for today):\n${lines.join('\n')}`);
   }
 
   if (loansPaidOff.length) {
@@ -218,12 +234,24 @@ Watchdog log: ${LOG_PATH}`,
     sections.push(`Loans paid off today:\n${lines.join('\n')}`);
   }
 
+  const collisions = diag.crossGroupCollisions || [];
+  if (collisions.length) {
+    const lines = collisions.map((c) => `- ${c.detail}`);
+    sections.push(`Cross-roster collisions — these stylists were EXCLUDED from tonight's CSV to avoid double payment. Resolve by removing them from the wrong roster tab, then pay today manually if owed:\n${lines.join('\n')}`);
+    summaryBits.push(`${collisions.length} roster collision${collisions.length === 1 ? '' : 's'}`);
+  }
+
+  if (diag.crossGroupCollisionCheckStatus === 'failed') {
+    summaryBits.push('collision check failed');
+    sections.push(`Cross-roster collision check FAILED for ${args.targetDate} — the other group's roster could not be read tonight, so double-payment protection was NOT verified for this ${args.group.label} run. Manually confirm no stylist appears on more than one group's roster tab before treating tonight's CSV as final.`);
+  }
+
   if (!sections.length) {
     log(`watchdog ok target=${args.targetDate}`);
     return;
   }
 
-  const subject = `[HMX] Branch deposit watchdog ${args.targetDate} — ${summaryBits.join('; ')}`;
+  const subject = `[${args.group.emailSubjectPrefix}] Branch deposit watchdog ${args.targetDate} — ${summaryBits.join('; ')}`;
   const body = `Watchdog ran for ${args.targetDate}. Export wrote ${diag.exportRowCount} deposit rows.${outOfScopeCount > 0 ? ` (${outOfScopeCount} YOT-paid staff at out-of-scope locations skipped silently.)` : ''}
 
 ${sections.join('\n\n')}
