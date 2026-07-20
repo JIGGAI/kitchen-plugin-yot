@@ -9,20 +9,24 @@
 //
 // Source of truth shape (post-cutover 2026-05-14):
 //   - YOT StaffCashoutReport for the target date → who got paid, how much
-//   - "CSV MASTER" tab on the Branch Daily Totals sheet → roster of staff
-//     known to Branch (staffId, first, last, location)
+//   - the group's roster tab on the Branch Daily Totals sheet → roster of
+//     staff known to Branch (staffId, first, last, location). Which tab is
+//     selected by --group (default corp → "CORP CSV MASTER"); see
+//     src/disbursements/group-config.ts.
 //
 // We iterate YOT positives and look each up in CSV MASTER. A match emits
 // an export row with the YOT bank-to-bank amount minus any garnishment;
 // the transaction id is rebuilt in the format Branch has been receiving
 // (<LastName><StaffId><AmountInteger><M/D/YYYY><Location>). When YOT pays
-// someone
-// who isn't on CSV MASTER, the watchdog appends a placeholder row to the
-// sheet and emails RJ.
+// someone who isn't on CSV MASTER, the watchdog only emails RJ about it —
+// it makes no Google Sheets writes; an operator adds the missing staff to
+// the roster tab by hand.
 //
 // Per-day tabs: the BRANCH MASTER daily tab (Branch Daily Totals sheet) and
 // a CSV mirror tab (Branch DISPURSEMENTS sheet) are both recreated per run,
-// named M/D/YY.
+// named M/D/YY. The mirror tab carries the group's dispursementsTabPrefix
+// (empty for corp) so groups that keep both on ONE spreadsheet don't have
+// the second write delete the first write's tab.
 
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -31,11 +35,17 @@ import { runStaffCashoutReport } from '../src/reports/run-staff-cashout';
 import type { StaffCashoutRow } from '../src/reports/reports/staff-cashout';
 import * as sheetsApi from '../src/sheets/google-sheets';
 import { sendGmail } from '../src/mail/google-mailer';
+import { normalizeLocation, normalizeText } from '../src/disbursements/normalize';
+import { otherGroupConfigs, resolveGroupConfig, type DisbursementGroupConfig } from '../src/disbursements/group-config';
+import { findRosterCollisions, type RosterCollision, type RosterEntry } from '../src/disbursements/roster-collisions';
 
 type Args = {
   date: string;
   teamId: string;
   organisationId: number;
+  /** Which distribution group this run serves. Selects roster tab,
+   *  spreadsheets, recipients, filenames, and garnishment/loan flags. */
+  group: DisbursementGroupConfig;
   sheetId: string;
   garnishmentsSheetId: string;
   account: string;
@@ -159,6 +169,11 @@ type MatchDiagnostics = {
   date: string;
   source: 'csv-master';
   sourceLabel: string;
+  groupId: string;
+  crossGroupCollisions: RosterCollision[];
+  /** 'failed' means the other group's roster could not be read this run, so
+   *  the collision list is empty by degradation, not by absence of overlap. */
+  crossGroupCollisionCheckStatus: 'ok' | 'failed';
   generatedAt: string;
   reportRowCount: number;
   masterRowCount: number;
@@ -201,34 +216,18 @@ type MatchDiagnostics = {
   dispursementsTabStatus: 'written' | 'failed' | 'skipped-dry-run';
 };
 
-const DEFAULT_SHEET_ID = '1jIFWOMmvMVbGULUbDpEqV2e6CsXy_DzhBrCorV9H-EA';
 const DEFAULT_GARNISHMENTS_SHEET_ID = '1pvwN3h0X9ZsdhpH024zue9DlE4NaZiuzTia5NMoEn6c';
 const DEFAULT_ACCOUNT = 'govna.assistant@gmail.com';
 const DEFAULT_TEAM_ID = 'hmx-marketing-team';
 const DEFAULT_ORGANISATION_ID = 11082;
 const DEFAULT_OUTPUT_DIR = '/Users/hairmx/hmx-reports';
 const NEW_YORK_TZ = 'America/New_York';
-const CSV_MASTER_TAB = 'CSV MASTER';
-// Template tab on the Branch Daily Totals sheet. Holds two side-by-side
+// Template tab on each group's daily-totals sheet. Holds two side-by-side
 // tables (BRANCH at cols A-C, YOT at cols E-G) keyed by location name in
-// rows 4-18 plus a TOTAL row at 21. We read it once per run to learn the
-// location list + TOTAL formula shape, then write a fresh per-day copy.
+// the group's location rows plus a TOTAL row. We read it once per run to
+// learn the location list + TOTAL formula shape, then write a fresh per-day
+// copy. The row geometry lives in the group config (branchMaster*Row).
 const BRANCH_MASTER_TAB = 'BRANCH MASTER';
-const BRANCH_MASTER_FIRST_LOCATION_ROW = 4;
-const BRANCH_MASTER_LAST_LOCATION_ROW = 18;
-const BRANCH_MASTER_TOTAL_ROW = 21;
-// The Branch DISPURSEMENTS sheet — separate spreadsheet from the Branch
-// Daily Totals one. CSV BLANK MASTER tab carries the column layout for
-// Miranda's Branch processing; we only use its header for shape (the tab
-// has no data rows). Trailing space in the tab name is intentional — that's
-// how it's named on the sheet.
-const DISPURSEMENTS_SHEET_ID = '1Z9Ey0oaKAH1J4gy0JlL-m3HjLvy4PKbBYFno3dYjbH8';
-const DISPURSEMENTS_TEMPLATE_TAB = 'CSV BLANK MASTER ';
-const DEFAULT_DISPURSEMENTS_RECIPIENT = 'Miranda.hmx.corp@hairmx.net';
-// Additional recipients CC'd on the nightly disbursements email so the
-// corporate inbox has visibility alongside Miranda. Skipped when
-// --test-recipient redirects the run (test sends stay isolated).
-const ADDITIONAL_DISPURSEMENTS_RECIPIENTS: readonly string[] = ['info@hairmx.com'];
 // When the disbursements email to Miranda (or whoever the recipient is set
 // to) fails, we send a fallback alert to this address so the failure
 // doesn't sit silently in stdout. RJ's personal Gmail keeps the alert
@@ -252,11 +251,21 @@ function parseArgs(argv: string[]): Args {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error(`Invalid --date value: ${date}`);
   if (!Number.isFinite(organisationId)) throw new Error(`Invalid organisationId: ${map.get('organisationId') || map.get('org')}`);
 
+  const group = resolveGroupConfig(map.get('group'));
+
   return {
     date,
     teamId: map.get('teamId') || DEFAULT_TEAM_ID,
     organisationId,
-    sheetId: map.get('sheetId') || DEFAULT_SHEET_ID,
+    group,
+    // The spreadsheet holding BRANCH MASTER + the per-day BRANCH MASTER tabs.
+    // Defaults to the group's daily-totals sheet (for corp that is the same
+    // id this flag has always defaulted to); --sheetId still overrides.
+    // NOTE: --sheetId no longer redirects the roster read. The roster always
+    // comes from args.group.rosterSheetId / rosterTab, so pointing --sheetId
+    // at a scratch copy redirects only the BRANCH MASTER template read and
+    // the per-day tab writes — the roster is still read from the live sheet.
+    sheetId: map.get('sheetId') || group.dailyTotalsSheetId,
     garnishmentsSheetId: map.get('garnishmentsSheetId') || DEFAULT_GARNISHMENTS_SHEET_ID,
     account: map.get('account') || DEFAULT_ACCOUNT,
     outputDir: expandHome(map.get('outputDir') || DEFAULT_OUTPUT_DIR),
@@ -281,25 +290,6 @@ function todayIsoInTimezone(timeZone: string): string {
   }).formatToParts(new Date());
   const byType = Object.fromEntries(parts.map((part) => [part.type, part.value]));
   return `${byType.year}-${byType.month}-${byType.day}`;
-}
-
-function normalizeText(value: string | null | undefined): string {
-  return String(value || '')
-    .normalize('NFKD')
-    .replace(/[’']/g, '')
-    .replace(/[^a-zA-Z0-9\s-]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .toLowerCase();
-}
-
-function normalizeLocation(value: string | null | undefined): string {
-  return normalizeText(value)
-    .replace(/\bmi\b|\boh\b|\bpa\b|\bwv\b|\bfl\b/g, '')
-    .replace(/\btownship\b|\btwp\b/g, '')
-    .replace(/\bstylist\b/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
 }
 
 function splitName(fullName: string): { first: string; last: string } {
@@ -422,17 +412,23 @@ function buildWatchdogEmailSection(args: {
   typoRows: FuzzyMatchedRow[];
   inScopeUnmatched: UnmatchedReportRow[];
   loansPaidOff: LoanPaidOff[];
+  // The running group's roster tab. Named explicitly in the prose so an
+  // hmx-group run never tells the operator to add a stylist to CORP's
+  // roster — doing so would create a cross-roster collision and get that
+  // stylist excluded from BOTH groups' payouts.
+  rosterTab: string;
 }): string {
   const sections: string[] = [];
+  const roster = args.rosterTab;
 
   if (args.typoRows.length) {
-    const lines = args.typoRows.map((r) => `- CSV MASTER row ${r.csvMasterRowNumber} has "${r.csvMasterName}"; YOT has "${r.reportName}" (${r.locationName || '?'}). The export paid them via fuzzy match. Please fix the spelling on CSV MASTER.`);
-    sections.push(`CSV MASTER spelling drift vs YOT:\n${lines.join('\n')}`);
+    const lines = args.typoRows.map((r) => `- ${roster} row ${r.csvMasterRowNumber} has "${r.csvMasterName}"; YOT has "${r.reportName}" (${r.locationName || '?'}). The export paid them via fuzzy match. Please fix the spelling on ${roster}.`);
+    sections.push(`${roster} spelling drift vs YOT:\n${lines.join('\n')}`);
   }
 
   if (args.inScopeUnmatched.length) {
-    const lines = args.inScopeUnmatched.map((r) => `- ${r.staffName || '?'} @ ${r.locationName || '?'} earned $${r.bankToBankAmount} today (YOT bank-to-bank). They aren't on CSV MASTER, so they were not in tonight's deposit CSV. Action: pay them manually for today's amount, then add them to CSV MASTER (with their Branch STAFF ID) so tomorrow's export covers them.`);
-    sections.push(`Missing from CSV MASTER (manual payout for today):\n${lines.join('\n')}`);
+    const lines = args.inScopeUnmatched.map((r) => `- ${r.staffName || '?'} @ ${r.locationName || '?'} earned $${r.bankToBankAmount} today (YOT bank-to-bank). They aren't on ${roster}, so they were not in tonight's deposit CSV. Action: pay them manually for today's amount, then add them to ${roster} (with their Branch STAFF ID) so tomorrow's export covers them.`);
+    sections.push(`Missing from ${roster} (manual payout for today):\n${lines.join('\n')}`);
   }
 
   if (args.loansPaidOff.length) {
@@ -465,12 +461,14 @@ async function sendDisbursementsFailureAlert(
   date: string,
   disbursementsPath: string,
   errorMessage: string,
+  emailSubjectPrefix: string,
+  groupId: string,
 ): Promise<boolean> {
   if (intendedRecipient === DISPURSEMENTS_FAILURE_ALERT_TO) {
     // Don't alert RJ that the email to RJ failed — they'll just see stdout.
     return false;
   }
-  const subject = `[HMX] Disbursements email to ${intendedRecipient} FAILED for ${date}`;
+  const subject = `[${emailSubjectPrefix}] Disbursements email to ${intendedRecipient} FAILED for ${date}`;
   const body = `The nightly disbursements email failed to deliver to ${intendedRecipient}.
 
 Date: ${date}
@@ -480,7 +478,7 @@ The CSV is still on disk:
   ${disbursementsPath}
 
 To re-run the whole export (idempotent on sheet writes):
-  cd ~/kitchen-plugin-yot && npx tsx scripts/export-branch-deposits.ts --date=${date}
+  cd ~/kitchen-plugin-yot && npx tsx scripts/export-branch-deposits.ts --date=${date}${groupId === 'corp' ? '' : ` --group=${groupId}`}
 `;
   try {
     await sendGmail({
@@ -541,12 +539,12 @@ function formatTransactionDate(dateIso: string): string {
   return `${Number(m[2])}/${Number(m[3])}/${m[1]}`;
 }
 
-async function loadCsvMasterRows(sheetId: string, _account: string): Promise<MasterRow[]> {
+async function loadCsvMasterRows(sheetId: string, tabName: string, _account: string): Promise<MasterRow[]> {
   // FORMATTED_VALUE preserves the cell's display string — critical for
   // staff IDs typed with leading zeros (e.g. "0731" for Miranda Bender)
   // which UNFORMATTED_VALUE would return as the number 731 and silently
   // drop the leading zero on the way into the export CSV.
-  const values = await sheetsApi.getValues(sheetId, `'${CSV_MASTER_TAB}'!A1:G500`);
+  const values = await sheetsApi.getValues(sheetId, `'${tabName}'!A1:G500`);
   const rows: MasterRow[] = [];
   for (let i = 1; i < values.length; i++) {
     const row = values[i] || [];
@@ -788,11 +786,11 @@ type BranchMasterTemplate = {
   headerLabels: { a: string; b: string; c: string; e: string; f: string; g: string };
 };
 
-async function loadBranchMasterTemplate(sheetId: string, _account: string): Promise<BranchMasterTemplate> {
-  const values = await sheetsApi.getValues(sheetId, `'${BRANCH_MASTER_TAB}'!A1:G${BRANCH_MASTER_TOTAL_ROW}`);
+async function loadBranchMasterTemplate(sheetId: string, cfg: DisbursementGroupConfig, _account: string): Promise<BranchMasterTemplate> {
+  const values = await sheetsApi.getValues(sheetId, `'${BRANCH_MASTER_TAB}'!A1:G${cfg.branchMasterTotalRow}`);
   const header = values[1] || [];
   const locationLabels: string[] = [];
-  for (let r = BRANCH_MASTER_FIRST_LOCATION_ROW - 1; r <= BRANCH_MASTER_LAST_LOCATION_ROW - 1; r++) {
+  for (let r = cfg.branchMasterFirstLocationRow - 1; r <= cfg.branchMasterLastLocationRow - 1; r++) {
     const label = String((values[r] || [])[0] || '');
     locationLabels.push(label);
   }
@@ -863,8 +861,9 @@ async function writeDailyTabContent(args: {
   template: BranchMasterTemplate;
   resolved: ResolvedLocationRow[];
   date: string;
+  cfg: DisbursementGroupConfig;
 }): Promise<void> {
-  const { spreadsheetId, tabName, template, resolved, date } = args;
+  const { spreadsheetId, tabName, template, resolved, date, cfg } = args;
   const labelWithDate = `LOCATION ${formatDailyTabName(date)}`;
 
   // Build the full A1:G21 grid in one shot.
@@ -891,16 +890,17 @@ async function writeDailyTabContent(args: {
       row.yotNotes,
     ]);
   }
-  // Rows 19, 20: blank spacers (preserve template shape).
-  while (grid.length < BRANCH_MASTER_TOTAL_ROW - 1) {
+  // Blank spacer rows between the last location row and TOTAL (preserve
+  // template shape).
+  while (grid.length < cfg.branchMasterTotalRow - 1) {
     grid.push(['', '', '', '', '', '', '']);
   }
-  // Row 21: TOTAL row with SUM formulas matching the template.
-  const sumRangeBranch = `B${BRANCH_MASTER_FIRST_LOCATION_ROW}:B${BRANCH_MASTER_LAST_LOCATION_ROW}`;
-  const sumRangeYot = `F${BRANCH_MASTER_FIRST_LOCATION_ROW}:F${BRANCH_MASTER_LAST_LOCATION_ROW}`;
+  // TOTAL row with SUM formulas matching the template.
+  const sumRangeBranch = `B${cfg.branchMasterFirstLocationRow}:B${cfg.branchMasterLastLocationRow}`;
+  const sumRangeYot = `F${cfg.branchMasterFirstLocationRow}:F${cfg.branchMasterLastLocationRow}`;
   grid.push(['', 'TOTAL', `=SUM(${sumRangeBranch})`, '', '', 'TOTAL', `=SUM(${sumRangeYot})`]);
 
-  await sheetsApi.updateValues(spreadsheetId, `'${tabName}'!A1:G${BRANCH_MASTER_TOTAL_ROW}`, grid, 'USER_ENTERED');
+  await sheetsApi.updateValues(spreadsheetId, `'${tabName}'!A1:G${cfg.branchMasterTotalRow}`, grid, 'USER_ENTERED');
 }
 
 // Mirrors the disbursements CSV onto a per-day tab ("M/D/YY") on the Branch
@@ -911,11 +911,14 @@ async function writeDailyTabContent(args: {
 // leading-zero staff ids (e.g. "0731") as text instead of letting Sheets
 // coerce them to numbers and drop the zero.
 async function writeDispursementsDailyTab(args: {
+  spreadsheetId: string;
+  templateTab: string;
   account: string;
   tabName: string;
   rows: ExportRow[];
   date: string;
 }): Promise<void> {
+  const { spreadsheetId, templateTab } = args;
   const disbursementDate = nextDayIso(args.date);
   const values: (string | number)[][] = [
     ['ID', 'First Name', 'Last Name', 'Type', 'Amount', 'Transaction ID', 'Location', 'Disbursement Date (YYYY-MM-DD)', 'Description'],
@@ -931,19 +934,19 @@ async function writeDispursementsDailyTab(args: {
       '',
     ]),
   ];
-  await deleteTabIfExists(DISPURSEMENTS_SHEET_ID, args.account, args.tabName);
-  await addTab(DISPURSEMENTS_SHEET_ID, args.account, args.tabName);
-  await sheetsApi.updateValues(DISPURSEMENTS_SHEET_ID, `'${args.tabName}'!A1:I${values.length}`, values, 'RAW');
+  await deleteTabIfExists(spreadsheetId, args.account, args.tabName);
+  await addTab(spreadsheetId, args.account, args.tabName);
+  await sheetsApi.updateValues(spreadsheetId, `'${args.tabName}'!A1:I${values.length}`, values, 'RAW');
   // Position right of the CSV BLANK MASTER template (newest day first),
   // matching where the operator kept the hand-made daily tabs. Best-effort —
   // the tab already has correct content if the move fails.
   try {
-    const tabs = await sheetsApi.listTabs(DISPURSEMENTS_SHEET_ID);
+    const tabs = await sheetsApi.listTabs(spreadsheetId);
     const newTab = tabs.find((t) => t.title === args.tabName);
-    const template = tabs.find((t) => t.title === DISPURSEMENTS_TEMPLATE_TAB);
+    const template = tabs.find((t) => t.title === templateTab);
     if (newTab && template) {
       await moveTabToIndex({
-        spreadsheetId: DISPURSEMENTS_SHEET_ID,
+        spreadsheetId,
         account: args.account,
         sheetId: newTab.sheetId,
         newIndex: template.index + 1,
@@ -964,10 +967,16 @@ async function main() {
     endDateIso: args.date,
     organisationId: args.organisationId,
   });
-  const masterRows = await loadCsvMasterRows(args.sheetId, args.account);
-  const garnishmentRules = await loadGarnishmentRules(args.garnishmentsSheetId, args.account);
-  const activeLoans = await loadActiveLoans(args.garnishmentsSheetId, args.account);
-  const existingLoanPayments = await loadExistingLoanPayments(args.garnishmentsSheetId, args.account);
+  const masterRows = await loadCsvMasterRows(args.group.rosterSheetId, args.group.rosterTab, args.account);
+  const garnishmentRules = args.group.garnishmentsEnabled
+    ? await loadGarnishmentRules(args.garnishmentsSheetId, args.account)
+    : new Map<string, GarnishmentRule>();
+  const activeLoans = args.group.loansEnabled
+    ? await loadActiveLoans(args.garnishmentsSheetId, args.account)
+    : [];
+  const existingLoanPayments = args.group.loansEnabled
+    ? await loadExistingLoanPayments(args.garnishmentsSheetId, args.account)
+    : [];
   const masterIndexes = buildMasterIndexes(masterRows);
   // CSV MASTER is the authoritative list of which locations Branch handles
   // — staff at any other location are paid through some other system and
@@ -979,6 +988,36 @@ async function main() {
     const norm = normalizeLocation(row.location);
     if (norm) supportedLocations.add(norm);
   }
+
+  // Cross-roster safety: a stylist on two groups' rosters would be paid by
+  // both nightly runs. Exclude them here and surface them in diagnostics +
+  // the watchdog email so a human resolves the ambiguity. Never abort — that
+  // would stop payroll for everyone correctly rostered.
+  const ownRoster: RosterEntry[] = masterRows.map((r) => ({
+    staffId: r.staffId, firstName: r.firstName, lastName: r.lastName, location: r.location,
+  }));
+  const crossGroupCollisions: RosterCollision[] = [];
+  // Fail open. This read touches a tab THIS run does not otherwise depend on
+  // (the other group's roster); a rename, a permissions change, or a
+  // transient Sheets error must not stop payroll for everyone on our own
+  // roster. On failure we proceed with no collisions and record the degraded
+  // state in diagnostics so the watchdog/operator can see the check was skipped.
+  let crossGroupCollisionCheckStatus: 'ok' | 'failed' = 'ok';
+  try {
+    for (const other of otherGroupConfigs(args.group.id)) {
+      const otherRows = await loadCsvMasterRows(other.rosterSheetId, other.rosterTab, args.account);
+      crossGroupCollisions.push(...findRosterCollisions(ownRoster, otherRows.map((r) => ({
+        staffId: r.staffId, firstName: r.firstName, lastName: r.lastName, location: r.location,
+      }))));
+    }
+  } catch (err: any) {
+    crossGroupCollisionCheckStatus = 'failed';
+    crossGroupCollisions.length = 0;
+    console.error(`[warn] cross-roster collision check failed: ${err?.message || err} — proceeding without it`);
+  }
+  const collidingStaffIds = new Set(crossGroupCollisions.filter((c) => c.kind === 'staff-id').map((c) => c.value));
+  const collidingLocations = new Set(crossGroupCollisions.filter((c) => c.kind === 'location').map((c) => c.value));
+  for (const c of crossGroupCollisions) console.error(`[collision] ${c.detail}`);
 
   // Idempotency: if a LOAN PAYMENTS row already exists for (staffId, args.date)
   // from a previous run of this date, roll that withholding back out of the
@@ -1063,6 +1102,20 @@ async function main() {
       }
       continue;
     }
+
+    // Cross-roster exclusion. Placed here — as soon as the stylist is
+    // identified — rather than just before exportRows.push, so a colliding
+    // stylist produces NO side effects at all: no loan withholding recorded
+    // against their LOANS row, no LOAN PAYMENTS row, no garnishment payout
+    // row. Skipping later would deduct from a deposit that never gets paid.
+    // Consequence of skipping this early: a colliding stylist with a negative
+    // bank-to-bank amount also loses their "FIRSTNAME OWES $X" YOT NOTES
+    // annotation on the BRANCH MASTER daily tab — accepted, since the
+    // collision itself is reported and needs manual handling anyway.
+    if (collidingStaffIds.has(String(match.row.staffId).trim()) || collidingLocations.has(normalizeLocation(match.row.location))) {
+      continue;
+    }
+
     if (match.kind !== 'exact') {
       fuzzyMatchedRows.push({
         csvMasterRowNumber: match.row.rowNumber,
@@ -1193,8 +1246,10 @@ async function main() {
 
   exportRows.sort((a, b) => a.location.localeCompare(b.location) || a.lastName.localeCompare(b.lastName) || a.firstName.localeCompare(b.firstName));
 
-  const existingGarnishmentPayoutRows = (await loadExistingGarnishmentPayoutRows(args.garnishmentsSheetId, args.account))
-    .filter((row) => row.date !== args.date);
+  const priorGarnishmentPayoutRows = args.group.garnishmentsEnabled
+    ? await loadExistingGarnishmentPayoutRows(args.garnishmentsSheetId, args.account)
+    : [];
+  const existingGarnishmentPayoutRows = priorGarnishmentPayoutRows.filter((row) => row.date !== args.date);
   const rewrittenGarnishmentPayoutRows = [...existingGarnishmentPayoutRows, ...garnishmentPayoutRows]
     .sort((a, b) => (a.date === b.date ? a.location.localeCompare(b.location) || a.lastName.localeCompare(b.lastName) : b.date.localeCompare(a.date)));
 
@@ -1215,10 +1270,14 @@ async function main() {
   if (args.dryRun) {
     console.error(`[dry-run] skipping sheet writes: GARNISHMENTS PAYOUTS=${rewrittenGarnishmentPayoutRows.length} rows, LOAN PAYMENTS=${rewrittenLoanPayments.length} rows, LOANS cell updates=${finalCellByRow.size}`);
   } else {
-    await rewriteGarnishmentPayoutSheet(args.garnishmentsSheetId, args.account, rewrittenGarnishmentPayoutRows);
-    await rewriteLoanPaymentsSheet(args.garnishmentsSheetId, args.account, rewrittenLoanPayments);
-    for (const [rowNumber, vals] of finalCellByRow) {
-      await updateLoanCellsForRow(args.garnishmentsSheetId, args.account, rowNumber, vals.totalPaid, vals.remainingBalance);
+    if (args.group.garnishmentsEnabled) {
+      await rewriteGarnishmentPayoutSheet(args.garnishmentsSheetId, args.account, rewrittenGarnishmentPayoutRows);
+    }
+    if (args.group.loansEnabled) {
+      await rewriteLoanPaymentsSheet(args.garnishmentsSheetId, args.account, rewrittenLoanPayments);
+      for (const [rowNumber, vals] of finalCellByRow) {
+        await updateLoanCellsForRow(args.garnishmentsSheetId, args.account, rowNumber, vals.totalPaid, vals.remainingBalance);
+      }
     }
   }
 
@@ -1232,7 +1291,7 @@ async function main() {
   //     contribute to BRANCH — they only show up as a YOT NOTES annotation.
   //   - BRANCH NOTES = per-loan annotations ("WH $X LOAN FIRSTNAME").
   //   - YOT NOTES = per-rebate annotations ("FIRSTNAME OWES $X").
-  const branchMasterTemplate = await loadBranchMasterTemplate(args.sheetId, args.account);
+  const branchMasterTemplate = await loadBranchMasterTemplate(args.sheetId, args.group, args.account);
   const branchMasterTabName = formatDailyTabName(args.date);
 
   type PerLocAgg = DailyTabLocationAggregate;
@@ -1369,6 +1428,7 @@ async function main() {
       template: branchMasterTemplate,
       resolved: branchMasterPerLocation,
       date: args.date,
+      cfg: args.group,
     });
     // Move the new tab to position `branchMasterIndex + 1` so the most
     // recent daily tab sits immediately to the right of BRANCH MASTER and
@@ -1393,9 +1453,9 @@ async function main() {
     }
   }
 
-  const csvPath = path.join(args.outputDir, `branch-deposits-${args.date}.csv`);
-  const diagnosticsPath = path.join(args.outputDir, `branch-deposits-${args.date}.diagnostics.json`);
-  const disbursementsPath = path.join(args.outputDir, `disbursements-${args.date}.csv`);
+  const csvPath = path.join(args.outputDir, `${args.group.filePrefix}branch-deposits-${args.date}.csv`);
+  const diagnosticsPath = path.join(args.outputDir, `${args.group.filePrefix}branch-deposits-${args.date}.diagnostics.json`);
+  const disbursementsPath = path.join(args.outputDir, `${args.group.filePrefix}disbursements-${args.date}.csv`);
 
   // Stylists whose net payout hits $0 after garnishment + loan withholding
   // are omitted from both CSVs — Branch shouldn't process a $0 deposit row.
@@ -1413,20 +1473,26 @@ async function main() {
   // — the CSV is already on disk — so log + report status instead of
   // throwing.
   let dispursementsTabStatus: 'written' | 'failed' | 'skipped-dry-run' = 'skipped-dry-run';
+  // Prefixed for groups whose CSV-mirror shares a spreadsheet with the
+  // BRANCH MASTER daily tabs — writing both under the same M/D/YY name would
+  // make the second write delete + recreate the first one's tab.
+  const dispursementsTabName = `${args.group.dispursementsTabPrefix}${branchMasterTabName}`;
   if (args.dryRun) {
-    console.error(`[dry-run] skipping Branch DISPURSEMENTS daily tab write: would delete + recreate '${branchMasterTabName}' on sheet ${DISPURSEMENTS_SHEET_ID} with ${depositRows.length} rows`);
+    console.error(`[dry-run] skipping Branch DISPURSEMENTS daily tab write: would delete + recreate '${dispursementsTabName}' on sheet ${args.group.dispursementsSheetId} with ${depositRows.length} rows`);
   } else {
     try {
       await writeDispursementsDailyTab({
+        spreadsheetId: args.group.dispursementsSheetId,
+        templateTab: args.group.dispursementsTemplateTab,
         account: args.account,
-        tabName: branchMasterTabName,
+        tabName: dispursementsTabName,
         rows: depositRows,
         date: args.date,
       });
       dispursementsTabStatus = 'written';
     } catch (err: any) {
       dispursementsTabStatus = 'failed';
-      console.error(`[warn] failed to write '${branchMasterTabName}' tab on Branch DISPURSEMENTS: ${err?.message || err}`);
+      console.error(`[warn] failed to write '${dispursementsTabName}' tab on Branch DISPURSEMENTS: ${err?.message || err}`);
     }
   }
   // NB: the diagnostics JSON is written AFTER the email step below, so it can
@@ -1441,16 +1507,15 @@ async function main() {
     typoRows,
     inScopeUnmatched: inScopeUnmatchedRows,
     loansPaidOff: loansPaidOffToday,
+    rosterTab: args.group.rosterTab,
   });
 
   // Email the disbursements CSV to Miranda (or wherever --test-recipient
   // redirects). Suppressed on dry-run or --skip-email. Failure is logged but
   // doesn't fail the whole export — the CSV is still on disk and the
   // watchdog can surface any issues.
-  const recipient = args.testRecipient || DEFAULT_DISPURSEMENTS_RECIPIENT;
-  const sendTo: string | string[] = args.testRecipient
-    ? recipient
-    : [recipient, ...ADDITIONAL_DISPURSEMENTS_RECIPIENTS];
+  const recipient = args.testRecipient || args.group.emailTo;
+  const sendTo: string | string[] = args.testRecipient ? recipient : [recipient, ...args.group.emailCc];
   const totalAmount = depositRows.reduce((s, r) => s + r.amount, 0);
   // Per-stylist note when deductions zeroed out a payout — Miranda should
   // know the stylist worked but was intentionally left off the CSV.
@@ -1465,7 +1530,15 @@ ${zeroNetRows.map((r) => {
     ].filter(Boolean).join(', ');
     return `- ${r.firstName} ${r.lastName} (${r.location}) — earned $${r.originalAmount.toFixed(2)}; ${parts || 'deductions consumed the full amount'}`;
   }).join('\n')}` : '';
-  const subject = `HMX Disbursements ${args.date} — ${depositRows.length} deposits, $${totalAmount.toFixed(2)}`;
+  // Cross-roster collisions silently remove stylists (or a whole location's
+  // stylists) from the CSV. Surface them here so the omission is visible in
+  // the same email that carries the file, not only in stderr + diagnostics.
+  const collisionEmailSection = crossGroupCollisions.length ? `
+
+Excluded — on more than one group's roster (not in this CSV):
+${crossGroupCollisions.map((c) => `- ${c.detail}`).join('\n')}
+These were excluded to prevent the same person being paid twice on the same night, once by each group's run. They need manual handling: remove the duplicate from whichever roster is wrong, and pay today's amount by hand if it is owed.` : '';
+  const subject = `${args.group.emailSubjectPrefix} Disbursements ${args.date} — ${depositRows.length} deposits, $${totalAmount.toFixed(2)}`;
   const body = `Disbursements file for ${args.date} is attached.
 
   Deposits: ${depositRows.length}
@@ -1473,9 +1546,10 @@ ${zeroNetRows.map((r) => {
   Garnishments applied: ${garnishmentPayoutRows.length}
   Loan withholdings: ${loanPaymentsThisRun.length}${loansPaidOffToday.length ? `
   Loans paid off today: ${loansPaidOffToday.length}` : ''}${zeroNetRows.length ? `
-  Omitted ($0 net after deductions): ${zeroNetRows.length}` : ''}${zeroNetEmailSection}
+  Omitted ($0 net after deductions): ${zeroNetRows.length}` : ''}${crossGroupCollisions.length ? `
+  Excluded (roster collision): ${crossGroupCollisions.length}` : ''}${zeroNetEmailSection}${collisionEmailSection}
 
-Sourced from CSV MASTER on the Branch Daily Totals sheet, with garnishment + loan deductions already applied. Auto-generated by the nightly Branch deposit export.${watchdogEmailSection}`;
+Sourced from ${args.group.rosterTab} on the Branch Daily Totals sheet${args.group.garnishmentsEnabled || args.group.loansEnabled ? ', with garnishment + loan deductions already applied' : ''}. Auto-generated by the nightly Branch deposit export.${watchdogEmailSection}`;
 
   let emailStatus: 'sent' | 'skipped' | 'failed' = 'skipped';
   let failureAlertStatus: 'sent' | 'skipped' | 'failed' | 'not-needed' = 'not-needed';
@@ -1490,7 +1564,7 @@ Sourced from CSV MASTER on the Branch Daily Totals sheet, with garnishment + loa
       emailStatus = 'failed';
       const errMsg = err?.message || String(err);
       console.error(`disbursements email to ${recipient} failed: ${errMsg}`);
-      const delivered = await sendDisbursementsFailureAlert(args.account, recipient, args.date, disbursementsPath, errMsg);
+      const delivered = await sendDisbursementsFailureAlert(args.account, recipient, args.date, disbursementsPath, errMsg, args.group.emailSubjectPrefix, args.group.id);
       failureAlertStatus = delivered ? 'sent' : (recipient === DISPURSEMENTS_FAILURE_ALERT_TO ? 'skipped' : 'failed');
     }
   }
@@ -1499,7 +1573,10 @@ Sourced from CSV MASTER on the Branch Daily Totals sheet, with garnishment + loa
   writeFileSync(diagnosticsPath, JSON.stringify({
     date: args.date,
     source: 'csv-master',
-    sourceLabel: CSV_MASTER_TAB,
+    sourceLabel: args.group.rosterTab,
+    groupId: args.group.id,
+    crossGroupCollisions,
+    crossGroupCollisionCheckStatus,
     generatedAt: new Date().toISOString(),
     reportRowCount: report.rows.length,
     masterRowCount: masterRows.length,
@@ -1529,7 +1606,10 @@ Sourced from CSV MASTER on the Branch Daily Totals sheet, with garnishment + loa
     ok: true,
     date: args.date,
     source: 'csv-master',
-    sourceLabel: CSV_MASTER_TAB,
+    sourceLabel: args.group.rosterTab,
+    groupId: args.group.id,
+    crossGroupCollisionCount: crossGroupCollisions.length,
+    crossGroupCollisionCheckStatus,
     csvPath,
     diagnosticsPath,
     disbursementsPath,
