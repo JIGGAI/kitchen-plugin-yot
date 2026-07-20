@@ -54,7 +54,7 @@ The two groups run as **separate nightly invocations**, so code is shared but ex
 | Daily-totals spreadsheet | existing Branch Daily Totals | new dedicated spreadsheet |
 | CSV mirror spreadsheet | existing Branch DISPURSEMENTS | same new spreadsheet |
 | Email To | `Miranda.hmx.corp@hairmx.net` | `Miranda.hmx.corp@hairmx.net` |
-| Email CC | `info@hairmx.com` | `rjdjohnston@gmail.com`, `deanna@hairmxgroup.com`, `linsey@hairmxgroup.com` |
+| Email CC | `info@hairmx.com` | `rjdjohnston@gmail.com` (`deanna@hairmxgroup.com`, `linsey@hairmxgroup.com` held back until the nightly file is verified) |
 | Branch upload file | `branch-deposits-<date>.csv` | `hmxgroup-branch-deposits-<date>.csv` |
 | Emailed file | `disbursements-<date>.csv` | `hmxgroup-disbursements-<date>.csv` |
 | Diagnostics | `branch-deposits-<date>.diagnostics.json` | `hmxgroup-branch-deposits-<date>.diagnostics.json` |
