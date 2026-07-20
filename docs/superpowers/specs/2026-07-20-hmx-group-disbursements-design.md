@@ -34,7 +34,7 @@ The export pulls the YOT StaffCashoutReport (org 11082), looks each paid stylist
 
 4. **Seven YOT locations are on neither roster** — Clearwater, Jacksonville, Mandarin, Palm Harbor (FL), Grand Blanc, Rochester (MI), Washington (PA). They are paid through another system and remain silently skipped, exactly as today.
 
-5. **`normalizeLocation` strips state suffixes** (`World of Golf FL.` → `world of golf`), so the GROUP roster's spellings already match YOT. This also means two same-named shops in different states would collide — not a problem today (verified no collisions), but a reason for the disjointness assertion below now that the system is multi-state by design.
+5. **`normalizeLocation` strips state suffixes** (`World of Golf FL.` → `world of golf`), so the GROUP roster's spellings already match YOT. This also means two same-named shops in different states would collide — not a problem today (verified no collisions), but a reason for the collision guard below now that the system is multi-state by design.
 
 ## Approach
 
