@@ -95,11 +95,10 @@ export const GROUP_CONFIGS: Record<DisbursementGroupId, DisbursementGroupConfig>
 
 export function resolveGroupConfig(id?: string | null): DisbursementGroupConfig {
   const key = (id || 'corp') as DisbursementGroupId;
-  const cfg = GROUP_CONFIGS[key];
-  if (!cfg) {
+  if (!Object.prototype.hasOwnProperty.call(GROUP_CONFIGS, key)) {
     throw new Error(`Unknown --group value: ${id} (expected one of ${Object.keys(GROUP_CONFIGS).join(', ')})`);
   }
-  return cfg;
+  return GROUP_CONFIGS[key];
 }
 
 export function otherGroupConfigs(id: DisbursementGroupId): DisbursementGroupConfig[] {

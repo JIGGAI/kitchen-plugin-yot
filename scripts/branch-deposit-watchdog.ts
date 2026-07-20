@@ -159,7 +159,7 @@ The export script likely failed silently. Common causes:
   - YOT Telerik report unreachable
 
 To re-run manually:
-  cd ~/kitchen-plugin-yot && npx tsx scripts/export-branch-deposits.ts --date=${args.targetDate}
+  cd ~/kitchen-plugin-yot && npx tsx scripts/export-branch-deposits.ts --date=${args.targetDate}${args.group.id === 'corp' ? '' : ` --group=${args.group.id}`}
 
 Watchdog log: ${LOG_PATH}`,
       args.dryRun,
@@ -203,7 +203,7 @@ Miranda was NOT emailed the deposit CSV and the live Google Sheets were NOT upda
   Recipient: ${diag.disbursementsRecipient || '(default)'}
 
 Re-run for real (emails Miranda + writes the live sheets):
-  export GOG_KEYRING_PASSWORD="$(cat ~/.openclaw/secrets/gog_keyring_password)" && cd ~/kitchen-plugin-yot && npx tsx scripts/export-branch-deposits.ts --date=${args.targetDate}
+  export GOG_KEYRING_PASSWORD="$(cat ~/.openclaw/secrets/gog_keyring_password)" && cd ~/kitchen-plugin-yot && npx tsx scripts/export-branch-deposits.ts --date=${args.targetDate}${args.group.id === 'corp' ? '' : ` --group=${args.group.id}`}
 
 Diagnostics: ${diagPath}
 Watchdog log: ${LOG_PATH}`,

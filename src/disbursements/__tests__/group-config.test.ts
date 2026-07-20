@@ -14,6 +14,10 @@ describe('resolveGroupConfig', () => {
   it('rejects an unknown group id', () => {
     expect(() => resolveGroupConfig('nope')).toThrow(/Unknown --group/);
   });
+
+  it('rejects an inherited Object.prototype member instead of resolving it', () => {
+    expect(() => resolveGroupConfig('constructor')).toThrow(/Unknown --group/);
+  });
 });
 
 describe('corp config preserves existing production behavior', () => {

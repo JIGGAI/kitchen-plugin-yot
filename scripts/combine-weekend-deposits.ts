@@ -172,7 +172,7 @@ async function main() {
 
   const missing = [satPath, sunPath].filter((p) => !existsSync(p));
   if (missing.length) {
-    const msg = `Weekend disbursements combine for ${saturday} + ${sunday} could not run — missing input file(s):\n${missing.join('\n')}\n\nThe nightly export likely didn't produce one of the days. Check the nightly export / watchdog, then re-run manually:\n  cd ~/kitchen-plugin-yot && npx tsx scripts/combine-weekend-deposits.ts --sunday=${sunday}`;
+    const msg = `Weekend disbursements combine for ${saturday} + ${sunday} could not run — missing input file(s):\n${missing.join('\n')}\n\nThe nightly export likely didn't produce one of the days. Check the nightly export / watchdog, then re-run manually:\n  cd ~/kitchen-plugin-yot && npx tsx scripts/combine-weekend-deposits.ts --sunday=${sunday}${args.group.id === 'corp' ? '' : ` --group=${args.group.id}`}`;
     console.error(msg);
     if (!args.dryRun && !args.skipEmail) await sendFailureAlert(args.account, `[${args.group.emailSubjectPrefix}] Weekend deposit combine FAILED for ${saturday}+${sunday} — missing file`, msg);
     process.exit(1);

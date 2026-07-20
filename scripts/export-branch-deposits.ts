@@ -18,9 +18,9 @@
 // an export row with the YOT bank-to-bank amount minus any garnishment;
 // the transaction id is rebuilt in the format Branch has been receiving
 // (<LastName><StaffId><AmountInteger><M/D/YYYY><Location>). When YOT pays
-// someone
-// who isn't on CSV MASTER, the watchdog appends a placeholder row to the
-// sheet and emails RJ.
+// someone who isn't on CSV MASTER, the watchdog only emails RJ about it —
+// it makes no Google Sheets writes; an operator adds the missing staff to
+// the roster tab by hand.
 //
 // Per-day tabs: the BRANCH MASTER daily tab (Branch Daily Totals sheet) and
 // a CSV mirror tab (Branch DISPURSEMENTS sheet) are both recreated per run,
@@ -462,6 +462,7 @@ async function sendDisbursementsFailureAlert(
   disbursementsPath: string,
   errorMessage: string,
   emailSubjectPrefix: string,
+  groupId: string,
 ): Promise<boolean> {
   if (intendedRecipient === DISPURSEMENTS_FAILURE_ALERT_TO) {
     // Don't alert RJ that the email to RJ failed — they'll just see stdout.
@@ -477,7 +478,7 @@ The CSV is still on disk:
   ${disbursementsPath}
 
 To re-run the whole export (idempotent on sheet writes):
-  cd ~/kitchen-plugin-yot && npx tsx scripts/export-branch-deposits.ts --date=${date}
+  cd ~/kitchen-plugin-yot && npx tsx scripts/export-branch-deposits.ts --date=${date}${groupId === 'corp' ? '' : ` --group=${groupId}`}
 `;
   try {
     await sendGmail({
@@ -1563,7 +1564,7 @@ Sourced from ${args.group.rosterTab} on the Branch Daily Totals sheet${args.grou
       emailStatus = 'failed';
       const errMsg = err?.message || String(err);
       console.error(`disbursements email to ${recipient} failed: ${errMsg}`);
-      const delivered = await sendDisbursementsFailureAlert(args.account, recipient, args.date, disbursementsPath, errMsg, args.group.emailSubjectPrefix);
+      const delivered = await sendDisbursementsFailureAlert(args.account, recipient, args.date, disbursementsPath, errMsg, args.group.emailSubjectPrefix, args.group.id);
       failureAlertStatus = delivered ? 'sent' : (recipient === DISPURSEMENTS_FAILURE_ALERT_TO ? 'skipped' : 'failed');
     }
   }

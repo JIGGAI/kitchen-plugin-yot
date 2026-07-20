@@ -14,7 +14,7 @@ One nightly pipeline, all CORP:
 | When | Job | Purpose |
 |---|---|---|
 | 21:00 ET Mon–Sat, 16:00 ET Sun | `scripts/export-branch-deposits.ts` | Builds the Branch upload CSV, emails disbursements |
-| 22:00 ET daily | `scripts/branch-deposit-watchdog.ts` | Validates output, detects name typos, auto-appends missing staff to the roster tab, alerts RJ |
+| 22:00 ET daily | `scripts/branch-deposit-watchdog.ts` | Validates output, detects name typos, alerts RJ about missing staff for manual roster-tab addition (no auto-append) |
 | 17:00 ET Sun | `scripts/combine-weekend-deposits.ts` | Stacks Sat+Sun disbursements CSVs, emails the combined file |
 
 The export pulls the YOT StaffCashoutReport (org 11082), looks each paid stylist up in the `CSV MASTER` roster tab, applies garnishments and loan withholding, and emits:
@@ -54,7 +54,7 @@ The two groups run as **separate nightly invocations**, so code is shared but ex
 | Daily-totals spreadsheet | existing Branch Daily Totals | new dedicated spreadsheet |
 | CSV mirror spreadsheet | existing Branch DISPURSEMENTS | same new spreadsheet |
 | Email To | `Miranda.hmx.corp@hairmx.net` | `Miranda.hmx.corp@hairmx.net` |
-| Email CC | `info@hairmx.com` | `rjdjohnston@gmail.com` |
+| Email CC | `info@hairmx.com` | `rjdjohnston@gmail.com`, `deanna@hairmxgroup.com`, `linsey@hairmxgroup.com` |
 | Branch upload file | `branch-deposits-<date>.csv` | `hmxgroup-branch-deposits-<date>.csv` |
 | Emailed file | `disbursements-<date>.csv` | `hmxgroup-disbursements-<date>.csv` |
 | Diagnostics | `branch-deposits-<date>.diagnostics.json` | `hmxgroup-branch-deposits-<date>.diagnostics.json` |
@@ -101,7 +101,7 @@ Its spreadsheet id becomes the `hmx-group` config's sheet target. The link is sh
 
 Both support jobs take the same `--group` flag and operate entirely within that group's config:
 
-- **Watchdog** — validates that the group's file exists and is non-empty, runs the same typo/fuzzy detection, auto-appends genuinely-missing staff to *that group's* roster tab, and emails RJ with the group named in the subject.
+- **Watchdog** — validates that the group's file exists and is non-empty, runs the same typo/fuzzy detection, and emails RJ (with the group named in the subject) about genuinely-missing staff so they can be added to *that group's* roster tab by hand — the watchdog makes zero Google Sheets writes; it alerts only.
 - **Weekend combine** — globs that group's Sat+Sun disbursements files, writes `hmxgroup-disbursements-weekend-<sat>-to-<sun>.csv`, and emails that group's recipients.
 
 ## Scheduling
