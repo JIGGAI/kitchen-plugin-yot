@@ -31,6 +31,7 @@ import { runStaffCashoutReport } from '../src/reports/run-staff-cashout';
 import type { StaffCashoutRow } from '../src/reports/reports/staff-cashout';
 import * as sheetsApi from '../src/sheets/google-sheets';
 import { sendGmail } from '../src/mail/google-mailer';
+import { normalizeLocation, normalizeText } from '../src/disbursements/normalize';
 
 type Args = {
   date: string;
@@ -281,25 +282,6 @@ function todayIsoInTimezone(timeZone: string): string {
   }).formatToParts(new Date());
   const byType = Object.fromEntries(parts.map((part) => [part.type, part.value]));
   return `${byType.year}-${byType.month}-${byType.day}`;
-}
-
-function normalizeText(value: string | null | undefined): string {
-  return String(value || '')
-    .normalize('NFKD')
-    .replace(/[’']/g, '')
-    .replace(/[^a-zA-Z0-9\s-]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .toLowerCase();
-}
-
-function normalizeLocation(value: string | null | undefined): string {
-  return normalizeText(value)
-    .replace(/\bmi\b|\boh\b|\bpa\b|\bwv\b|\bfl\b/g, '')
-    .replace(/\btownship\b|\btwp\b/g, '')
-    .replace(/\bstylist\b/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
 }
 
 function splitName(fullName: string): { first: string; last: string } {
