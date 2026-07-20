@@ -461,12 +461,13 @@ async function sendDisbursementsFailureAlert(
   date: string,
   disbursementsPath: string,
   errorMessage: string,
+  emailSubjectPrefix: string,
 ): Promise<boolean> {
   if (intendedRecipient === DISPURSEMENTS_FAILURE_ALERT_TO) {
     // Don't alert RJ that the email to RJ failed — they'll just see stdout.
     return false;
   }
-  const subject = `[HMX] Disbursements email to ${intendedRecipient} FAILED for ${date}`;
+  const subject = `[${emailSubjectPrefix}] Disbursements email to ${intendedRecipient} FAILED for ${date}`;
   const body = `The nightly disbursements email failed to deliver to ${intendedRecipient}.
 
 Date: ${date}
@@ -1562,7 +1563,7 @@ Sourced from ${args.group.rosterTab} on the Branch Daily Totals sheet${args.grou
       emailStatus = 'failed';
       const errMsg = err?.message || String(err);
       console.error(`disbursements email to ${recipient} failed: ${errMsg}`);
-      const delivered = await sendDisbursementsFailureAlert(args.account, recipient, args.date, disbursementsPath, errMsg);
+      const delivered = await sendDisbursementsFailureAlert(args.account, recipient, args.date, disbursementsPath, errMsg, args.group.emailSubjectPrefix);
       failureAlertStatus = delivered ? 'sent' : (recipient === DISPURSEMENTS_FAILURE_ALERT_TO ? 'skipped' : 'failed');
     }
   }

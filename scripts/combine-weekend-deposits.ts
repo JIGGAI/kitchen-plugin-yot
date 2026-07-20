@@ -3,11 +3,13 @@
 // Runs Sundays at 17:00 ET (1h after the Sunday nightly export's 16:00 ET run)
 // via ~/Library/LaunchAgents/com.hairmx.weekend-deposit-combine.plist. Reads
 // the two per-day disbursements CSVs the nightly export already wrote —
-//   ~/hmx-reports/disbursements-<saturday>.csv
-//   ~/hmx-reports/disbursements-<sunday>.csv
+//   ~/hmx-reports/<prefix>disbursements-<saturday>.csv
+//   ~/hmx-reports/<prefix>disbursements-<sunday>.csv
 // — merges them under one header, writes
-//   ~/hmx-reports/disbursements-weekend-<saturday>-to-<sunday>.csv
-// and emails the combined file to Miranda.
+//   ~/hmx-reports/<prefix>disbursements-weekend-<saturday>-to-<sunday>.csv
+// and emails the combined file to the configured recipient. The --group flag
+// (default corp) selects the file prefix and the recipients; see
+// src/disbursements/group-config.ts for per-group values.
 //
 // Merge rule: group by (staff id, location). A stylist who worked the SAME
 // shop on both days collapses to one row with the two amounts summed and a
@@ -24,7 +26,7 @@
 //
 // If either day's CSV is missing, or the two headers disagree, or the send
 // fails, it alerts RJ (rjdjohnston@gmail.com) and exits non-zero rather than
-// emailing Miranda a partial/garbled file.
+// emailing a partial/garbled file to the recipient.
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
