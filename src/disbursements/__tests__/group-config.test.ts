@@ -72,7 +72,7 @@ describe('hmx-group config', () => {
 
   it('emails Miranda with RJ copied', () => {
     expect(grp.emailTo).toBe('Miranda.hmx.corp@hairmx.net');
-    expect(grp.emailCc).toEqual(['rjdjohnston@gmail.com']);
+    expect(grp.emailCc).toEqual(['rjdjohnston@gmail.com', 'deanna@hairmxgroup.com', 'linsey@hairmxgroup.com']);
     expect(grp.emailSubjectPrefix).toBe('HMX GROUP');
   });
 
