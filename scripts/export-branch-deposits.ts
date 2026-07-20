@@ -24,7 +24,9 @@
 //
 // Per-day tabs: the BRANCH MASTER daily tab (Branch Daily Totals sheet) and
 // a CSV mirror tab (Branch DISPURSEMENTS sheet) are both recreated per run,
-// named M/D/YY.
+// named M/D/YY. The mirror tab carries the group's dispursementsTabPrefix
+// (empty for corp) so groups that keep both on ONE spreadsheet don't have
+// the second write delete the first write's tab.
 
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -169,6 +171,9 @@ type MatchDiagnostics = {
   sourceLabel: string;
   groupId: string;
   crossGroupCollisions: RosterCollision[];
+  /** 'failed' means the other group's roster could not be read this run, so
+   *  the collision list is empty by degradation, not by absence of overlap. */
+  crossGroupCollisionCheckStatus: 'ok' | 'failed';
   generatedAt: string;
   reportRowCount: number;
   masterRowCount: number;
@@ -256,6 +261,10 @@ function parseArgs(argv: string[]): Args {
     // The spreadsheet holding BRANCH MASTER + the per-day BRANCH MASTER tabs.
     // Defaults to the group's daily-totals sheet (for corp that is the same
     // id this flag has always defaulted to); --sheetId still overrides.
+    // NOTE: --sheetId no longer redirects the roster read. The roster always
+    // comes from args.group.rosterSheetId / rosterTab, so pointing --sheetId
+    // at a scratch copy redirects only the BRANCH MASTER template read and
+    // the per-day tab writes — the roster is still read from the live sheet.
     sheetId: map.get('sheetId') || group.dailyTotalsSheetId,
     garnishmentsSheetId: map.get('garnishmentsSheetId') || DEFAULT_GARNISHMENTS_SHEET_ID,
     account: map.get('account') || DEFAULT_ACCOUNT,
@@ -403,17 +412,23 @@ function buildWatchdogEmailSection(args: {
   typoRows: FuzzyMatchedRow[];
   inScopeUnmatched: UnmatchedReportRow[];
   loansPaidOff: LoanPaidOff[];
+  // The running group's roster tab. Named explicitly in the prose so an
+  // hmx-group run never tells the operator to add a stylist to CORP's
+  // roster — doing so would create a cross-roster collision and get that
+  // stylist excluded from BOTH groups' payouts.
+  rosterTab: string;
 }): string {
   const sections: string[] = [];
+  const roster = args.rosterTab;
 
   if (args.typoRows.length) {
-    const lines = args.typoRows.map((r) => `- CSV MASTER row ${r.csvMasterRowNumber} has "${r.csvMasterName}"; YOT has "${r.reportName}" (${r.locationName || '?'}). The export paid them via fuzzy match. Please fix the spelling on CSV MASTER.`);
-    sections.push(`CSV MASTER spelling drift vs YOT:\n${lines.join('\n')}`);
+    const lines = args.typoRows.map((r) => `- ${roster} row ${r.csvMasterRowNumber} has "${r.csvMasterName}"; YOT has "${r.reportName}" (${r.locationName || '?'}). The export paid them via fuzzy match. Please fix the spelling on ${roster}.`);
+    sections.push(`${roster} spelling drift vs YOT:\n${lines.join('\n')}`);
   }
 
   if (args.inScopeUnmatched.length) {
-    const lines = args.inScopeUnmatched.map((r) => `- ${r.staffName || '?'} @ ${r.locationName || '?'} earned $${r.bankToBankAmount} today (YOT bank-to-bank). They aren't on CSV MASTER, so they were not in tonight's deposit CSV. Action: pay them manually for today's amount, then add them to CSV MASTER (with their Branch STAFF ID) so tomorrow's export covers them.`);
-    sections.push(`Missing from CSV MASTER (manual payout for today):\n${lines.join('\n')}`);
+    const lines = args.inScopeUnmatched.map((r) => `- ${r.staffName || '?'} @ ${r.locationName || '?'} earned $${r.bankToBankAmount} today (YOT bank-to-bank). They aren't on ${roster}, so they were not in tonight's deposit CSV. Action: pay them manually for today's amount, then add them to ${roster} (with their Branch STAFF ID) so tomorrow's export covers them.`);
+    sections.push(`Missing from ${roster} (manual payout for today):\n${lines.join('\n')}`);
   }
 
   if (args.loansPaidOff.length) {
@@ -980,11 +995,23 @@ async function main() {
     staffId: r.staffId, firstName: r.firstName, lastName: r.lastName, location: r.location,
   }));
   const crossGroupCollisions: RosterCollision[] = [];
-  for (const other of otherGroupConfigs(args.group.id)) {
-    const otherRows = await loadCsvMasterRows(other.rosterSheetId, other.rosterTab, args.account);
-    crossGroupCollisions.push(...findRosterCollisions(ownRoster, otherRows.map((r) => ({
-      staffId: r.staffId, firstName: r.firstName, lastName: r.lastName, location: r.location,
-    }))));
+  // Fail open. This read touches a tab THIS run does not otherwise depend on
+  // (the other group's roster); a rename, a permissions change, or a
+  // transient Sheets error must not stop payroll for everyone on our own
+  // roster. On failure we proceed with no collisions and record the degraded
+  // state in diagnostics so the watchdog/operator can see the check was skipped.
+  let crossGroupCollisionCheckStatus: 'ok' | 'failed' = 'ok';
+  try {
+    for (const other of otherGroupConfigs(args.group.id)) {
+      const otherRows = await loadCsvMasterRows(other.rosterSheetId, other.rosterTab, args.account);
+      crossGroupCollisions.push(...findRosterCollisions(ownRoster, otherRows.map((r) => ({
+        staffId: r.staffId, firstName: r.firstName, lastName: r.lastName, location: r.location,
+      }))));
+    }
+  } catch (err: any) {
+    crossGroupCollisionCheckStatus = 'failed';
+    crossGroupCollisions.length = 0;
+    console.error(`[warn] cross-roster collision check failed: ${err?.message || err} — proceeding without it`);
   }
   const collidingStaffIds = new Set(crossGroupCollisions.filter((c) => c.kind === 'staff-id').map((c) => c.value));
   const collidingLocations = new Set(crossGroupCollisions.filter((c) => c.kind === 'location').map((c) => c.value));
@@ -1079,6 +1106,10 @@ async function main() {
     // stylist produces NO side effects at all: no loan withholding recorded
     // against their LOANS row, no LOAN PAYMENTS row, no garnishment payout
     // row. Skipping later would deduct from a deposit that never gets paid.
+    // Consequence of skipping this early: a colliding stylist with a negative
+    // bank-to-bank amount also loses their "FIRSTNAME OWES $X" YOT NOTES
+    // annotation on the BRANCH MASTER daily tab — accepted, since the
+    // collision itself is reported and needs manual handling anyway.
     if (collidingStaffIds.has(String(match.row.staffId).trim()) || collidingLocations.has(normalizeLocation(match.row.location))) {
       continue;
     }
@@ -1213,10 +1244,10 @@ async function main() {
 
   exportRows.sort((a, b) => a.location.localeCompare(b.location) || a.lastName.localeCompare(b.lastName) || a.firstName.localeCompare(b.firstName));
 
-  const existingGarnishmentPayoutRows = (args.group.garnishmentsEnabled
+  const priorGarnishmentPayoutRows = args.group.garnishmentsEnabled
     ? await loadExistingGarnishmentPayoutRows(args.garnishmentsSheetId, args.account)
-    : [])
-    .filter((row) => row.date !== args.date);
+    : [];
+  const existingGarnishmentPayoutRows = priorGarnishmentPayoutRows.filter((row) => row.date !== args.date);
   const rewrittenGarnishmentPayoutRows = [...existingGarnishmentPayoutRows, ...garnishmentPayoutRows]
     .sort((a, b) => (a.date === b.date ? a.location.localeCompare(b.location) || a.lastName.localeCompare(b.lastName) : b.date.localeCompare(a.date)));
 
@@ -1440,22 +1471,26 @@ async function main() {
   // — the CSV is already on disk — so log + report status instead of
   // throwing.
   let dispursementsTabStatus: 'written' | 'failed' | 'skipped-dry-run' = 'skipped-dry-run';
+  // Prefixed for groups whose CSV-mirror shares a spreadsheet with the
+  // BRANCH MASTER daily tabs — writing both under the same M/D/YY name would
+  // make the second write delete + recreate the first one's tab.
+  const dispursementsTabName = `${args.group.dispursementsTabPrefix}${branchMasterTabName}`;
   if (args.dryRun) {
-    console.error(`[dry-run] skipping Branch DISPURSEMENTS daily tab write: would delete + recreate '${branchMasterTabName}' on sheet ${args.group.dispursementsSheetId} with ${depositRows.length} rows`);
+    console.error(`[dry-run] skipping Branch DISPURSEMENTS daily tab write: would delete + recreate '${dispursementsTabName}' on sheet ${args.group.dispursementsSheetId} with ${depositRows.length} rows`);
   } else {
     try {
       await writeDispursementsDailyTab({
         spreadsheetId: args.group.dispursementsSheetId,
         templateTab: args.group.dispursementsTemplateTab,
         account: args.account,
-        tabName: branchMasterTabName,
+        tabName: dispursementsTabName,
         rows: depositRows,
         date: args.date,
       });
       dispursementsTabStatus = 'written';
     } catch (err: any) {
       dispursementsTabStatus = 'failed';
-      console.error(`[warn] failed to write '${branchMasterTabName}' tab on Branch DISPURSEMENTS: ${err?.message || err}`);
+      console.error(`[warn] failed to write '${dispursementsTabName}' tab on Branch DISPURSEMENTS: ${err?.message || err}`);
     }
   }
   // NB: the diagnostics JSON is written AFTER the email step below, so it can
@@ -1470,6 +1505,7 @@ async function main() {
     typoRows,
     inScopeUnmatched: inScopeUnmatchedRows,
     loansPaidOff: loansPaidOffToday,
+    rosterTab: args.group.rosterTab,
   });
 
   // Email the disbursements CSV to Miranda (or wherever --test-recipient
@@ -1492,6 +1528,14 @@ ${zeroNetRows.map((r) => {
     ].filter(Boolean).join(', ');
     return `- ${r.firstName} ${r.lastName} (${r.location}) — earned $${r.originalAmount.toFixed(2)}; ${parts || 'deductions consumed the full amount'}`;
   }).join('\n')}` : '';
+  // Cross-roster collisions silently remove stylists (or a whole location's
+  // stylists) from the CSV. Surface them here so the omission is visible in
+  // the same email that carries the file, not only in stderr + diagnostics.
+  const collisionEmailSection = crossGroupCollisions.length ? `
+
+Excluded — on more than one group's roster (not in this CSV):
+${crossGroupCollisions.map((c) => `- ${c.detail}`).join('\n')}
+These were excluded to prevent the same person being paid twice on the same night, once by each group's run. They need manual handling: remove the duplicate from whichever roster is wrong, and pay today's amount by hand if it is owed.` : '';
   const subject = `${args.group.emailSubjectPrefix} Disbursements ${args.date} — ${depositRows.length} deposits, $${totalAmount.toFixed(2)}`;
   const body = `Disbursements file for ${args.date} is attached.
 
@@ -1500,7 +1544,8 @@ ${zeroNetRows.map((r) => {
   Garnishments applied: ${garnishmentPayoutRows.length}
   Loan withholdings: ${loanPaymentsThisRun.length}${loansPaidOffToday.length ? `
   Loans paid off today: ${loansPaidOffToday.length}` : ''}${zeroNetRows.length ? `
-  Omitted ($0 net after deductions): ${zeroNetRows.length}` : ''}${zeroNetEmailSection}
+  Omitted ($0 net after deductions): ${zeroNetRows.length}` : ''}${crossGroupCollisions.length ? `
+  Excluded (roster collision): ${crossGroupCollisions.length}` : ''}${zeroNetEmailSection}${collisionEmailSection}
 
 Sourced from ${args.group.rosterTab} on the Branch Daily Totals sheet${args.group.garnishmentsEnabled || args.group.loansEnabled ? ', with garnishment + loan deductions already applied' : ''}. Auto-generated by the nightly Branch deposit export.${watchdogEmailSection}`;
 
@@ -1529,6 +1574,7 @@ Sourced from ${args.group.rosterTab} on the Branch Daily Totals sheet${args.grou
     sourceLabel: args.group.rosterTab,
     groupId: args.group.id,
     crossGroupCollisions,
+    crossGroupCollisionCheckStatus,
     generatedAt: new Date().toISOString(),
     reportRowCount: report.rows.length,
     masterRowCount: masterRows.length,
@@ -1561,6 +1607,7 @@ Sourced from ${args.group.rosterTab} on the Branch Daily Totals sheet${args.grou
     sourceLabel: args.group.rosterTab,
     groupId: args.group.id,
     crossGroupCollisionCount: crossGroupCollisions.length,
+    crossGroupCollisionCheckStatus,
     csvPath,
     diagnosticsPath,
     disbursementsPath,

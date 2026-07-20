@@ -45,6 +45,10 @@ describe('corp config preserves existing production behavior', () => {
   it('keeps the trailing space in its template tab name', () => {
     expect(corp.dispursementsTemplateTab).toBe('CSV BLANK MASTER ');
   });
+
+  it('does not prefix its CSV-mirror tab (separate spreadsheet, no collision)', () => {
+    expect(corp.dispursementsTabPrefix).toBe('');
+  });
 });
 
 describe('hmx-group config', () => {
@@ -78,6 +82,10 @@ describe('hmx-group config', () => {
 
   it('uses a template tab name with no trailing space', () => {
     expect(grp.dispursementsTemplateTab).toBe('CSV BLANK MASTER');
+  });
+
+  it('prefixes its CSV-mirror tab so it cannot overwrite the daily tab', () => {
+    expect(grp.dispursementsTabPrefix).toBe('CSV ');
   });
 });
 

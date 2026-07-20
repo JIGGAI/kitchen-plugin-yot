@@ -23,6 +23,11 @@ export type DisbursementGroupConfig = {
   dispursementsSheetId: string;
   /** Template tab supplying the CSV mirror header. */
   dispursementsTemplateTab: string;
+  /** Prefix on the per-day CSV-mirror tab name. Empty for corp, whose mirror
+   *  lives on its own spreadsheet and so cannot collide with the BRANCH MASTER
+   *  daily tab. hmx-group shares one spreadsheet for both, so its mirror is
+   *  prefixed to keep the two per-day tabs distinct. */
+  dispursementsTabPrefix: string;
   /** BRANCH MASTER template geometry, 1-based rows. */
   branchMasterFirstLocationRow: number;
   branchMasterLastLocationRow: number;
@@ -56,6 +61,7 @@ export const GROUP_CONFIGS: Record<DisbursementGroupId, DisbursementGroupConfig>
     dispursementsSheetId: CORP_DISPURSEMENTS_SHEET_ID,
     // Trailing space is intentional — that is the tab's real name.
     dispursementsTemplateTab: 'CSV BLANK MASTER ',
+    dispursementsTabPrefix: '',
     branchMasterFirstLocationRow: 4,
     branchMasterLastLocationRow: 18,
     branchMasterTotalRow: 21,
@@ -74,6 +80,7 @@ export const GROUP_CONFIGS: Record<DisbursementGroupId, DisbursementGroupConfig>
     dailyTotalsSheetId: HMX_GROUP_SHEET_ID,
     dispursementsSheetId: HMX_GROUP_SHEET_ID,
     dispursementsTemplateTab: 'CSV BLANK MASTER',
+    dispursementsTabPrefix: 'CSV ',
     branchMasterFirstLocationRow: 4,
     branchMasterLastLocationRow: 7,
     branchMasterTotalRow: 10,
