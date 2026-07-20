@@ -149,7 +149,7 @@ async function main() {
   if (!existsSync(csvPath)) {
     log(`MISSING ${csvPath}`);
     sendEmail(
-      `[HMX] Branch deposit export missing for ${args.targetDate}`,
+      `[${args.group.emailSubjectPrefix}] Branch deposit export missing for ${args.targetDate}`,
       `The nightly Branch deposit export (21:00 ET) did not produce:
 ${csvPath}
 
@@ -193,7 +193,7 @@ Watchdog log: ${LOG_PATH}`,
       : `the disbursements email status was "${diag.disbursementsEmailStatus}"`;
     log(`NOT-SENT target=${args.targetDate} emailStatus=${diag.disbursementsEmailStatus} dryRun=${!!diag.dryRun}`);
     sendEmail(
-      `[HMX] Branch deposit NOT SENT for ${args.targetDate}`,
+      `[${args.group.emailSubjectPrefix}] Branch deposit NOT SENT for ${args.targetDate}`,
       `The Branch deposit files for ${args.targetDate} exist, but ${reason}.
 
 Miranda was NOT emailed the deposit CSV and the live Google Sheets were NOT updated. The ${diag.exportRowCount} deposits for ${args.targetDate} have not been processed.
