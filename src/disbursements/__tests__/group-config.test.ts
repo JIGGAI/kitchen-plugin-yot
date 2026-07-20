@@ -41,6 +41,10 @@ describe('corp config preserves existing production behavior', () => {
   it('keeps its BRANCH MASTER geometry', () => {
     expect([corp.branchMasterFirstLocationRow, corp.branchMasterLastLocationRow, corp.branchMasterTotalRow]).toEqual([4, 18, 21]);
   });
+
+  it('keeps the trailing space in its template tab name', () => {
+    expect(corp.dispursementsTemplateTab).toBe('CSV BLANK MASTER ');
+  });
 });
 
 describe('hmx-group config', () => {
@@ -70,6 +74,10 @@ describe('hmx-group config', () => {
 
   it('uses 4-location BRANCH MASTER geometry', () => {
     expect([grp.branchMasterFirstLocationRow, grp.branchMasterLastLocationRow, grp.branchMasterTotalRow]).toEqual([4, 7, 10]);
+  });
+
+  it('uses a template tab name with no trailing space', () => {
+    expect(grp.dispursementsTemplateTab).toBe('CSV BLANK MASTER');
   });
 });
 
