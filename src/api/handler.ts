@@ -47,7 +47,13 @@ import type {
 // aggregates don't split a single store into several rows. Keyed by normalized
 // name (trim + collapse internal whitespace + lowercase). Non-listed names pass
 // through unchanged. Add new variant→canonical pairs here as YOT renames sites.
-const LOCATION_NAME_ALIASES: Record<string, string> = {
+function normalizeLocationName(name: string | null | undefined): string {
+  return String(name ?? '').trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+// Historical variant → canonical name. Keys are matched after normalization,
+// so they may be written in any case/spacing.
+const LOCATION_NAME_VARIANTS: Record<string, string> = {
   // St. Augustine FL "Treaty Oaks" shop — recorded under three names over time
   // (see ranges: "Treaty Oaks St. Augustine Fl." → "St. Augustine FL." →
   // "Treaty Oaks St. Aug. FL."). Canonical active record is id 7432.
@@ -55,10 +61,30 @@ const LOCATION_NAME_ALIASES: Record<string, string> = {
   'treaty oaks st. augustine fl.': 'Treaty Oaks St. Aug. FL.',
 };
 
+// Lookup table: every variant key AND every canonical name, both normalized.
+//
+// Self-mapping the canonical names is load-bearing, not tidiness. Previously
+// the map held only the variant keys and the function fell through to `raw` on
+// a miss — so a case-only variant of the CANONICAL name was the one spelling
+// it could not catch. That is exactly how YOT's inactive location 7429
+// ("Treaty Oaks St. Aug. Fl.", lowercase 'l') survived alongside the active
+// 7432 ("...FL.") and double-counted May 2026 revenue by $15,369 wherever
+// names are joined in from the locations table.
+//
+// Normalizing the variant keys here too means a future editor can add a pair
+// in natural casing without silently writing an unmatchable key.
+const LOCATION_NAME_ALIASES: Record<string, string> = (() => {
+  const map: Record<string, string> = {};
+  for (const [variant, canonical] of Object.entries(LOCATION_NAME_VARIANTS)) {
+    map[normalizeLocationName(variant)] = canonical;
+    map[normalizeLocationName(canonical)] = canonical;
+  }
+  return map;
+})();
+
 export function canonicalLocationName(name: string | null | undefined): string {
   const raw = String(name ?? '');
-  const norm = raw.trim().replace(/\s+/g, ' ').toLowerCase();
-  return LOCATION_NAME_ALIASES[norm] ?? raw;
+  return LOCATION_NAME_ALIASES[normalizeLocationName(raw)] ?? raw;
 }
 
 export type PluginRequest = {
