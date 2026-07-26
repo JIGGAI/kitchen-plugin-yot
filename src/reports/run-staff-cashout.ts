@@ -1,8 +1,11 @@
 import { initializeDatabase } from '../db';
 import type { YotConfig } from '../types';
 import { createReportClient } from './client';
+import type { ReportDocumentFormat } from './client';
 import { reportRegistry } from './report-registry';
 import type { StaffCashoutResult } from './reports/staff-cashout';
+import { parseStaffCashoutCsv } from './reports/staff-cashout-csv';
+import { isXlsxRenderingUnavailable } from './render-fallback';
 
 type SqliteDb = ReturnType<typeof initializeDatabase>['sqlite'];
 
@@ -14,6 +17,12 @@ export type RunStaffCashoutOptions = {
   locationId?: number | null;
   staffId?: number | null;
   includeDebugRows?: boolean;
+  /**
+   * Fall back to the CSV renderer when YOT's XLSX extension is unavailable.
+   * Only safe for callers that read staffName / locationName /
+   * bankToBankAmount — the CSV parser leaves the revenue columns null.
+   */
+  allowCsvFallback?: boolean;
 };
 
 function readConfig(sqlite: SqliteDb, teamId: string): YotConfig {
@@ -46,8 +55,36 @@ export async function runStaffCashoutReport(options: RunStaffCashoutOptions): Pr
     reportRegistry.staffCashout.reportType,
     reportRegistry.staffCashout.buildInstanceParams(params),
   );
-  const document = await client.createDocument(instanceId, reportRegistry.staffCashout.preferredFormat);
-  await client.waitForDocument(instanceId, document.documentId);
-  const file = await client.fetchDocument(instanceId, document.documentId);
-  return reportRegistry.staffCashout.parseDocument(file.buffer, parameterDefinitions, { includeDebugRows: options.includeDebugRows });
+  async function render(format: ReportDocumentFormat) {
+    const document = await client.createDocument(instanceId, format);
+    await client.waitForDocument(instanceId, document.documentId);
+    return client.fetchDocument(instanceId, document.documentId);
+  }
+
+  try {
+    const file = await render(reportRegistry.staffCashout.preferredFormat);
+    return reportRegistry.staffCashout.parseDocument(file.buffer, parameterDefinitions, {
+      includeDebugRows: options.includeDebugRows,
+    });
+  } catch (error) {
+    // Opt-in only. The CSV parser populates staffName / locationName /
+    // bankToBankAmount — everything the disbursement export reads — but leaves
+    // the revenue columns null, so callers that surface the full row shape
+    // (e.g. the /staff-cashout API) must keep failing loudly instead.
+    if (!options.allowCsvFallback || !isXlsxRenderingUnavailable(error)) throw error;
+
+    console.error(
+      '[staff-cashout] XLSX rendering unavailable upstream — falling back to the CSV renderer. ' +
+        'Rows are reconciled against the report\'s own bank-to-bank total before use.',
+    );
+    const file = await render('CSV');
+    // Throws unless the extracted rows reconcile against the report's own
+    // stated bank-to-bank total.
+    const result = parseStaffCashoutCsv(file.buffer);
+    console.error(
+      `[staff-cashout] CSV fallback reconciled: ${result.rows.length} staff rows totalling ` +
+        `${result.bankToBankTotal.toFixed(2)} bank-to-bank.`,
+    );
+    return result;
+  }
 }
