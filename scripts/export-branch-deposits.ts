@@ -966,6 +966,11 @@ async function main() {
     startDateIso: args.date,
     endDateIso: args.date,
     organisationId: args.organisationId,
+    // This export reads only staffName / locationName / bankToBankAmount, so
+    // it can ride the CSV renderer while YOT's XLSX extension is down. The
+    // CSV parser refuses to return rows that don't reconcile against the
+    // report's own stated total.
+    allowCsvFallback: true,
   });
   const masterRows = await loadCsvMasterRows(args.group.rosterSheetId, args.group.rosterTab, args.account);
   const garnishmentRules = args.group.garnishmentsEnabled
