@@ -179,6 +179,19 @@ export function buildStylistNameMap(
 }
 
 /**
+ * Roster display names carry YOT's role suffix and stray double spaces —
+ * "Alaysa Kwek (Stylist)", "Chelsea  Desselles (Stylist )". Strip both so the
+ * result lines up with the StaffPerformance report's plain "Firstname Surname",
+ * which is the only key those two datasets share.
+ */
+export function cleanRosterStylistName(name: string | null | undefined): string {
+  return String(name || '')
+    .replace(/\s*\([^)]*\)\s*$/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
  * Pick cached appointment rows to prune for one location after a sync: rows
  * whose start falls inside the window the feed just covered but whose
  * `appointmentId` the current feed no longer returns. YOT's `/appointmentsrange`
@@ -2330,6 +2343,136 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       const now = new Date().toISOString();
       upsertSyncState(perfDb, teamId, 'staff_performance_facts', { lastSyncedAt: now, lastError: error?.message || String(error) });
       return apiError(502, 'YOT_ERROR', error?.message || 'Failed to sync staff performance');
+    }
+  }
+
+  // ─── Staff Utilization (schedule fill rate) ───────────────────────────
+  // GET /staff-utilization?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
+  //
+  // "What share of a stylist's scheduled shift time was actually booked."
+  //
+  //   filledPct = booked appointment minutes / rostered shift minutes
+  //
+  // Both sides come from data we already cache — no Telerik report, no YOT
+  // call. The denominator is the coverage roster (location_coverage_facts
+  // .rostered_payload, synced by the coverage cron), the numerator is the
+  // `appointments` table (15-min sync).
+  //
+  // Two things keep the ratio honest:
+  //   1. Only days with a synced roster count. A day we never rostered would
+  //      otherwise contribute booked minutes against a zero denominator and
+  //      inflate every stylist who worked it.
+  //   2. Split shifts sum their chunks rather than taking the widest
+  //      envelope (which /coverage/day-schedule does, deliberately, for
+  //      drawing a single row) — a 9-12 + 4-8 day is 7 rostered hours, not 11.
+  //
+  // No-shows and cancellations are excluded from the numerator: the slot was
+  // booked but the chair sat empty, and "filled" should track chair time.
+  if (req.path === '/staff-utilization' && req.method === 'GET') {
+    try {
+      const { db, sqlite } = initializeDatabase(teamId);
+      const today = dateOnlyNow();
+      const firstOfMonth = today.slice(0, 8) + '01';
+      const startDate = toDateOnlyInput(req.query.startDate || req.query.start) || firstOfMonth;
+      const endDate = toDateOnlyInput(req.query.endDate || req.query.end) || today;
+
+      type CoverageRow = { locationId: string; date: string; rosteredPayload: string | null };
+      const coverageRows = sqlite.prepare(
+        `SELECT location_id AS locationId, date, rostered_payload AS rosteredPayload
+           FROM location_coverage_facts
+          WHERE team_id = ? AND date BETWEEN ? AND ?`,
+      ).all(teamId, startDate, endDate) as CoverageRow[];
+
+      type RosterEntry = { stylistId?: string | null; stylistName?: string | null; status?: string | null; startsAt?: string | null; endsAt?: string | null };
+      type Bucket = { locationId: string; stylistId: string; stylistName: string | null; rosteredMinutes: number; bookedMinutes: number };
+      const buckets = new Map<string, Bucket>();
+      // (locationId, stylistId) → the set of dates we hold a scheduled shift
+      // for, so the appointment scan can ignore everything else.
+      const rosteredDays = new Map<string, Set<string>>();
+      const bucketKey = (locationId: string, stylistId: string) => `${locationId}::${stylistId}`;
+
+      for (const cov of coverageRows) {
+        if (!cov.rosteredPayload) continue;
+        let entries: RosterEntry[] = [];
+        try {
+          entries = (JSON.parse(cov.rosteredPayload) as { rows?: RosterEntry[] }).rows ?? [];
+        } catch { continue; }
+        for (const entry of entries) {
+          if (entry.status !== 'scheduled') continue;
+          if (!entry.stylistId || !entry.startsAt || !entry.endsAt) continue;
+          const minutes = (Date.parse(entry.endsAt) - Date.parse(entry.startsAt)) / 60000;
+          if (!Number.isFinite(minutes) || minutes <= 0) continue;
+          const key = bucketKey(cov.locationId, entry.stylistId);
+          const bucket = buckets.get(key) || {
+            locationId: cov.locationId, stylistId: entry.stylistId,
+            stylistName: null, rosteredMinutes: 0, bookedMinutes: 0,
+          };
+          bucket.rosteredMinutes += minutes;
+          if (!bucket.stylistName && entry.stylistName) bucket.stylistName = entry.stylistName;
+          buckets.set(key, bucket);
+          const days = rosteredDays.get(key) || new Set<string>();
+          days.add(cov.date);
+          rosteredDays.set(key, days);
+        }
+      }
+
+      // Booked minutes per (location, stylist, date). Appointments carry the
+      // bare YOT stylist id, the same id the roster payload uses, so these
+      // join directly (no name matching).
+      type ApptRow = { locationId: string | null; stylistId: string | null; date: string; minutes: number | null };
+      const apptRows = sqlite.prepare(
+        `SELECT location_id AS locationId, stylist_id AS stylistId,
+                substr(start_at, 1, 10) AS date, SUM(duration_minutes) AS minutes
+           FROM appointments
+          WHERE team_id = ? AND substr(start_at, 1, 10) BETWEEN ? AND ?
+            AND COALESCE(cancelled_flag, 0) = 0
+            AND CAST(COALESCE(status_code, '') AS TEXT) <> '5'
+          GROUP BY location_id, stylist_id, date`,
+      ).all(teamId, startDate, endDate) as ApptRow[];
+
+      for (const appt of apptRows) {
+        if (!appt.locationId || !appt.stylistId) continue;
+        const key = bucketKey(appt.locationId, appt.stylistId);
+        const bucket = buckets.get(key);
+        if (!bucket) continue;                              // never rostered here
+        if (!rosteredDays.get(key)?.has(appt.date)) continue; // no roster that day
+        bucket.bookedMinutes += Number(appt.minutes || 0);
+      }
+
+      // Names + location labels. Roster display names win; the stylists table
+      // fills gaps (keyed LOCATION:YOT_ID, so resolve through private_id —
+      // same reasoning as buildStylistNameMap).
+      const locationRows = sqlite.prepare(
+        'SELECT id, name FROM locations WHERE team_id = ?',
+      ).all(teamId) as Array<{ id: string; name: string | null }>;
+      const locationNameById = new Map(locationRows.map((l) => [String(l.id), l.name || '']));
+      const stylistRows = db.select().from(schema.stylists)
+        .where(eq(schema.stylists.teamId, teamId)).all() as schema.Stylist[];
+      const nameById = buildStylistNameMap(
+        [...buckets.values()].map((b) => ({ stylistId: b.stylistId, stylistName: b.stylistName })),
+        stylistRows,
+      );
+
+      const rows = [...buckets.values()].map((b) => {
+        const rosteredMinutes = Math.round(b.rosteredMinutes);
+        const bookedMinutes = Math.round(b.bookedMinutes);
+        return {
+          locationId: b.locationId,
+          locationName: canonicalLocationName(locationNameById.get(b.locationId) || ''),
+          stylistId: b.stylistId,
+          // Strip YOT's role suffix ("Alaysa Kwek (Stylist)") and collapse
+          // double spaces so callers can match this against the name-keyed
+          // StaffPerformance rows.
+          staffName: cleanRosterStylistName(nameById.get(b.stylistId) || b.stylistName || ''),
+          rosteredMinutes,
+          bookedMinutes,
+          filledPct: rosteredMinutes > 0 ? bookedMinutes / rosteredMinutes : null,
+        };
+      }).sort((a, b) => (b.filledPct ?? -1) - (a.filledPct ?? -1));
+
+      return { status: 200, data: { ok: true, startDate, endDate, rowCount: rows.length, rows } };
+    } catch (error: any) {
+      return apiError(500, 'INTERNAL', error?.message || 'Failed to compute staff utilization');
     }
   }
 
