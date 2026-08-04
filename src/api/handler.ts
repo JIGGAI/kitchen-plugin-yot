@@ -2209,14 +2209,50 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
          FROM staff_performance_facts WHERE team_id = ? AND date BETWEEN ? AND ?`,
       ).all(teamId, startDate, endDate) as StaffPerfFact[];
 
+      // StaffPerformance reports commission and tips as ONE combined figure
+      // ("Commission & Tips Total"), and its "Average Tip" column can't be
+      // multiplied back into a tips total — YOT appears to average over tipped
+      // sales only, so avg_tip × sale_count exceeds the combined total on some
+      // days and would yield a negative commission.
+      //
+      // StaffCashout, synced daily into staff_cashout_facts, carries a real
+      // `tips` column for the same (date, location, staff). Joining it gives a
+      // YOT-sourced tips figure, leaving commission as a single subtraction:
+      //
+      //   tips       = StaffCashout.tips
+      //   commission = StaffPerformance.commissionTipsTotal - tips
+      //
+      // The two reports disagree on whitespace for the same person and shop
+      // ("Allison  Indra", "Clinton Twp.  MI"), so the join key collapses runs
+      // of spaces on both sides. Without that the join lands ~73%; with it,
+      // 109/109 on a spot-checked day.
+      const tipsKey = (locationName: string | null, staffName: string | null, date: string) =>
+        `${canonicalLocationName(locationName).replace(/\s+/g, ' ').trim().toLowerCase()}::${String(staffName || '').replace(/\s+/g, ' ').trim().toLowerCase()}::${date}`;
+      const cashoutTipsByKey = new Map<string, number>();
+      try {
+        const cashoutRows = sqlite.prepare(
+          `SELECT location_name AS locationName, staff_name AS staffName, date, tips
+             FROM staff_cashout_facts WHERE team_id = ? AND date BETWEEN ? AND ? AND tips IS NOT NULL`,
+        ).all(teamId, startDate, endDate) as Array<{ locationName: string | null; staffName: string | null; date: string; tips: number | null }>;
+        for (const row of cashoutRows) {
+          cashoutTipsByKey.set(tipsKey(row.locationName, row.staffName, row.date), Number(row.tips || 0));
+        }
+      } catch {
+        // Cashout is a separate sync — if its table is missing or unsynced,
+        // fall through with an empty map so tips/commission come back null
+        // rather than taking the whole endpoint down.
+      }
+
       type Acc = {
         locationName: string; staffName: string;
         totalSalesCount: number; serviceSold: number; servicesValue: number;
         productsSold: number; productsValue: number; totalSalesValue: number;
         pointsEarned: number; commissionTipsTotal: number;
-        // tipsTotal = Σ(avg_tip × sale_count) so the range/subtotal avg tip is a
-        // proper weighted average; hoursMinutes sums parsed "Xh, Ym" cells.
-        tipsTotal: number; hoursMinutes: number;
+        // avgTipWeighted = Σ(avg_tip × sale_count), the numerator behind the
+        // range/subtotal average tip (a weighted mean, not a mean of means).
+        // Distinct from tipsTotal, which is StaffCashout's actual tips column;
+        // hoursMinutes sums parsed "Xh, Ym" cells.
+        avgTipWeighted: number; tipsTotal: number; tipsMatched: boolean; hoursMinutes: number;
       };
       const buckets = new Map<string, Acc>();
       let lastUpdatedAt: string | null = null;
@@ -2229,7 +2265,8 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
           locationName, staffName: f.staffName,
           totalSalesCount: 0, serviceSold: 0, servicesValue: 0,
           productsSold: 0, productsValue: 0, totalSalesValue: 0,
-          pointsEarned: 0, commissionTipsTotal: 0, tipsTotal: 0, hoursMinutes: 0,
+          pointsEarned: 0, commissionTipsTotal: 0,
+          avgTipWeighted: 0, tipsTotal: 0, tipsMatched: false, hoursMinutes: 0,
         };
         acc.totalSalesCount += Number(f.totalSalesCount || 0);
         acc.serviceSold += Number(f.serviceSold || 0);
@@ -2239,7 +2276,9 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         acc.totalSalesValue += Number(f.totalSalesValue || 0);
         acc.pointsEarned += Number(f.pointsEarned || 0);
         acc.commissionTipsTotal += Number(f.commissionTipsTotal || 0);
-        acc.tipsTotal += Number(f.averageTip || 0) * Number(f.totalSalesCount || 0);
+        acc.avgTipWeighted += Number(f.averageTip || 0) * Number(f.totalSalesCount || 0);
+        const dayTips = cashoutTipsByKey.get(tipsKey(f.locationName, f.staffName, f.date));
+        if (dayTips != null) { acc.tipsTotal += dayTips; acc.tipsMatched = true; }
         acc.hoursMinutes += parseHoursWorkedToMinutes(f.hoursWorkedRaw);
         buckets.set(key, acc);
         lastUpdatedAt = mostRecentIso(lastUpdatedAt, f.lastUpdatedAt);
@@ -2252,7 +2291,11 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
           servicesPerSale: a.totalSalesCount > 0 ? a.serviceSold / a.totalSalesCount : null,
           avgSaleValue: a.totalSalesCount > 0 ? a.totalSalesValue / a.totalSalesCount : null,
           clientsPerPoint: a.pointsEarned > 0 ? a.totalSalesCount / a.pointsEarned : null,
-          averageTip: a.totalSalesCount > 0 ? a.tipsTotal / a.totalSalesCount : null,
+          averageTip: a.totalSalesCount > 0 ? a.avgTipWeighted / a.totalSalesCount : null,
+          // Null (not zero) when no StaffCashout row matched — an unmatched
+          // stylist has unknown tips, and a zero would read as "tipped nothing".
+          tipsTotal: a.tipsMatched ? a.tipsTotal : null,
+          commissionTotal: a.tipsMatched ? a.commissionTipsTotal - a.tipsTotal : null,
           hoursWorkedMinutes: a.hoursMinutes,
           hoursWorked: formatMinutesAsHours(a.hoursMinutes),
           totalPerHour: hours > 0 ? a.totalSalesValue / hours : null,
