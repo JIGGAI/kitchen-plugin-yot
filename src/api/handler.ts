@@ -782,6 +782,83 @@ function readPayoutExportForDate(date: string, group: DisbursementGroupConfig): 
   };
 }
 
+/**
+ * Pull YOT's StaffWorkSummary report for one day and replace that day's rows.
+ *
+ * Called from POST /staff-performance/sync rather than its own endpoint: the
+ * two reports share a cadence and a grain, so piggybacking keeps the tables on
+ * the same date without a second cron job.
+ *
+ * Never throws. The caller has usually already written staff-performance rows
+ * successfully by this point, and a StaffWorkSummary outage must not turn that
+ * into a failed sync — the error is recorded in sync_state and returned.
+ */
+async function syncStaffWorkSummaryDay(
+  sqlite: ReturnType<typeof initializeDatabase>['sqlite'],
+  db: ReturnType<typeof initializeDatabase>['db'],
+  teamId: string,
+  date: string,
+  organisationId: number,
+  config: YotConfig,
+): Promise<{ rowsWritten: number; error?: string }> {
+  try {
+    const client = createReportClient(config);
+    const r = reportRegistry.staffWorkSummary;
+    const params = {
+      startDateIso: `${date}T00:00:00`,
+      endDateIso: `${date}T23:59:59`,
+      organisationId,
+      locationId: null,
+      staffId: null,
+    };
+    const defs = await client.getParameters(r.reportType, r.buildParameterDiscovery(params, config.apiKey));
+    const inst = await client.createInstance(r.reportType, r.buildInstanceParams(params));
+    const doc = await client.createDocument(inst, r.preferredFormat);
+    await client.waitForDocument(inst, doc.documentId);
+    const file = await client.fetchDocument(inst, doc.documentId);
+    const parsed = r.parseDocument(file.buffer, defs);
+
+    const upsert = sqlite.prepare(
+      `INSERT INTO staff_work_summary_facts (
+        team_id, location_name, staff_name, date,
+        sales_per_hour, avg_length_minutes, scheduled_minutes,
+        work_less_breaks_minutes, days_worked, last_updated_at
+      ) VALUES (?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT (team_id, location_name, staff_name, date) DO UPDATE SET
+        sales_per_hour = excluded.sales_per_hour,
+        avg_length_minutes = excluded.avg_length_minutes,
+        scheduled_minutes = excluded.scheduled_minutes,
+        work_less_breaks_minutes = excluded.work_less_breaks_minutes,
+        days_worked = excluded.days_worked,
+        last_updated_at = excluded.last_updated_at`,
+    );
+
+    // Wipe first so a stylist removed on YOT's side doesn't linger.
+    sqlite.prepare('DELETE FROM staff_work_summary_facts WHERE team_id = ? AND date = ?').run(teamId, date);
+    const now = new Date().toISOString();
+    let rowsWritten = 0;
+    for (const row of parsed.rows) {
+      if (!row.locationName || !row.staffName) continue;
+      upsert.run(
+        teamId, row.locationName, row.staffName, date,
+        row.salesPerHour, row.avgLengthMinutes, row.scheduledMinutes,
+        row.workLessBreaksMinutes, row.daysWorked, now,
+      );
+      rowsWritten += 1;
+    }
+    upsertSyncState(db, teamId, 'staff_work_summary_facts', {
+      lastSyncedAt: now, lastSuccessAt: now, lastError: null, rowCount: rowsWritten,
+    });
+    return { rowsWritten };
+  } catch (error: any) {
+    const message = error?.message || String(error);
+    upsertSyncState(db, teamId, 'staff_work_summary_facts', {
+      lastSyncedAt: new Date().toISOString(), lastError: message,
+    });
+    return { rowsWritten: 0, error: message };
+  }
+}
+
 export function listDisbursementGroups(): DisbursementGroupConfig[] {
   return Object.values(GROUP_CONFIGS);
 }
@@ -2342,7 +2419,59 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         // Distinct from tipsTotal, which is StaffCashout's actual tips column;
         // hoursMinutes sums parsed "Xh, Ym" cells.
         avgTipWeighted: number; tipsTotal: number; tipsMatched: boolean; hoursMinutes: number;
+        // StaffWorkSummary ratios. salesPerHour and avgLength are averages, so
+        // they're accumulated as Σ(value × weight) and divided by Σ(weight) at
+        // the end — a weighted mean, never a mean of means.
+        //
+        // Each carries its OWN weight: the report can supply an Avg Length with
+        // no Sales per hour (real, 2026-08-04). A shared weight turned that
+        // missing value into a 0.00 on the leaderboard, which reads as "sold
+        // nothing per hour" rather than "not reported".
+        salesPerHourWeighted: number; salesPerHourWeight: number;
+        avgLengthWeighted: number; avgLengthWeight: number;
       };
+      // StaffWorkSummary facts for the same window, keyed like the cashout join
+      // above — the two reports disagree on whitespace for the same person and
+      // shop, so runs of spaces collapse on both sides.
+      type WorkSummaryFact = {
+        locationName: string | null; staffName: string | null; date: string;
+        salesPerHour: number | null; avgLengthMinutes: number | null;
+        workLessBreaksMinutes: number | null; daysWorked: number | null;
+      };
+      const workSummaryByKey = new Map<string, WorkSummaryFact>();
+      // Same facts keyed by (staff, date) only. StaffWorkSummary attributes a
+      // stylist to the shop they were SCHEDULED at, while StaffPerformance
+      // attributes them to where the SALE happened — so for anyone covering a
+      // second shop the location-keyed join misses (6 of 125 on 2026-08-04).
+      // This is the fallback for those rows.
+      const workSummaryByStaff = new Map<string, WorkSummaryFact[]>();
+      try {
+        const wsRows = sqlite.prepare(
+          `SELECT location_name AS locationName, staff_name AS staffName, date,
+            sales_per_hour AS salesPerHour, avg_length_minutes AS avgLengthMinutes,
+            work_less_breaks_minutes AS workLessBreaksMinutes, days_worked AS daysWorked
+           FROM staff_work_summary_facts WHERE team_id = ? AND date BETWEEN ? AND ?`,
+        ).all(teamId, startDate, endDate) as WorkSummaryFact[];
+        for (const row of wsRows) {
+          workSummaryByKey.set(tipsKey(row.locationName, row.staffName, row.date), row);
+          const staffKey = `${String(row.staffName || '').replace(/\s+/g, ' ').trim().toLowerCase()}::${row.date}`;
+          workSummaryByStaff.set(staffKey, [...(workSummaryByStaff.get(staffKey) || []), row]);
+        }
+      } catch {
+        // Separate sync with its own failure mode — if the table is missing or
+        // unsynced, salesPerHour/chairTime come back null rather than taking
+        // the whole endpoint down.
+      }
+
+      /** Weight for one day's ratios: minutes actually worked, else days, else
+       *  a nominal hour — so a stylist whose shift YOT never recorded still
+       *  contributes instead of vanishing from their own average. */
+      const workSummaryWeightOf = (ws: WorkSummaryFact) => (
+        Number(ws.workLessBreaksMinutes || 0) > 0
+          ? Number(ws.workLessBreaksMinutes)
+          : (Number(ws.daysWorked || 0) > 0 ? Number(ws.daysWorked) * 60 : 60)
+      );
+
       const buckets = new Map<string, Acc>();
       let lastUpdatedAt: string | null = null;
       for (const f of facts) {
@@ -2356,6 +2485,8 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
           productsSold: 0, productsValue: 0, totalSalesValue: 0,
           pointsEarned: 0, commissionTipsTotal: 0,
           avgTipWeighted: 0, tipsTotal: 0, tipsMatched: false, hoursMinutes: 0,
+          salesPerHourWeighted: 0, salesPerHourWeight: 0,
+          avgLengthWeighted: 0, avgLengthWeight: 0,
         };
         acc.totalSalesCount += Number(f.totalSalesCount || 0);
         acc.serviceSold += Number(f.serviceSold || 0);
@@ -2369,6 +2500,23 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         const dayTips = cashoutTipsByKey.get(tipsKey(f.locationName, f.staffName, f.date));
         if (dayTips != null) { acc.tipsTotal += dayTips; acc.tipsMatched = true; }
         acc.hoursMinutes += parseHoursWorkedToMinutes(f.hoursWorkedRaw);
+
+        // Exact (location, staff, date) match first; fall back to the person's
+        // rows anywhere that day for stylists who covered a second shop.
+        const exact = workSummaryByKey.get(tipsKey(f.locationName, f.staffName, f.date));
+        const staffKey = `${String(f.staffName || '').replace(/\s+/g, ' ').trim().toLowerCase()}::${f.date}`;
+        const matches = exact ? [exact] : (workSummaryByStaff.get(staffKey) || []);
+        for (const ws of matches) {
+          const weight = workSummaryWeightOf(ws);
+          if (ws.salesPerHour != null) {
+            acc.salesPerHourWeighted += Number(ws.salesPerHour) * weight;
+            acc.salesPerHourWeight += weight;
+          }
+          if (ws.avgLengthMinutes != null) {
+            acc.avgLengthWeighted += Number(ws.avgLengthMinutes) * weight;
+            acc.avgLengthWeight += weight;
+          }
+        }
         buckets.set(key, acc);
         lastUpdatedAt = mostRecentIso(lastUpdatedAt, f.lastUpdatedAt);
       }
@@ -2388,6 +2536,10 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
           hoursWorkedMinutes: a.hoursMinutes,
           hoursWorked: formatMinutesAsHours(a.hoursMinutes),
           totalPerHour: hours > 0 ? a.totalSalesValue / hours : null,
+          // Null (not zero) when no StaffWorkSummary row matched — unknown is
+          // not the same as "sold nothing per hour".
+          salesPerHour: a.salesPerHourWeight > 0 ? a.salesPerHourWeighted / a.salesPerHourWeight : null,
+          chairTimeMinutes: a.avgLengthWeight > 0 ? a.avgLengthWeighted / a.avgLengthWeight : null,
         };
       }).sort((a, b) => b.totalSalesValue - a.totalSalesValue);
       return { status: 200, data: { ok: true, startDate, endDate, rowCount: rows.length, lastUpdatedAt, rows } };
@@ -2470,7 +2622,21 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       upsertSyncState(perfDb, teamId, 'staff_performance_facts', {
         lastSyncedAt: completedAt, lastSuccessAt: completedAt, lastError: null, rowCount: rowsWritten,
       });
-      return { status: 200, data: { ok: true, date, rowsWritten, locationCount: parsed.locations.length, startedAt, completedAt } };
+
+      // StaffWorkSummary rides this same job: same report family, same cadence,
+      // same day. Piggybacking avoids a second cron and keeps the two tables on
+      // the same date. Deliberately non-fatal — a failure here must not fail a
+      // staff-performance sync that already succeeded, so it is reported in the
+      // response and its own sync_state row instead of throwing.
+      const workSummary = await syncStaffWorkSummaryDay(sqlite, perfDb, teamId, date, organisationId, config);
+
+      return {
+        status: 200,
+        data: {
+          ok: true, date, rowsWritten, locationCount: parsed.locations.length,
+          startedAt, completedAt, workSummary,
+        },
+      };
     } catch (error: any) {
       const now = new Date().toISOString();
       upsertSyncState(perfDb, teamId, 'staff_performance_facts', { lastSyncedAt: now, lastError: error?.message || String(error) });
