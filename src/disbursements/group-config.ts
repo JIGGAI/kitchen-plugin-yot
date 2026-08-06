@@ -9,6 +9,10 @@ export type DisbursementGroupConfig = {
   id: DisbursementGroupId;
   /** Human label for logs. */
   label: string;
+  /** Label shown to dashboard users. Separate from `label` because the log
+   *  names ("CORP") are internal shorthand — staff know the two payout runs as
+   *  "HMX" and "HMX Group". */
+  displayLabel: string;
   /** Spreadsheet holding the roster tab. Both groups' rosters live on the
    *  Branch Daily Totals sheet, which is why this is separate from
    *  dailyTotalsSheetId. */
@@ -55,6 +59,7 @@ export const GROUP_CONFIGS: Record<DisbursementGroupId, DisbursementGroupConfig>
   corp: {
     id: 'corp',
     label: 'CORP',
+    displayLabel: 'HMX',
     rosterSheetId: BRANCH_DAILY_TOTALS_SHEET_ID,
     rosterTab: 'CORP CSV MASTER',
     dailyTotalsSheetId: BRANCH_DAILY_TOTALS_SHEET_ID,
@@ -75,6 +80,7 @@ export const GROUP_CONFIGS: Record<DisbursementGroupId, DisbursementGroupConfig>
   'hmx-group': {
     id: 'hmx-group',
     label: 'HMX GROUP',
+    displayLabel: 'HMX Group',
     rosterSheetId: BRANCH_DAILY_TOTALS_SHEET_ID,
     rosterTab: 'HAIR MX GROUP CSV MASTER',
     dailyTotalsSheetId: HMX_GROUP_SHEET_ID,
