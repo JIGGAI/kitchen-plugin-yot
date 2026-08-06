@@ -2,7 +2,7 @@
 // Kitchen invokes handleRequest({ path, method, query, headers, body }, ctx)
 // and expects { status, data } back.
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'fs';
 import path from 'path';
 import { randomUUID } from 'crypto';
 import { execFileSync } from 'child_process';
@@ -19,6 +19,7 @@ import { listStaffCashoutFacts, syncStaffCashoutFromReport } from '../reports/sy
 import { syncPromotionUsageRange } from '../reports/sync-promotion-usage';
 import { syncRevenueFactsRangeFromDailyRevenueSummary } from '../reports/sync-revenue-facts';
 import { reportRegistry } from '../reports/report-registry';
+import { GROUP_CONFIGS, type DisbursementGroupConfig, type DisbursementGroupId } from '../disbursements/group-config';
 import { createReportClient } from '../reports/client';
 import type { KitchenPluginContext } from './types-kitchen';
 import type {
@@ -282,6 +283,10 @@ type RevenueGrain = 'day' | 'week' | 'month';
 type RevenueFactRow = schema.RevenueFact & { locationName: string | null };
 type PayoutFactRow = {
   date: string;
+  /** Which nightly disbursement export this row came from. Provenance is the
+   *  file it was read out of — there is no group column in the CSV. */
+  groupId: DisbursementGroupId;
+  groupLabel: string;
   locationName: string;
   staffName: string;
   staffId: string | null;
@@ -331,6 +336,8 @@ type PayoutExportDiagnostics = {
 };
 type PayoutLocationTotalRow = {
   date: string;
+  groupId: DisbursementGroupId;
+  groupLabel: string;
   locationName: string;
   branchTotal: number;
   originalPayoutTotal: number;
@@ -405,7 +412,13 @@ type PromotionMatrixAccumulator = {
 
 const REPORTS_TIME_ZONE = 'America/New_York';
 const DEFAULT_REVENUE_ORGANISATION_ID = 11082;
-const PAYOUT_EXPORT_DIR = '/Users/hairmx/hmx-reports';
+const DEFAULT_PAYOUT_EXPORT_DIR = '/Users/hairmx/hmx-reports';
+
+// Read per call rather than frozen at import so tests can point the reader at a
+// fixture directory instead of the live payroll exports.
+function payoutExportDir(): string {
+  return process.env.HMX_PAYOUT_EXPORT_DIR || DEFAULT_PAYOUT_EXPORT_DIR;
+}
 
 // New-client referral aggregate is backed by a live Telerik report run (several
 // seconds), so results are TTL-cached per (team, range, org). New-client counts
@@ -700,9 +713,9 @@ function parseExportCsv(text: string): ExportCsvRow[] {
   }).filter((row) => row.staffId || row.transactionId || row.location);
 }
 
-function readPayoutExportForDate(date: string): { rows: PayoutFactRow[]; generatedAt: string | null } {
-  const csvPath = path.join(PAYOUT_EXPORT_DIR, `branch-deposits-${date}.csv`);
-  const diagnosticsPath = path.join(PAYOUT_EXPORT_DIR, `branch-deposits-${date}.diagnostics.json`);
+function readPayoutExportForDate(date: string, group: DisbursementGroupConfig): { rows: PayoutFactRow[]; generatedAt: string | null } {
+  const csvPath = path.join(payoutExportDir(), `${group.filePrefix}branch-deposits-${date}.csv`);
+  const diagnosticsPath = path.join(payoutExportDir(), `${group.filePrefix}branch-deposits-${date}.diagnostics.json`);
   if (!existsSync(csvPath)) return { rows: [], generatedAt: null };
 
   const csvRows = parseExportCsv(readFileSync(csvPath, 'utf8'));
@@ -752,6 +765,8 @@ function readPayoutExportForDate(date: string): { rows: PayoutFactRow[]; generat
         : null;
       return {
         date,
+        groupId: group.id,
+        groupLabel: group.label,
         locationName: row.location,
         staffName: [row.firstName, row.lastName].filter(Boolean).join(' ').trim(),
         staffId: row.staffId || null,
@@ -767,17 +782,87 @@ function readPayoutExportForDate(date: string): { rows: PayoutFactRow[]; generat
   };
 }
 
-function listPayoutFactsFromExports(filters: { startDate?: string | null; endDate?: string | null; locationName?: string | null } = {}): { rows: PayoutFactRow[]; lastExportedAt: string | null } {
+export function listDisbursementGroups(): DisbursementGroupConfig[] {
+  return Object.values(GROUP_CONFIGS);
+}
+
+function resolveGroupsFilter(groupId?: string | null): DisbursementGroupConfig[] {
+  const all = listDisbursementGroups();
+  if (!groupId) return all;
+  const match = all.find((group) => group.id === groupId);
+  return match ? [match] : [];
+}
+
+/**
+ * Weekend combine files, indexed by the dates they cover.
+ *
+ * The Sunday combine job merges Saturday + Sunday into one deposit per stylist
+ * and writes `<prefix>disbursements-weekend-<sat>-to-<sun>.csv`. There is no
+ * matching `branch-deposits-weekend-*`, so these are download artifacts only —
+ * the on-page rows still come from the two per-day exports. Both dates in a
+ * range map to the same file.
+ *
+ * Coverage is uneven by design (corp goes back to 2026-06-13, hmx-group only to
+ * 2026-07-25), so a date with no weekend file is normal, not an error.
+ */
+export type WeekendExportFile = { file: string; startDate: string; endDate: string };
+
+const WEEKEND_INDEX_TTL_MS = 60 * 1000;
+const WEEKEND_INDEX_CACHE = new Map<string, { at: number; byDate: Map<string, WeekendExportFile> }>();
+
+export function weekendExportsForGroup(group: DisbursementGroupConfig): Map<string, WeekendExportFile> {
+  // Keyed by directory too, so a test pointing HMX_PAYOUT_EXPORT_DIR at a
+  // fixture dir can't be served the live dir's index.
+  const cacheKey = `${payoutExportDir()}::${group.id}`;
+  const cached = WEEKEND_INDEX_CACHE.get(cacheKey);
+  if (cached && Date.now() - cached.at < WEEKEND_INDEX_TTL_MS) return cached.byDate;
+
+  const byDate = new Map<string, WeekendExportFile>();
+  // Anchored on the prefix so corp's empty prefix doesn't also swallow
+  // `hmxgroup-disbursements-weekend-*`.
+  const pattern = new RegExp(`^${group.filePrefix}disbursements-weekend-(\\d{4}-\\d{2}-\\d{2})-to-(\\d{4}-\\d{2}-\\d{2})\\.csv$`);
+  let names: string[] = [];
+  try {
+    names = readdirSync(payoutExportDir());
+  } catch {
+    names = [];
+  }
+  for (const name of names) {
+    const match = pattern.exec(name);
+    if (!match) continue;
+    const [, startDate, endDate] = match as unknown as [string, string, string];
+    const entry: WeekendExportFile = { file: name, startDate, endDate };
+    for (let cursor = startDate; cursor <= endDate; cursor = addDaysToDateOnly(cursor, 1)) {
+      byDate.set(cursor, entry);
+    }
+  }
+  WEEKEND_INDEX_CACHE.set(cacheKey, { at: Date.now(), byDate });
+  return byDate;
+}
+
+function listPayoutFactsFromExports(filters: { startDate?: string | null; endDate?: string | null; locationName?: string | null; groupId?: string | null } = {}): {
+  rows: PayoutFactRow[];
+  lastExportedAt: string | null;
+  lastExportedAtByGroup: Record<string, string | null>;
+} {
   const startDate = filters.startDate ? String(filters.startDate).slice(0, 10) : null;
   const endDate = filters.endDate ? String(filters.endDate).slice(0, 10) : null;
-  if (!startDate || !endDate) return { rows: [], lastExportedAt: null };
+  if (!startDate || !endDate) return { rows: [], lastExportedAt: null, lastExportedAtByGroup: {} };
 
   const rows: PayoutFactRow[] = [];
   let lastExportedAt: string | null = null;
-  for (let cursor = startDate; cursor <= endDate; cursor = addDaysToDateOnly(cursor, 1)) {
-    const loaded = readPayoutExportForDate(cursor);
-    lastExportedAt = mostRecentIso(lastExportedAt, loaded.generatedAt);
-    rows.push(...loaded.rows);
+  // Per-group freshness as well as the overall max: a stalled hmx-group export
+  // would otherwise be masked by a fresh corp one and read as up to date.
+  const lastExportedAtByGroup: Record<string, string | null> = {};
+  for (const group of resolveGroupsFilter(filters.groupId)) {
+    let groupLast: string | null = null;
+    for (let cursor = startDate; cursor <= endDate; cursor = addDaysToDateOnly(cursor, 1)) {
+      const loaded = readPayoutExportForDate(cursor, group);
+      groupLast = mostRecentIso(groupLast, loaded.generatedAt);
+      rows.push(...loaded.rows);
+    }
+    lastExportedAtByGroup[group.id] = groupLast;
+    lastExportedAt = mostRecentIso(lastExportedAt, groupLast);
   }
 
   const filtered = filters.locationName
@@ -786,11 +871,12 @@ function listPayoutFactsFromExports(filters: { startDate?: string | null; endDat
 
   filtered.sort((a, b) => {
     if (a.date !== b.date) return b.date.localeCompare(a.date);
+    if (a.groupId !== b.groupId) return a.groupId.localeCompare(b.groupId);
     if (a.locationName !== b.locationName) return a.locationName.localeCompare(b.locationName);
     return (b.netPayoutAmount || 0) - (a.netPayoutAmount || 0) || a.staffName.localeCompare(b.staffName);
   });
 
-  return { rows: filtered, lastExportedAt };
+  return { rows: filtered, lastExportedAt, lastExportedAtByGroup };
 }
 
 function resolvePluginFile(startDir: string, relativePath: string): string | null {
@@ -820,8 +906,8 @@ function computePayoutTotals(rows: PayoutFactRow[]) {
     garnishmentTotal += asNumber(row.garnishmentAmount);
     loanPaymentTotal += asNumber(row.loanPaymentAmount);
     if (row.date) dates.add(row.date);
-    if (row.locationName) branches.add(row.locationName);
-    if (row.staffName) stylists.add(`${row.date}::${row.locationName}::${row.staffName}`);
+    if (row.locationName) branches.add(`${row.groupId}::${row.locationName}`);
+    if (row.staffName) stylists.add(`${row.date}::${row.groupId}::${row.locationName}::${row.staffName}`);
     lastUpdatedAt = mostRecentIso(lastUpdatedAt, row.lastUpdatedAt || null);
   }
   return {
@@ -840,9 +926,11 @@ function computePayoutTotals(rows: PayoutFactRow[]) {
 function buildPayoutLocationTotals(rows: PayoutFactRow[]): PayoutLocationTotalRow[] {
   const buckets = new Map<string, PayoutLocationTotalRow>();
   for (const row of rows) {
-    const key = `${row.date}::${row.locationName}`;
+    const key = `${row.date}::${row.groupId}::${row.locationName}`;
     const bucket = buckets.get(key) || {
       date: row.date,
+      groupId: row.groupId,
+      groupLabel: row.groupLabel,
       locationName: row.locationName,
       branchTotal: 0,
       originalPayoutTotal: 0,
@@ -861,6 +949,7 @@ function buildPayoutLocationTotals(rows: PayoutFactRow[]): PayoutLocationTotalRo
   }
   return [...buckets.values()].sort((a, b) => {
     if (a.date !== b.date) return b.date.localeCompare(a.date);
+    if (a.groupId !== b.groupId) return a.groupId.localeCompare(b.groupId);
     return a.locationName.localeCompare(b.locationName);
   });
 }
@@ -3041,14 +3130,65 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       const endDate = requestedEnd || anchorEnd;
       const startDate = requestedStart || endDate;
       const locationName = cleanString(req.query.location || req.query.locationName);
-      const loaded = listPayoutFactsFromExports({ startDate, endDate, locationName });
+      const groupId = cleanString(req.query.group || req.query.groupId);
+      if (groupId && !Object.prototype.hasOwnProperty.call(GROUP_CONFIGS, groupId)) {
+        return apiError(400, 'UNKNOWN_GROUP', `Unknown group: ${groupId}`);
+      }
+      const loaded = listPayoutFactsFromExports({ startDate, endDate, locationName, groupId });
       const rows = loaded.rows.filter((row) => asNumber(row.originalPayoutAmount) > 0);
       const locationTotals = buildPayoutLocationTotals(rows);
       const totals = computePayoutTotals(rows);
-      return { status: 200, data: { startDate, endDate, locationName: locationName || null, rows, locationTotals, totals, lastSyncedAt: loaded.lastExportedAt } };
+      // Per (date, group) download availability, so the dashboard renders only
+      // links that resolve to a file on disk.
+      const exportFiles = resolveGroupsFilter(groupId).flatMap((group) => {
+        const weekendByDate = weekendExportsForGroup(group);
+        const entries: Array<{ date: string; groupId: string; daily: boolean; weekend: WeekendExportFile | null }> = [];
+        for (let cursor = startDate; cursor <= endDate; cursor = addDaysToDateOnly(cursor, 1)) {
+          entries.push({
+            date: cursor,
+            groupId: group.id,
+            daily: existsSync(path.join(payoutExportDir(), `${group.filePrefix}disbursements-${cursor}.csv`)),
+            weekend: weekendByDate.get(cursor) || null,
+          });
+        }
+        return entries;
+      });
+      return {
+        status: 200,
+        data: {
+          startDate,
+          endDate,
+          locationName: locationName || null,
+          groupId: groupId || null,
+          groups: resolveGroupsFilter(groupId).map((group) => ({ id: group.id, label: group.label })),
+          rows,
+          locationTotals,
+          totals,
+          exportFiles,
+          lastSyncedAt: loaded.lastExportedAt,
+          lastSyncedAtByGroup: loaded.lastExportedAtByGroup,
+        },
+      };
     } catch (error: any) {
       return apiError(500, 'DATABASE_ERROR', error?.message || 'Failed to read payout export facts');
     }
+  }
+
+  // Group registry for the read path. The dashboard's CSV download route needs
+  // filePrefix to resolve a filename; serving it from here keeps
+  // group-config.ts the single source of truth instead of copying prefixes
+  // into the dashboard.
+  if (req.path === '/payouts/groups' && req.method === 'GET') {
+    return {
+      status: 200,
+      data: {
+        groups: listDisbursementGroups().map((group) => ({
+          id: group.id,
+          label: group.label,
+          filePrefix: group.filePrefix,
+        })),
+      },
+    };
   }
 
   if (req.path === '/payouts/sync' && req.method === 'POST') {
@@ -3063,7 +3203,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
 
       const results: any[] = [];
       for (let cursor = startDate; cursor <= endDate; cursor = addDaysToDateOnly(cursor, 1)) {
-        const out = execFileSync('npx', ['tsx', scriptPath, `--date=${cursor}`, `--teamId=${teamId}`, `--organisationId=${DEFAULT_REVENUE_ORGANISATION_ID}`, `--outputDir=${PAYOUT_EXPORT_DIR}`], {
+        const out = execFileSync('npx', ['tsx', scriptPath, `--date=${cursor}`, `--teamId=${teamId}`, `--organisationId=${DEFAULT_REVENUE_ORGANISATION_ID}`, `--outputDir=${payoutExportDir()}`], {
           encoding: 'utf8',
           maxBuffer: 20 * 1024 * 1024,
         });
