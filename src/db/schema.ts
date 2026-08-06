@@ -253,6 +253,26 @@ export const revenueFacts = sqliteTable('revenue_facts', {
   pk: primaryKey({ columns: [t.teamId, t.locationId, t.date] }),
 }));
 
+// StaffWorkSummary report facts. Separate table rather than extra columns on
+// staff_performance_facts because it's a different report with its own sync
+// failure mode — one can be stale while the other is current.
+export const staffWorkSummaryFacts = sqliteTable('staff_work_summary_facts', {
+  teamId: text('team_id').notNull(),
+  locationName: text('location_name').notNull(),
+  staffName: text('staff_name').notNull(),
+  date: text('date').notNull(),
+  // Ratios — never sum these; see the range roll-up in GET /staff-performance.
+  salesPerHour: real('sales_per_hour'),
+  avgLengthMinutes: real('avg_length_minutes'),
+  // Aggregation weights.
+  scheduledMinutes: real('scheduled_minutes'),
+  workLessBreaksMinutes: real('work_less_breaks_minutes'),
+  daysWorked: real('days_worked'),
+  lastUpdatedAt: text('last_updated_at').notNull(),
+}, (t) => ({
+  pk: primaryKey({ columns: [t.teamId, t.locationName, t.staffName, t.date] }),
+}));
+
 export const staffPerformanceFacts = sqliteTable('staff_performance_facts', {
   teamId: text('team_id').notNull(),
   locationName: text('location_name').notNull(),
