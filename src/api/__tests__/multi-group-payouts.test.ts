@@ -117,7 +117,7 @@ describe('GET /payouts across disbursement groups', () => {
     const res = await payouts({ startDate: '2026-08-03', endDate: '2026-08-03', group: 'hmx-group' });
     expect(res.status).toBe(200);
     expect([...new Set(res.data.rows.map((r: any) => r.groupId))]).toEqual(['hmx-group']);
-    expect(res.data.groups).toEqual([{ id: 'hmx-group', label: 'HMX GROUP' }]);
+    expect(res.data.groups).toEqual([{ id: 'hmx-group', label: 'HMX Group' }]);
   });
 
   it('rejects an unknown group instead of silently returning everything', async () => {
@@ -182,8 +182,8 @@ describe('GET /payouts/groups', () => {
     )) as any;
     expect(res.status).toBe(200);
     expect(res.data.groups).toEqual([
-      { id: 'corp', label: 'CORP', filePrefix: '' },
-      { id: 'hmx-group', label: 'HMX GROUP', filePrefix: 'hmxgroup-' },
+      { id: 'corp', label: 'HMX', filePrefix: '' },
+      { id: 'hmx-group', label: 'HMX Group', filePrefix: 'hmxgroup-' },
     ]);
     expect(res.data.groups).toHaveLength(listDisbursementGroups().length);
   });

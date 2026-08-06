@@ -766,7 +766,7 @@ function readPayoutExportForDate(date: string, group: DisbursementGroupConfig): 
       return {
         date,
         groupId: group.id,
-        groupLabel: group.label,
+        groupLabel: group.displayLabel,
         locationName: row.location,
         staffName: [row.firstName, row.lastName].filter(Boolean).join(' ').trim(),
         staffId: row.staffId || null,
@@ -3160,7 +3160,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
           endDate,
           locationName: locationName || null,
           groupId: groupId || null,
-          groups: resolveGroupsFilter(groupId).map((group) => ({ id: group.id, label: group.label })),
+          groups: resolveGroupsFilter(groupId).map((group) => ({ id: group.id, label: group.displayLabel })),
           rows,
           locationTotals,
           totals,
@@ -3184,7 +3184,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       data: {
         groups: listDisbursementGroups().map((group) => ({
           id: group.id,
-          label: group.label,
+          label: group.displayLabel,
           filePrefix: group.filePrefix,
         })),
       },
