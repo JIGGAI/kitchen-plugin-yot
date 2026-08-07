@@ -2915,6 +2915,25 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       const organisationId = Number(cleanString(req.query.organisationId || req.query.org) || String(DEFAULT_REVENUE_ORGANISATION_ID));
       if (!Number.isFinite(organisationId)) return apiError(400, 'BAD_REQUEST', 'organisationId must be a number');
 
+      // `?only=work-summary` skips the StaffPerformance half.
+      //
+      // StaffWorkSummary rides this endpoint, which is right for the nightly
+      // job — same cadence, same day, one call. It is wrong for a backfill:
+      // staff_work_summary_facts only goes back as far as it has been synced
+      // (7 days when it was introduced), so catching it up to
+      // staff_performance_facts' history means re-running the performance
+      // report for every past date and rewriting rows that were already
+      // correct. That doubles the work and needlessly touches good data.
+      const onlyWorkSummary = cleanString(req.query.only) === 'work-summary';
+      if (onlyWorkSummary) {
+        const { sqlite: wsSqlite } = initializeDatabase(teamId);
+        const workSummary = await syncStaffWorkSummaryDay(wsSqlite, perfDb, teamId, date, organisationId, config);
+        return {
+          status: workSummary.error ? 502 : 200,
+          data: { ok: !workSummary.error, date, only: 'work-summary', workSummary },
+        };
+      }
+
       const params = {
         startDateIso: `${date}T00:00:00`,
         endDateIso: `${date}T00:00:00`,
