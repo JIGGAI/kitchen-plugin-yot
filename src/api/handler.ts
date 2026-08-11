@@ -859,6 +859,142 @@ async function syncStaffWorkSummaryDay(
   }
 }
 
+/**
+ * Pull StaffWorkSummary for a whole window and store YOT's own figure for it.
+ *
+ * This is the only correct source for a multi-day "Sales per hour". See
+ * db/migrations/0023 for why the per-day rows cannot be rolled up into one.
+ *
+ * Every window that gets computed is persisted — the nightly preset warm and
+ * an ad-hoc range a user picked land in the same table, so the second request
+ * for a given window is served from cache no matter which path filled it.
+ *
+ * Never throws, for the same reason syncStaffWorkSummaryDay doesn't: this runs
+ * detached from a request, and an unhandled rejection would take the process
+ * with it. The failure is recorded on the job row instead.
+ */
+export async function syncStaffWorkSummaryRange(
+  sqlite: ReturnType<typeof initializeDatabase>['sqlite'],
+  teamId: string,
+  startDate: string,
+  endDate: string,
+  organisationId: number,
+  config: YotConfig,
+): Promise<{ rowsWritten: number; error?: string }> {
+  const markJob = (status: string, extra: Record<string, unknown> = {}) => {
+    sqlite.prepare(
+      `INSERT INTO staff_work_summary_range_jobs
+         (team_id, start_date, end_date, status, started_at, finished_at, row_count, error)
+       VALUES (?,?,?,?,?,?,?,?)
+       ON CONFLICT (team_id, start_date, end_date) DO UPDATE SET
+         status = excluded.status,
+         finished_at = excluded.finished_at,
+         row_count = excluded.row_count,
+         error = excluded.error`,
+    ).run(
+      teamId, startDate, endDate, status, new Date().toISOString(),
+      (extra.finishedAt as string) ?? null,
+      (extra.rowCount as number) ?? null,
+      (extra.error as string) ?? null,
+    );
+  };
+
+  markJob('running');
+  try {
+    const client = createReportClient(config);
+    const r = reportRegistry.staffWorkSummary;
+    const params = {
+      startDateIso: `${startDate}T00:00:00`,
+      endDateIso: `${endDate}T23:59:59`,
+      organisationId,
+      locationId: null,
+      staffId: null,
+    };
+    const defs = await client.getParameters(r.reportType, r.buildParameterDiscovery(params, config.apiKey));
+    const inst = await client.createInstance(r.reportType, r.buildInstanceParams(params));
+    const doc = await client.createDocument(inst, r.preferredFormat);
+    await client.waitForDocument(inst, doc.documentId);
+    const file = await client.fetchDocument(inst, doc.documentId);
+    const parsed = r.parseDocument(file.buffer, defs);
+
+    const upsert = sqlite.prepare(
+      `INSERT INTO staff_work_summary_range_facts (
+        team_id, start_date, end_date, location_name, staff_name,
+        sales_per_hour, avg_length_minutes, scheduled_minutes,
+        work_less_breaks_minutes, days_worked, computed_at
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT (team_id, start_date, end_date, location_name, staff_name) DO UPDATE SET
+        sales_per_hour = excluded.sales_per_hour,
+        avg_length_minutes = excluded.avg_length_minutes,
+        scheduled_minutes = excluded.scheduled_minutes,
+        work_less_breaks_minutes = excluded.work_less_breaks_minutes,
+        days_worked = excluded.days_worked,
+        computed_at = excluded.computed_at`,
+    );
+
+    // Wipe first so a stylist who left YOT doesn't linger in a recomputed window.
+    sqlite.prepare(
+      'DELETE FROM staff_work_summary_range_facts WHERE team_id = ? AND start_date = ? AND end_date = ?',
+    ).run(teamId, startDate, endDate);
+
+    const now = new Date().toISOString();
+    let rowsWritten = 0;
+    for (const row of parsed.rows) {
+      if (!row.locationName || !row.staffName) continue;
+      upsert.run(
+        teamId, startDate, endDate, row.locationName, row.staffName,
+        row.salesPerHour, row.avgLengthMinutes, row.scheduledMinutes,
+        row.workLessBreaksMinutes, row.daysWorked, now,
+      );
+      rowsWritten += 1;
+    }
+    markJob('ready', { finishedAt: now, rowCount: rowsWritten });
+    return { rowsWritten };
+  } catch (error: any) {
+    const message = error?.message || String(error);
+    markJob('failed', { finishedAt: new Date().toISOString(), error: message });
+    return { rowsWritten: 0, error: message };
+  }
+}
+
+/**
+ * Windows currently being pulled in this process.
+ *
+ * The jobs table records status durably, but a second request arriving while
+ * the first is mid-pull would read 'running' and still need to know not to
+ * start its own. Kept on globalThis for the same reason the DB connections are
+ * (see src/db/index.ts): the gateway re-evaluates this module, and a
+ * module-local Set would be empty every time.
+ */
+const RANGE_INFLIGHT_KEY = '__yotWorkSummaryRangeInflight__';
+function rangeInflight(): Set<string> {
+  const g = globalThis as any;
+  return g[RANGE_INFLIGHT_KEY] || (g[RANGE_INFLIGHT_KEY] = new Set<string>());
+}
+
+/**
+ * Start a range pull in the background unless one is already running.
+ *
+ * Deliberately not awaited by the caller — the report takes minutes, far
+ * longer than a page load, so the request returns "computing" and the row
+ * lands for the next one.
+ */
+export function ensureRangeSyncStarted(
+  sqlite: ReturnType<typeof initializeDatabase>['sqlite'],
+  teamId: string,
+  startDate: string,
+  endDate: string,
+  organisationId: number,
+  config: YotConfig,
+): void {
+  const key = `${teamId}::${startDate}::${endDate}`;
+  const inflight = rangeInflight();
+  if (inflight.has(key)) return;
+  inflight.add(key);
+  void syncStaffWorkSummaryRange(sqlite, teamId, startDate, endDate, organisationId, config)
+    .finally(() => inflight.delete(key));
+}
+
 export function listDisbursementGroups(): DisbursementGroupConfig[] {
   return Object.values(GROUP_CONFIGS);
 }
@@ -2465,12 +2601,98 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
 
       /** Weight for one day's ratios: minutes actually worked, else days, else
        *  a nominal hour — so a stylist whose shift YOT never recorded still
-       *  contributes instead of vanishing from their own average. */
+       *  contributes instead of vanishing from their own average.
+       *
+       *  Still used for chair time (Avg Length), which IS an average this can
+       *  legitimately weight. It is no longer used for Sales per hour — see
+       *  the range lookup below. */
       const workSummaryWeightOf = (ws: WorkSummaryFact) => (
         Number(ws.workLessBreaksMinutes || 0) > 0
           ? Number(ws.workLessBreaksMinutes)
           : (Number(ws.daysWorked || 0) > 0 ? Number(ws.daysWorked) * 60 : 60)
       );
+
+      /* Sales per hour for the requested window, from YOT's own figure for
+       * that window — never rebuilt from the daily rows, which produces a
+       * different statistic (see db/migrations/0023).
+       *
+       * A single-day request needs no range pull: the daily row already IS
+       * YOT's value for that window. Anything longer is looked up by exact
+       * (start, end); a miss starts a background pull and reports 'computing'
+       * rather than showing a number we know to be wrong. Whatever gets
+       * computed is cached, so a repeat of the same window is instant however
+       * it was first filled — nightly preset warm or an ad-hoc range. */
+      const isSingleDay = startDate === endDate;
+      const rangeSalesPerHour = new Map<string, number | null>();
+      /* Same rows keyed by staff alone, for the location-keyed join's two
+       * known misses — the mirror of workSummaryByStaff on the daily path:
+       *
+       *   - StaffWorkSummary files a stylist under the shop they were
+       *     SCHEDULED at, StaffPerformance under where the SALE happened, so
+       *     anyone covering a second shop misses on location.
+       *   - The report's location column is sometimes a stylist's name rather
+       *     than a shop (283 of 6,543 rows; every World of Golf FL. row for
+       *     2026-08-01..09 is filed under "Alex Stanley"). Those rows carry a
+       *     correct rate against an unusable location.
+       *
+       * Only used when exactly one candidate exists. Two rows for one person
+       * means two shops with two different rates and no basis for picking, and
+       * a blank beats a coin toss. */
+      const rangeByStaff = new Map<string, Array<{ locationName: string; staffName: string; salesPerHour: number | null }>>();
+      let salesPerHourStatus: 'ready' | 'computing' | 'unavailable' = 'ready';
+      if (!isSingleDay) {
+        try {
+          const rangeRows = sqlite.prepare(
+            `SELECT location_name AS locationName, staff_name AS staffName, sales_per_hour AS salesPerHour
+               FROM staff_work_summary_range_facts
+              WHERE team_id = ? AND start_date = ? AND end_date = ?`,
+          ).all(teamId, startDate, endDate) as Array<{ locationName: string; staffName: string; salesPerHour: number | null }>;
+          if (rangeRows.length) {
+            for (const row of rangeRows) {
+              rangeSalesPerHour.set(tipsKey(row.locationName, row.staffName, ''), row.salesPerHour);
+              const staffKey = String(row.staffName || '').replace(/\s+/g, ' ').trim().toLowerCase();
+              rangeByStaff.set(staffKey, [...(rangeByStaff.get(staffKey) || []), row]);
+            }
+          } else {
+            const job = sqlite.prepare(
+              `SELECT status, error FROM staff_work_summary_range_jobs
+                WHERE team_id = ? AND start_date = ? AND end_date = ?`,
+            ).get(teamId, startDate, endDate) as { status?: string; error?: string } | undefined;
+            // A previous pull that failed is reported as unavailable rather
+            // than retried on every page load — the report outage that caused
+            // it is not going to clear inside one refresh.
+            if (job?.status === 'failed') {
+              salesPerHourStatus = 'unavailable';
+            } else {
+              salesPerHourStatus = 'computing';
+              const cfg = readYotConfig(teamId);
+              if (cfg) {
+                ensureRangeSyncStarted(
+                  sqlite, teamId, startDate, endDate,
+                  Number(cleanString(req.query.organisationId || req.query.org) || String(DEFAULT_REVENUE_ORGANISATION_ID)),
+                  cfg,
+                );
+              } else {
+                salesPerHourStatus = 'unavailable';
+              }
+            }
+          }
+        } catch {
+          // Table missing (pre-migration) — fall back to reporting the figure
+          // as unavailable rather than serving the old inflated roll-up.
+          salesPerHourStatus = 'unavailable';
+        }
+      }
+
+      /** This window's figure for one (shop, stylist): by location first, then
+       *  by name alone when the location-keyed join misses for one of the two
+       *  reasons noted on rangeByStaff. */
+      const rangeSalesPerHourFor = (locationName: string | null, staffName: string | null): number | null => {
+        const direct = rangeSalesPerHour.get(tipsKey(locationName, staffName, ''));
+        if (direct !== undefined) return direct;
+        const candidates = rangeByStaff.get(String(staffName || '').replace(/\s+/g, ' ').trim().toLowerCase());
+        return candidates?.length === 1 ? candidates[0].salesPerHour : null;
+      };
 
       const buckets = new Map<string, Acc>();
       let lastUpdatedAt: string | null = null;
@@ -2536,13 +2758,28 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
           hoursWorkedMinutes: a.hoursMinutes,
           hoursWorked: formatMinutesAsHours(a.hoursMinutes),
           totalPerHour: hours > 0 ? a.totalSalesValue / hours : null,
-          // Null (not zero) when no StaffWorkSummary row matched — unknown is
-          // not the same as "sold nothing per hour".
-          salesPerHour: a.salesPerHourWeight > 0 ? a.salesPerHourWeighted / a.salesPerHourWeight : null,
+          // Null (not zero) when unknown — an unmatched stylist has no
+          // recorded rate, and a zero would read as "sold nothing per hour".
+          //
+          // A single day uses YOT's value for that day; a longer window uses
+          // YOT's value for that window. Neither is derived from the other.
+          // While a window is still being pulled every row is null and the
+          // payload's salesPerHourStatus says why.
+          salesPerHour: isSingleDay
+            ? (a.salesPerHourWeight > 0 ? a.salesPerHourWeighted / a.salesPerHourWeight : null)
+            : rangeSalesPerHourFor(a.locationName, a.staffName),
           chairTimeMinutes: a.avgLengthWeight > 0 ? a.avgLengthWeighted / a.avgLengthWeight : null,
         };
       }).sort((a, b) => b.totalSalesValue - a.totalSalesValue);
-      return { status: 200, data: { ok: true, startDate, endDate, rowCount: rows.length, lastUpdatedAt, rows } };
+      return {
+        status: 200,
+        data: {
+          ok: true, startDate, endDate, rowCount: rows.length, lastUpdatedAt, rows,
+          // ready | computing | unavailable. Lets the page show that the
+          // column is being fetched rather than silently rendering blanks.
+          salesPerHourStatus,
+        },
+      };
     } catch (error: any) {
       return apiError(500, 'INTERNAL', error?.message || 'Failed to read staff performance facts');
     }
@@ -2551,6 +2788,29 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
   // POST /staff-performance/sync?date=YYYY-MM-DD (default today)
   // Pulls the YOT StaffPerformance_2121 report for a single day and upserts
   // per-(location, staff) facts. To sync a range, call once per day.
+  // POST /staff-work-summary/sync-range?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
+  // Pulls YOT's StaffWorkSummary for the whole window and stores its own
+  // Sales-per-hour for it. Runs to completion (minutes) — this is the cron
+  // path that warms the leaderboard presets. Ad-hoc windows take the
+  // background path from GET /staff-performance instead.
+  if (req.path === '/staff-work-summary/sync-range' && req.method === 'POST') {
+    const config = readYotConfig(teamId);
+    if (!config) return apiError(400, 'NOT_CONFIGURED', 'YOT apiKey not set for this team. POST /config first.');
+    const startDate = toDateOnlyInput(req.query.startDate || req.query.start);
+    const endDate = toDateOnlyInput(req.query.endDate || req.query.end);
+    if (!startDate || !endDate) return apiError(400, 'BAD_REQUEST', 'startDate and endDate required (YYYY-MM-DD)');
+    if (startDate > endDate) return apiError(400, 'BAD_REQUEST', 'startDate must not be after endDate');
+    const { sqlite } = initializeDatabase(teamId);
+    const organisationId = Number(
+      cleanString(req.query.organisationId || req.query.org) || String(DEFAULT_REVENUE_ORGANISATION_ID),
+    );
+    const result = await syncStaffWorkSummaryRange(sqlite, teamId, startDate, endDate, organisationId, config);
+    if (result.error) {
+      return apiError(502, 'WORK_SUMMARY_RANGE_FAILED', result.error);
+    }
+    return { status: 200, data: { ok: true, startDate, endDate, rowsWritten: result.rowsWritten } };
+  }
+
   if (req.path === '/staff-performance/sync' && req.method === 'POST') {
     const config = readYotConfig(teamId);
     if (!config) return apiError(400, 'NOT_CONFIGURED', 'YOT apiKey not set for this team. POST /config first.');
