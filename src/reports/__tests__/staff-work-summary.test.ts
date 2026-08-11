@@ -67,6 +67,39 @@ describe('parseStaffWorkSummaryWorkbook', () => {
     expect(result.rows[1].avgLengthMinutes).toBe(28);
   });
 
+  it('does not mistake a stylist with no mapped data for a location header', () => {
+    // Regression: the header test used to be "none of the five mapped columns
+    // has a value", so a stylist who worked no hours in the window became a
+    // location and swallowed everyone below them. On 2026-08-01..09 that filed
+    // all 13 World of Golf FL. stylists under "Alex  Stanley", whose only cell
+    // is "00m" of break time in column 8 — a column this adapter never reads.
+    const result = parse([
+      row({ 1: 'Name' }),
+      row({ 1: 'World of Golf FL.' }),
+      row({ 1: 'Alex  Stanley', 8: '00m' }),
+      row({ 1: 'Carson Galeti', 6: '65h, 0m', 9: '62h, 20m', 10: '8', 25: '1.55' }),
+    ]);
+    expect(result.locations).toEqual(['World of Golf FL.']);
+    expect(result.rows.map((r) => [r.locationName, r.staffName])).toEqual([
+      ['World of Golf FL.', 'Alex  Stanley'],
+      ['World of Golf FL.', 'Carson Galeti'],
+    ]);
+    // The data-less stylist still yields a row, just an empty one — dropping
+    // them would hide someone who was on the roster.
+    expect(result.rows[0].salesPerHour).toBeNull();
+    expect(result.rows[1].salesPerHour).toBe(1.55);
+  });
+
+  it('treats a row with nothing but a name as a location header', () => {
+    const result = parse([
+      row({ 1: 'Name' }),
+      row({ 1: 'Howell MI' }),
+      row({ 1: 'Nubian Colvin', 25: '2.13' }),
+    ]);
+    expect(result.locations).toEqual(['Howell MI']);
+    expect(result.rows).toHaveLength(1);
+  });
+
   it('assigns each stylist to the location header above them', () => {
     const result = parse([
       row({ 1: 'Name' }),

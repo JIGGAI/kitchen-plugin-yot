@@ -175,15 +175,21 @@ export function parseStaffWorkSummaryWorkbook(
     const workLessBreaksMinutes = parseDurationMinutes(row[COL.workLessBreaks]);
     const daysWorked = parseNumber(row[COL.daysWorked]);
 
-    const hasData = salesPerHour != null
-      || avgLengthMinutes != null
-      || scheduledMinutes != null
-      || workLessBreaksMinutes != null
-      || daysWorked != null;
-
-    // Alpha label with no numbers → a location header, same rule the
-    // StaffPerformance adapter uses.
-    if (!hasData) {
+    /* Location header vs staff row.
+     *
+     * This used to key off the five mapped columns being empty, which quietly
+     * turned a stylist into a location whenever they had no hours in the
+     * window — and then filed every stylist below them under that person's
+     * name. On 2026-08-01..09 that put all 13 World of Golf FL. stylists under
+     * "Alex  Stanley", who shows only "00m" of break time in column 8; 283 of
+     * 6,543 rows across the retained history had a person in the location
+     * column for the same reason.
+     *
+     * The structural difference is that a header carries nothing but its name,
+     * while a staff row always carries something somewhere — even a stylist
+     * who only clocked a break. So test every column, not the mapped five. */
+    const hasAnyDataCell = row.some((cell, i) => i !== COL.label && cleanString(cell) != null);
+    if (!hasAnyDataCell) {
       currentLocation = label;
       if (!locations.includes(label)) locations.push(label);
       continue;
