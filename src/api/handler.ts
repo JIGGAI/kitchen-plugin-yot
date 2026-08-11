@@ -873,6 +873,9 @@ async function syncStaffWorkSummaryDay(
  * detached from a request, and an unhandled rejection would take the process
  * with it. The failure is recorded on the job row instead.
  */
+/** Document-poll ceiling for a range pull: 1600 × 1.5s ≈ 40 minutes. */
+const RANGE_REPORT_MAX_POLLS = 1600;
+
 export async function syncStaffWorkSummaryRange(
   sqlite: ReturnType<typeof initializeDatabase>['sqlite'],
   teamId: string,
@@ -901,21 +904,63 @@ export async function syncStaffWorkSummaryRange(
 
   markJob('running');
   try {
-    const client = createReportClient(config);
+    const client = createReportClient(config, { maxPolls: RANGE_REPORT_MAX_POLLS });
     const r = reportRegistry.staffWorkSummary;
-    const params = {
-      startDateIso: `${startDate}T00:00:00`,
-      endDateIso: `${endDate}T23:59:59`,
-      organisationId,
-      locationId: null,
-      staffId: null,
-    };
-    const defs = await client.getParameters(r.reportType, r.buildParameterDiscovery(params, config.apiKey));
-    const inst = await client.createInstance(r.reportType, r.buildInstanceParams(params));
-    const doc = await client.createDocument(inst, r.preferredFormat);
-    await client.waitForDocument(inst, doc.documentId);
-    const file = await client.fetchDocument(inst, doc.documentId);
-    const parsed = r.parseDocument(file.buffer, defs);
+
+    /* One report per shop, not one for the whole org.
+     *
+     * Asked org-wide, this report has a hard cliff: it renders a 10-day window
+     * in 107s, and for anything around a month or longer it reports the
+     * document READY at ~303s and hands back an empty file — 3KB of chrome as
+     * XLSX, literally "\r\n" as CSV. Same 303s either way, so it is neither a
+     * format problem nor a poll budget we could raise our way out of; waiting
+     * longer does nothing because the document is already "ready".
+     *
+     * Asked one location at a time, the identical 31-day window that empties
+     * out org-wide returns 11 real rows in SIX seconds, and the full month
+     * across all 28 shops completes in 150s. So the fan-out is not a
+     * workaround for slowness — it sidesteps whatever the org-wide query
+     * degenerates into, and it is faster in absolute terms.
+     *
+     * Correctness is untouched: each pull still asks YOT for its own figure
+     * over the exact window. We split by shop, never by time — splitting by
+     * time is the very thing that produced the wrong numbers this all started
+     * with (see db/migrations/0023). */
+    const locationRows = sqlite.prepare(
+      `SELECT id, name FROM locations WHERE team_id = ? AND (active = 1 OR active IS NULL) ORDER BY name`,
+    ).all(teamId) as Array<{ id: string; name: string }>;
+    if (!locationRows.length) throw new Error('no active locations to pull');
+
+    const collected: Array<{
+      locationName: string; staffName: string; salesPerHour: number | null;
+      avgLengthMinutes: number | null; scheduledMinutes: number | null;
+      workLessBreaksMinutes: number | null; daysWorked: number | null;
+    }> = [];
+    const failedLocations: string[] = [];
+
+    for (const loc of locationRows) {
+      const params = {
+        startDateIso: `${startDate}T00:00:00`,
+        endDateIso: `${endDate}T23:59:59`,
+        organisationId,
+        locationId: Number(loc.id),
+        staffId: null,
+      };
+      try {
+        const defs = await client.getParameters(r.reportType, r.buildParameterDiscovery(params, config.apiKey));
+        const inst = await client.createInstance(r.reportType, r.buildInstanceParams(params));
+        const doc = await client.createDocument(inst, r.preferredFormat);
+        await client.waitForDocument(inst, doc.documentId);
+        const file = await client.fetchDocument(inst, doc.documentId);
+        collected.push(...r.parseDocument(file.buffer, defs).rows);
+      } catch (err: any) {
+        // One shop failing must not lose the other twenty-seven. The window is
+        // still written; the job records which shops are missing from it.
+        failedLocations.push(`${loc.name}: ${err?.message || err}`);
+      }
+    }
+
+    const parsed = { rows: collected };
 
     const upsert = sqlite.prepare(
       `INSERT INTO staff_work_summary_range_facts (
@@ -948,7 +993,33 @@ export async function syncStaffWorkSummaryRange(
       );
       rowsWritten += 1;
     }
-    markJob('ready', { finishedAt: now, rowCount: rowsWritten });
+    /* A pull that produced nothing is a failure, not an empty success.
+     *
+     * Recording zero rows as 'ready' makes it indistinguishable from "never
+     * pulled", and the miss branch in GET /staff-performance then starts a
+     * fresh pull on every page load — a multi-minute report job per view, for
+     * a window that just came back empty, showing "computing…" forever. That
+     * is exactly what the org-wide query used to produce on every month-plus
+     * window; the fan-out above fixes the cause, and this stays as the guard
+     * so any future cause surfaces instead of looping. */
+    if (rowsWritten === 0) {
+      const message = failedLocations.length
+        ? `every location failed — ${failedLocations[0]}`
+        : 'report returned no rows for this window';
+      markJob('failed', { finishedAt: now, rowCount: 0, error: message });
+      return { rowsWritten: 0, error: message };
+    }
+    /* Partial windows are kept, not discarded. Twenty-seven shops' worth of
+     * correct figures beats none, and the shops that failed already render the
+     * same "—" as a stylist the report does not cover. The job row names them
+     * so a partial window is diagnosable rather than merely incomplete. */
+    markJob('ready', {
+      finishedAt: now,
+      rowCount: rowsWritten,
+      error: failedLocations.length
+        ? `${failedLocations.length} of ${locationRows.length} locations failed: ${failedLocations.join('; ').slice(0, 400)}`
+        : null,
+    });
     return { rowsWritten };
   } catch (error: any) {
     const message = error?.message || String(error);
@@ -2804,11 +2875,35 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     const organisationId = Number(
       cleanString(req.query.organisationId || req.query.org) || String(DEFAULT_REVENUE_ORGANISATION_ID),
     );
-    const result = await syncStaffWorkSummaryRange(sqlite, teamId, startDate, endDate, organisationId, config);
-    if (result.error) {
-      return apiError(502, 'WORK_SUMMARY_RANGE_FAILED', result.error);
-    }
-    return { status: 200, data: { ok: true, startDate, endDate, rowsWritten: result.rowsWritten } };
+    /* Starts the pull and returns immediately rather than holding the request
+     * open for it.
+     *
+     * A month across every shop takes ~150s and a year will take longer, while
+     * Node's HTTP server abandons a request at 300s by default — so a
+     * synchronous version killed the caller's connection at five minutes no
+     * matter what timeout the caller set. Poll
+     * /staff-work-summary/range-status for the outcome. */
+    ensureRangeSyncStarted(sqlite, teamId, startDate, endDate, organisationId, config);
+    return { status: 202, data: { ok: true, startDate, endDate, status: 'running' } };
+  }
+
+  // GET /staff-work-summary/range-status?startDate=&endDate=
+  // The outcome of a range pull: running | ready | failed, or missing when no
+  // pull has ever been started for that window.
+  if (req.path === '/staff-work-summary/range-status' && req.method === 'GET') {
+    const startDate = toDateOnlyInput(req.query.startDate || req.query.start);
+    const endDate = toDateOnlyInput(req.query.endDate || req.query.end);
+    if (!startDate || !endDate) return apiError(400, 'BAD_REQUEST', 'startDate and endDate required (YYYY-MM-DD)');
+    const { sqlite } = initializeDatabase(teamId);
+    const job = sqlite.prepare(
+      `SELECT status, started_at AS startedAt, finished_at AS finishedAt, row_count AS rowCount, error
+         FROM staff_work_summary_range_jobs
+        WHERE team_id = ? AND start_date = ? AND end_date = ?`,
+    ).get(teamId, startDate, endDate) as Record<string, unknown> | undefined;
+    return {
+      status: 200,
+      data: { ok: true, startDate, endDate, ...(job ?? { status: 'missing' }) },
+    };
   }
 
   if (req.path === '/staff-performance/sync' && req.method === 'POST') {
