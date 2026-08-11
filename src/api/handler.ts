@@ -4633,6 +4633,94 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     }
   }
 
+  // ---- GET /sync-status ----
+  // sync_state answers "when did this last run". It does NOT answer "how much
+  // history does it hold", and that gap is exactly what let the stylist
+  // leaderboard show "—" for a whole month: staff_work_summary_facts had 7
+  // days of data while staff_performance_facts had 214, and nothing surfaced
+  // the difference. This joins each resource's freshness to its actual
+  // coverage.
+  if (req.path === '/sync-status' && req.method === 'GET') {
+    try {
+      const { db, sqlite } = initializeDatabase(teamId);
+      const state = db.select().from(schema.syncState).where(eq(schema.syncState.teamId, teamId)).all() as any[];
+
+      // Resource → the table and date expression that define its coverage.
+      // Reference data (locations, stylists, services, clients) has no date
+      // dimension; it reports row counts only rather than a fake range.
+      // `grain` decides whether "missing days" is a meaningful number.
+      // staff_retention_facts is one row per PERIOD (monthly windows), so
+      // counting absent calendar days there reports ~205 missing on a healthy
+      // table. A status report whose loudest number is a false alarm gets
+      // ignored, so period-grained sources report their span and leave the
+      // gap count null.
+      const COVERAGE: Record<string, { table: string; dateExpr: string; grain: 'day' | 'period' }> = {
+        revenue_facts: { table: 'revenue_facts', dateExpr: 'date', grain: 'day' },
+        staff_performance_facts: { table: 'staff_performance_facts', dateExpr: 'date', grain: 'day' },
+        staff_work_summary_facts: { table: 'staff_work_summary_facts', dateExpr: 'date', grain: 'day' },
+        staff_cashout_facts: { table: 'staff_cashout_facts', dateExpr: 'date', grain: 'day' },
+        staff_retention_facts: { table: 'staff_retention_facts', dateExpr: 'period_start', grain: 'period' },
+        location_coverage_facts: { table: 'location_coverage_facts', dateExpr: 'date', grain: 'day' },
+        appointments: { table: 'appointments', dateExpr: 'substr(starts_at,1,10)', grain: 'day' },
+        promotion_usage: { table: 'promotion_usage', dateExpr: 'substr(used_at,1,10)', grain: 'day' },
+      };
+      const ROW_ONLY: Record<string, string> = {
+        clients: 'clients', stylists: 'stylists', services: 'services', locations: 'locations',
+      };
+
+      const resources = state.map((row) => {
+        const resource = String(row.resource);
+        const out: Record<string, unknown> = {
+          resource,
+          lastSyncedAt: row.lastSyncedAt ?? null,
+          lastSuccessAt: row.lastSuccessAt ?? null,
+          lastError: row.lastError ?? null,
+          rowCount: row.rowCount ?? null,
+          coverage: null,
+        };
+        const cov = COVERAGE[resource];
+        if (cov) {
+          try {
+            const r = sqlite.prepare(
+              `SELECT min(${cov.dateExpr}) AS earliest, max(${cov.dateExpr}) AS latest,
+                      count(DISTINCT ${cov.dateExpr}) AS days, count(*) AS rows
+                 FROM ${cov.table} WHERE team_id = ?`,
+            ).get(teamId) as { earliest: string | null; latest: string | null; days: number; rows: number };
+            // spanDays is the calendar distance between the ends; `days` is how
+            // many of those actually hold data. A large gap between the two is
+            // the signal that a backfill never ran or a sync has been failing
+            // quietly.
+            let spanDays: number | null = null;
+            if (r.earliest && r.latest) {
+              const ms = Date.parse(`${r.latest}T00:00:00Z`) - Date.parse(`${r.earliest}T00:00:00Z`);
+              if (Number.isFinite(ms)) spanDays = Math.round(ms / 86400000) + 1;
+            }
+            out.coverage = {
+              grain: cov.grain,
+              earliest: r.earliest, latest: r.latest,
+              days: r.days, spanDays, rows: r.rows,
+              missingDays: cov.grain === 'day' && spanDays != null ? Math.max(0, spanDays - r.days) : null,
+            };
+          } catch {
+            out.coverage = null;   // table absent on an older DB
+          }
+        } else if (ROW_ONLY[resource]) {
+          try {
+            const r = sqlite.prepare(`SELECT count(*) AS rows FROM ${ROW_ONLY[resource]} WHERE team_id = ?`).get(teamId) as { rows: number };
+            out.coverage = { grain: 'reference', earliest: null, latest: null, days: null, spanDays: null, rows: r.rows, missingDays: null };
+          } catch {
+            out.coverage = null;
+          }
+        }
+        return out;
+      }).sort((a, b) => String(a.resource).localeCompare(String(b.resource)));
+
+      return { status: 200, data: { teamId, checkedAt: new Date().toISOString(), resources } };
+    } catch (error: any) {
+      return apiError(500, 'DATABASE_ERROR', error?.message || 'Failed to read sync status');
+    }
+  }
+
   if (req.path === '/sync-runs' && req.method === 'GET') {
     try {
       const { db } = initializeDatabase(teamId);
