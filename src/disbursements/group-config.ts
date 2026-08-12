@@ -93,9 +93,7 @@ export const GROUP_CONFIGS: Record<DisbursementGroupId, DisbursementGroupConfig>
     filePrefix: 'hmxgroup-',
     emailSubjectPrefix: 'HMX GROUP',
     emailTo: 'Miranda.hmx.corp@hairmx.net',
-    // On hold while Miranda and RJ verify the nightly file. Restore by adding
-    // back: 'deanna@hairmxgroup.com', 'linsey@hairmxgroup.com'
-    emailCc: ['rjdjohnston@gmail.com'],
+    emailCc: ['rjdjohnston@gmail.com', 'deanna@hairmxgroup.com', 'linsey@hairmxgroup.com'],
     garnishmentsEnabled: false,
     loansEnabled: false,
   },
