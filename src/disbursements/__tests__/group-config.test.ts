@@ -74,9 +74,9 @@ describe('hmx-group config', () => {
     expect(grp.loansEnabled).toBe(false);
   });
 
-  it('emails Miranda with RJ copied', () => {
+  it('emails Miranda with RJ and the HMX Group managers copied', () => {
     expect(grp.emailTo).toBe('Miranda.hmx.corp@hairmx.net');
-    expect(grp.emailCc).toEqual(['rjdjohnston@gmail.com']);
+    expect(grp.emailCc).toEqual(['rjdjohnston@gmail.com', 'deanna@hairmxgroup.com', 'linsey@hairmxgroup.com']);
     expect(grp.emailSubjectPrefix).toBe('HMX GROUP');
   });
 
