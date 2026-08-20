@@ -2,7 +2,7 @@ import { describe, expect, it, beforeEach } from 'vitest';
 import Database from 'better-sqlite3';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
 import * as schema from '../../db/schema';
-import { listAppointmentsForRequest } from '../list-appointments';
+import { listAppointmentsForRequest, AGGREGATE_COLUMNS } from '../list-appointments';
 
 // Schema mirrors db/migrations 0001 + 0003 + 0004 — only the columns the
 // list helper reads. Indexes intentionally omitted; tests run against tiny
@@ -306,5 +306,73 @@ describe('listAppointmentsForRequest', () => {
 
     expect(result.rows).toEqual([]);
     expect(result.total).toBe(0);
+  });
+});
+
+/* ---------------------------------------------------------------------------
+ * The aggregate projection
+ *
+ * Why this exists: the dashboard paged appointments 500 at a time and stopped
+ * after 100 pages, a silent 50,000-row ceiling. Every window past it was
+ * answered from its most recent 50,000 rows — "This year" was really the last
+ * seven weeks, with a headline card reading exactly 50,000 against a true
+ * 215,728. Fetching the full record instead measured 1.6GB for one build, so
+ * the ceiling could not simply be raised; the projection is what makes it
+ * affordable to remove.
+ * ------------------------------------------------------------------------- */
+
+describe('AGGREGATE_COLUMNS', () => {
+  it('carries every field the dashboard roll-ups group on', () => {
+    // Each name here is read by summarizeAppointments/summarizeStylists in
+    // hmx-dashboard. Dropping one silently changes a number rather than
+    // failing, so the contract is asserted rather than assumed.
+    for (const field of [
+      'locationId', 'clientId', 'staffId', 'stylistId', 'serviceId',
+      'serviceNameRaw', 'categoryName', 'startAt', 'startsAt',
+      'status', 'statusCode', 'statusDescription', 'syncedAt', 'updatedAtRemote',
+    ]) {
+      expect(AGGREGATE_COLUMNS, `AGGREGATE_COLUMNS is missing ${field}`).toHaveProperty(field);
+    }
+  });
+
+  it('leaves out the heavy columns that made the ceiling necessary', () => {
+    // raw is the full JSON payload; the notes and description fields are long
+    // free text. None is read by any aggregation.
+    for (const field of ['raw', 'clientNotes', 'descriptionHtml', 'descriptionText']) {
+      expect(AGGREGATE_COLUMNS, `${field} does not belong in the projection`).not.toHaveProperty(field);
+    }
+  });
+
+  it('returns the same rows as the full select, only narrower', () => {
+    db.insert(schema.appointments).values([
+      appt({ id: 'a', startAt: '2026-04-19T08:00:00', startsAt: '2026-04-19T08:00:00', clientId: 'c1', raw: '{"big":"payload"}' }),
+      appt({ id: 'b', startAt: '2026-04-20T08:00:00', startsAt: '2026-04-20T08:00:00', clientId: 'c2', raw: '{"big":"payload"}' }),
+    ]).run();
+
+    const full = listAppointmentsForRequest(db, TEAM, {}, { limit: 50, offset: 0 });
+    const slim = listAppointmentsForRequest(db, TEAM, {}, { limit: 50, offset: 0 }, undefined, AGGREGATE_COLUMNS);
+
+    // Same rows, same order, same total — the projection must not change which
+    // appointments are returned, only how much of each one is.
+    expect(slim.total).toBe(full.total);
+    expect(slim.rows.map((r) => r.id)).toEqual(full.rows.map((r) => r.id));
+    expect(slim.rows.map((r) => r.clientId)).toEqual(full.rows.map((r) => r.clientId));
+    // ...and it really is narrower.
+    expect(full.rows[0]).toHaveProperty('raw');
+    expect(slim.rows[0]).not.toHaveProperty('raw');
+  });
+
+  it('honours filters and paging identically to the full select', () => {
+    db.insert(schema.appointments).values([
+      appt({ id: 'a', startAt: '2026-04-19T08:00:00', startsAt: '2026-04-19T08:00:00', locationId: 'loc-1' }),
+      appt({ id: 'b', startAt: '2026-04-20T08:00:00', startsAt: '2026-04-20T08:00:00', locationId: 'loc-1' }),
+      appt({ id: 'c', startAt: '2026-04-21T08:00:00', startsAt: '2026-04-21T08:00:00', locationId: 'loc-2' }),
+    ]).run();
+
+    const filters = { locationId: 'loc-1' };
+    const full = listAppointmentsForRequest(db, TEAM, filters, { limit: 1, offset: 1 });
+    const slim = listAppointmentsForRequest(db, TEAM, filters, { limit: 1, offset: 1 }, undefined, AGGREGATE_COLUMNS);
+    expect(slim.total).toBe(2);
+    expect(slim.rows.map((r) => r.id)).toEqual(full.rows.map((r) => r.id));
   });
 });

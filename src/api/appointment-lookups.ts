@@ -38,7 +38,12 @@ export function buildAppointmentLookupsForRows(
   db: Db,
   teamId: string,
   rows: schema.Appointment[],
+  options: { includeClients?: boolean } = {},
 ): AppointmentLookupMaps {
+  // The aggregate projection never reads clientName or clientPhone, and this
+  // join is an `IN (...)` over a 185K-row table sized by the page. Skipping it
+  // is most of what makes a 20,000-row page cheaper than 40 pages of 500.
+  const includeClients = options.includeClients !== false;
   const locationsById = new Map<string, schema.Location>();
   const stylistsByScopedPrivateId = new Map<string, schema.Stylist>();
   const stylistsByPrivateId = new Map<string, schema.Stylist>();
@@ -58,7 +63,7 @@ export function buildAppointmentLookupsForRows(
   }
 
   const locationIds = uniqueIds(rows.map((r) => r.locationId));
-  const clientIds = uniqueIds(rows.map((r) => r.clientId));
+  const clientIds = includeClients ? uniqueIds(rows.map((r) => r.clientId)) : [];
   const stylistPrivateIds = uniqueIds([
     ...rows.map((r) => r.stylistId),
     ...rows.map((r) => r.staffId),
@@ -72,7 +77,7 @@ export function buildAppointmentLookupsForRows(
     for (const row of locations) locationsById.set(row.id, row);
   }
 
-  if (clientIds.length) {
+  if (includeClients && clientIds.length) {
     const clients = db.select().from(schema.clients)
       .where(and(eq(schema.clients.teamId, teamId), inArray(schema.clients.id, clientIds)))
       .all() as schema.Client[];
