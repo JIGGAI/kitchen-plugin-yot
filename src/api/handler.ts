@@ -9,7 +9,7 @@ import { execFileSync } from 'child_process';
 import { and, eq, sql } from 'drizzle-orm';
 import { initializeDatabase } from '../db';
 import * as schema from '../db/schema';
-import { listAppointmentsForRequest } from './list-appointments';
+import { listAppointmentsForRequest, AGGREGATE_COLUMNS } from './list-appointments';
 import { stylistsByLocationForRange } from './stylists-by-location';
 import { buildAppointmentLookupsForRows } from './appointment-lookups';
 import { characterizeClientPaging, extractAppointmentsRangeRows, fetchAppointmentsRange, fetchBusiness, fetchClients, fetchLocationServices, fetchLocationStaff, fetchLocations, fetchStaffProfile, ping } from '../drivers/yot-client';
@@ -111,11 +111,21 @@ function getTeamId(req: PluginRequest): string {
   return req.query.team || req.query.teamId || req.headers['x-team-id'] || 'default';
 }
 
-function parsePagination(query: Record<string, string | undefined>) {
-  const limit = Math.min(parseInt(query.limit || '50', 10) || 50, 500);
+function parsePagination(query: Record<string, string | undefined>, maxLimit = 500) {
+  const limit = Math.min(parseInt(query.limit || '50', 10) || 50, maxLimit);
   const offset = parseInt(query.offset || '0', 10) || 0;
   return { limit, offset };
 }
+
+/**
+ * Page ceiling for the slim aggregate projection.
+ *
+ * The 500-row default exists because a full appointment record is heavy. The
+ * aggregate projection carries 15 short columns and no client join, so it can
+ * be paged in bulk: a full year (215,726 rows) moves in 11 pages instead of
+ * 432, which is what makes an untruncated This-year view affordable at all.
+ */
+const AGGREGATE_PAGE_LIMIT = 20000;
 
 function readYotConfig(teamId: string): YotConfig | null {
   const { db } = initializeDatabase(teamId);
@@ -1897,6 +1907,38 @@ function findAppointmentService(row: schema.Appointment, lookups: AppointmentLoo
     if (scoped) return scoped;
   }
   return lookups.servicesByPrivateId.get(privateId) || null;
+}
+
+/**
+ * The aggregate projection: exactly the fields the dashboard's appointment
+ * aggregation reads, with the same fallback semantics as the full mapper.
+ *
+ * locationName, stylistName and serviceCategoryName still resolve through the
+ * lookup maps, because the aggregation groups on them. clientName/clientPhone
+ * do not, which is why the aggregate path skips loading clients entirely —
+ * that join was an `IN (...)` over a 185K-row table on every page.
+ */
+function mapAppointmentAggregateRecord(row: schema.Appointment, lookups: AppointmentLookupMaps) {
+  const location = row.locationId ? lookups.locationsById.get(row.locationId) : null;
+  const stylist = findAppointmentStylist(row, lookups);
+  const service = findAppointmentService(row, lookups);
+  return {
+    id: row.id,
+    locationId: row.locationId ?? null,
+    locationName: location?.name ?? null,
+    clientId: row.clientId ?? null,
+    staffId: row.staffId ?? null,
+    stylistId: row.stylistId ?? null,
+    stylistName: stylist?.fullName ?? normalizeFullName(stylist as any) ?? null,
+    serviceName: service?.name ?? row.serviceNameRaw ?? null,
+    serviceCategoryName: service?.categoryName ?? row.categoryName ?? null,
+    startsAt: row.startAt ?? row.startsAt ?? null,
+    status: row.status ?? null,
+    statusCode: row.statusCode ?? null,
+    statusDescription: row.statusDescription ?? null,
+    updatedAtRemote: row.updatedAtRemote ?? null,
+    syncedAt: row.syncedAt,
+  };
 }
 
 function mapAppointmentRecordWithLookups(row: schema.Appointment, lookups: AppointmentLookupMaps): AppointmentRecord {
@@ -4262,7 +4304,10 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
   if (req.path === '/appointments' && req.method === 'GET') {
     try {
       const { db } = initializeDatabase(teamId);
-      const { limit, offset } = parsePagination(req.query);
+      // view=aggregate returns the slim projection the dashboard's roll-ups
+      // need, and is the only view allowed to page in bulk.
+      const aggregate = cleanString(req.query.view) === 'aggregate';
+      const { limit, offset } = parsePagination(req.query, aggregate ? AGGREGATE_PAGE_LIMIT : 500);
       const search = cleanString(req.query.search || req.query.q);
       const filters = {
         locationId: cleanString(req.query.locationId || req.query.location),
@@ -4306,12 +4351,17 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
           }
         : undefined;
 
-      const { rows, total } = listAppointmentsForRequest(db, teamId, filters, { limit, offset }, searchPostFilter);
-      const lookups = buildAppointmentLookupsForRows(db, teamId, rows);
+      const { rows, total } = listAppointmentsForRequest(
+        db, teamId, filters, { limit, offset }, searchPostFilter,
+        aggregate ? AGGREGATE_COLUMNS : undefined,
+      );
+      const lookups = buildAppointmentLookupsForRows(db, teamId, rows, { includeClients: !aggregate });
       return {
         status: 200,
         data: {
-          data: rows.map((row) => mapAppointmentRecordWithLookups(row, lookups)),
+          data: aggregate
+            ? rows.map((row) => mapAppointmentAggregateRecord(row, lookups))
+            : rows.map((row) => mapAppointmentRecordWithLookups(row, lookups)),
           total,
           limit,
           offset,

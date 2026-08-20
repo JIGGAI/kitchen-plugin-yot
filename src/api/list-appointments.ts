@@ -21,6 +21,33 @@ export type AppointmentListResult = {
   total: number;
 };
 
+/**
+ * The columns the dashboard's appointment aggregation actually reads.
+ *
+ * Selecting all 44 columns costs ~3.6KB per mapped row, which is why the
+ * dashboard capped itself at 50,000 rows and silently truncated every window
+ * larger than that — a full year is 215,726 appointments and cost 1.6GB. None
+ * of the dropped columns (raw JSON, notes, description HTML, prices) is read
+ * by any aggregation; they exist for the appointment detail view.
+ */
+export const AGGREGATE_COLUMNS = {
+  id: schema.appointments.id,
+  locationId: schema.appointments.locationId,
+  clientId: schema.appointments.clientId,
+  staffId: schema.appointments.staffId,
+  stylistId: schema.appointments.stylistId,
+  serviceId: schema.appointments.serviceId,
+  serviceNameRaw: schema.appointments.serviceNameRaw,
+  categoryName: schema.appointments.categoryName,
+  startAt: schema.appointments.startAt,
+  startsAt: schema.appointments.startsAt,
+  status: schema.appointments.status,
+  statusCode: schema.appointments.statusCode,
+  statusDescription: schema.appointments.statusDescription,
+  updatedAtRemote: schema.appointments.updatedAtRemote,
+  syncedAt: schema.appointments.syncedAt,
+} as const;
+
 // Pushes filters into Drizzle WHERE clauses so the indexed
 // (team_id, start_at) / (team_id, location_id, start_at) /
 // (team_id, stylist_id, start_at) indexes carry the load. The previous
@@ -37,6 +64,7 @@ export function listAppointmentsForRequest(
   filters: AppointmentFilters,
   pagination: { limit: number; offset: number },
   searchPostFilter?: (rows: schema.Appointment[]) => schema.Appointment[],
+  columns?: Record<string, unknown>,
 ): AppointmentListResult {
   const conds = [eq(schema.appointments.teamId, teamId)];
 
@@ -91,7 +119,9 @@ export function listAppointmentsForRequest(
     .get() as { c: number } | undefined;
   const total = Number(totalRow?.c ?? 0);
 
-  const rows = db.select().from(schema.appointments)
+  const rows = (columns
+    ? db.select(columns).from(schema.appointments)
+    : db.select().from(schema.appointments))
     .where(whereClause)
     .orderBy(desc(schema.appointments.startAt))
     .limit(pagination.limit)

@@ -282,3 +282,37 @@ describe('buildAppointmentLookupsForRows', () => {
     expect(lookups.clientsById.get('c-1')?.fullName).toBe('Repeated Client');
   });
 });
+
+describe('the aggregate projection skips the client join', () => {
+  it('does not load clients when includeClients is false', () => {
+    // The client join is an `IN (...)` over a 185K-row table, sized by the
+    // page. It is most of what made a 20,000-row page expensive, and the
+    // aggregate projection reads neither clientName nor clientPhone.
+    insertClient(sqlite, { id: 'c-1', teamId: TEAM, fullName: 'A Client' });
+    insertLocation(sqlite, { id: 'loc-1', teamId: TEAM, name: 'Southgate MI' });
+    insertStylist(sqlite, { id: 'r1', teamId: TEAM, privateId: 'sty-A', fullName: 'A Stylist' });
+    insertService(sqlite, { id: 'sv1', teamId: TEAM, privateId: 'svc-A', name: 'Haircut' });
+
+    const rows = [{
+      clientId: 'c-1', locationId: 'loc-1', stylistId: 'sty-A', serviceId: 'svc-A',
+    } as schema.Appointment];
+
+    const withClients = buildAppointmentLookupsForRows(db, TEAM, rows);
+    expect(withClients.clientsById.size).toBe(1);
+
+    const withoutClients = buildAppointmentLookupsForRows(db, TEAM, rows, { includeClients: false });
+    expect(withoutClients.clientsById.size).toBe(0);
+
+    // Everything the aggregation DOES group on still resolves, so skipping
+    // clients cannot change a grouped number.
+    expect(withoutClients.locationsById.get('loc-1')?.name).toBe('Southgate MI');
+    expect(withoutClients.stylistsByPrivateId.get('sty-A')?.fullName).toBe('A Stylist');
+    expect(withoutClients.servicesByPrivateId.get('svc-A')?.name).toBe('Haircut');
+  });
+
+  it('still loads clients by default, for the appointment detail view', () => {
+    insertClient(sqlite, { id: 'c-1', teamId: TEAM, fullName: 'A Client' });
+    const rows = [{ clientId: 'c-1' } as schema.Appointment];
+    expect(buildAppointmentLookupsForRows(db, TEAM, rows, {}).clientsById.size).toBe(1);
+  });
+});
