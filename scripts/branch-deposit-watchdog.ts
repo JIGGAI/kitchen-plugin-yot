@@ -4,7 +4,7 @@
 // watchdog.plist (1h after the export cron). Reads
 // /Users/hairmx/hmx-reports/<prefix>branch-deposits-<date>.{csv,diagnostics.json}
 // for the selected --group (default corp; see src/disbursements/group-config.ts)
-// and emails rjdjohnston@gmail.com from govna.assistant@gmail.com when
+// and emails the configured alert recipients from govna.assistant@gmail.com when
 // any of these conditions trip:
 //
 //   1. CSV file missing for the target date
@@ -38,7 +38,7 @@ import type { RosterCollision } from '../src/disbursements/roster-collisions';
 const NEW_YORK_TZ = 'America/New_York';
 const EXPORT_DIR = '/Users/hairmx/hmx-reports';
 const FROM_ACCOUNT = 'govna.assistant@gmail.com';
-const TO_ADDR = 'rjdjohnston@gmail.com';
+const DEFAULT_ALERT_TO = 'rjdjohnston@gmail.com';
 const LOG_PATH = `${process.env.HOME || ''}/.openclaw/logs/cron/branch-deposit-watchdog.log`;
 
 type Args = {
@@ -74,16 +74,24 @@ function log(line: string) {
   console.log(line);
 }
 
-function sendEmail(subject: string, body: string, dryRun: boolean) {
+function alertRecipients(group: DisbursementGroupConfig): string[] {
+  if (group.id === 'hmx-group') {
+    return [group.emailTo, ...group.emailCc];
+  }
+  return [DEFAULT_ALERT_TO];
+}
+
+function sendEmail(group: DisbursementGroupConfig, subject: string, body: string, dryRun: boolean) {
+  const recipients = alertRecipients(group);
   if (dryRun) {
-    log(`DRY-RUN would send email\n  to: ${TO_ADDR}\n  from: ${FROM_ACCOUNT}\n  subject: ${subject}\n--- body ---\n${body}\n--- end ---`);
+    log(`DRY-RUN would send email\n  to: ${recipients.join(', ')}\n  from: ${FROM_ACCOUNT}\n  subject: ${subject}\n--- body ---\n${body}\n--- end ---`);
     return;
   }
   execFileSync('gog', [
     'gmail', 'send',
     '--account', FROM_ACCOUNT,
     '--from', FROM_ACCOUNT,
-    '--to', TO_ADDR,
+    '--to', recipients.join(','),
     '--subject', subject,
     '--body', body,
     '--no-input',
@@ -149,6 +157,7 @@ async function main() {
   if (!existsSync(csvPath)) {
     log(`MISSING ${csvPath}`);
     sendEmail(
+      args.group,
       `[${args.group.emailSubjectPrefix}] Branch deposit export missing for ${args.targetDate}`,
       `The nightly Branch deposit export (21:00 ET) did not produce:
 ${csvPath}
@@ -193,6 +202,7 @@ Watchdog log: ${LOG_PATH}`,
       : `the disbursements email status was "${diag.disbursementsEmailStatus}"`;
     log(`NOT-SENT target=${args.targetDate} emailStatus=${diag.disbursementsEmailStatus} dryRun=${!!diag.dryRun}`);
     sendEmail(
+      args.group,
       `[${args.group.emailSubjectPrefix}] Branch deposit NOT SENT for ${args.targetDate}`,
       `The Branch deposit files for ${args.targetDate} exist, but ${reason}.
 
@@ -258,7 +268,7 @@ ${sections.join('\n\n')}
 
 Diagnostics: ${diagPath}
 Watchdog log: ${LOG_PATH}`;
-  sendEmail(subject, body, args.dryRun);
+  sendEmail(args.group, subject, body, args.dryRun);
   log(`email sent: ${summaryBits.join('; ')}`);
 }
 

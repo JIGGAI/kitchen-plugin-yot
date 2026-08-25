@@ -93,7 +93,7 @@ export const GROUP_CONFIGS: Record<DisbursementGroupId, DisbursementGroupConfig>
     filePrefix: 'hmxgroup-',
     emailSubjectPrefix: 'HMX GROUP',
     emailTo: 'Miranda.hmx.corp@hairmx.net',
-    emailCc: ['rjdjohnston@gmail.com', 'deanna@hairmxgroup.com', 'linsey@hairmxgroup.com'],
+    emailCc: ['deanna@hairmxgroup.com', 'linsey@hairmxgroup.com'],
     garnishmentsEnabled: false,
     loansEnabled: false,
   },
