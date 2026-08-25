@@ -37,6 +37,7 @@ async function main() {
   const startPage = startPageArg ? Number(startPageArg) : undefined;
 
   let totalSynced = 0;
+  let totalSkipped = 0;
   let lastResult: any = null;
   let complete = false;
 
@@ -52,7 +53,9 @@ async function main() {
       });
       lastResult = result;
       totalSynced += result.synced;
-      console.log(`chunk ${chunk}: synced=${result.synced} fromPage=${result.fromPage} lastPage=${result.lastPage} stop=${result.stoppedBecause} next=${result.nextPage ?? 'done'}`);
+      const skipNote = result.skippedPages?.length ? ` skipped=${result.skippedPages.length}` : '';
+      console.log(`chunk ${chunk}: synced=${result.synced} fromPage=${result.fromPage} lastPage=${result.lastPage} stop=${result.stoppedBecause} next=${result.nextPage ?? 'done'}${skipNote}`);
+      totalSkipped += result.skippedPages?.length ?? 0;
       if (result.complete) { complete = true; break; }
       if (result.stoppedBecause === 'error') break; // cursor preserved; next run resumes
     }
@@ -67,6 +70,7 @@ async function main() {
     complete,
     totalSynced,
     totalClients: lastResult?.totalClients ?? null,
+    skippedPages: totalSkipped,
     nextPage: lastResult?.nextPage ?? null,
     stoppedBecause: lastResult?.stoppedBecause ?? null,
     error: lastResult?.error ?? null,

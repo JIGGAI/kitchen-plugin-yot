@@ -4220,6 +4220,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         pageTimeoutMs: req.query.pageTimeoutMs != null && req.query.pageTimeoutMs !== '' ? Number(req.query.pageTimeoutMs) : undefined,
         pageRetries: req.query.pageRetries != null && req.query.pageRetries !== '' ? Number(req.query.pageRetries) : undefined,
         retryBackoffMs: req.query.retryBackoffMs != null && req.query.retryBackoffMs !== '' ? Number(req.query.retryBackoffMs) : undefined,
+        maxSkippedPages: req.query.maxSkippedPages != null && req.query.maxSkippedPages !== '' ? Number(req.query.maxSkippedPages) : undefined,
       });
       return { status: 200, data: result };
     } catch (error: any) {
@@ -4734,7 +4735,41 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         promotion_usage: { table: 'promotion_usage', dateExpr: 'substr(used_at,1,10)', grain: 'day' },
       };
       const ROW_ONLY: Record<string, string> = {
-        clients: 'clients', stylists: 'stylists', services: 'services', locations: 'locations',
+        stylists: 'stylists', services: 'services', locations: 'locations',
+      };
+
+      // `clients` used to sit in ROW_ONLY, reporting only a row count — and a
+      // healthy-looking 187,165 rows is exactly how a 10-week sync stall stayed
+      // invisible: the paginated /clients walk had parked on a page that 500s
+      // every attempt, and by 2026-08-25 roughly 47% of the clients who had
+      // visited in the trailing year were absent from the roster (and so
+      // unreachable by SMS marketing, which joins clients for the phone).
+      //
+      // Reference data has no date range, but it does have a coverage question:
+      // of the clients the appointments stream actually references, how many do
+      // we hold? That linkage number is the one that would have screamed.
+      const CLIENT_LINKAGE_WINDOW_DAYS = 365;
+      const clientLinkage = () => {
+        const since = new Date(Date.now() - CLIENT_LINKAGE_WINDOW_DAYS * 86_400_000).toISOString();
+        const r = sqlite.prepare(`
+          SELECT COUNT(*) AS referenced, SUM(CASE WHEN c.id IS NULL THEN 1 ELSE 0 END) AS missing
+          FROM (
+            SELECT DISTINCT a.client_id AS id
+            FROM appointments a
+            WHERE a.team_id = ? AND a.start_at >= ?
+              AND a.client_id IS NOT NULL AND a.client_id <> '' AND a.client_id <> '0'
+          ) a
+          LEFT JOIN clients c ON c.id = a.id
+        `).get(teamId, since) as { referenced: number; missing: number };
+        const referenced = Number(r?.referenced ?? 0);
+        const missing = Number(r?.missing ?? 0);
+        return {
+          windowDays: CLIENT_LINKAGE_WINDOW_DAYS,
+          referenced,
+          present: referenced - missing,
+          missing,
+          missingPct: referenced ? Math.round((missing / referenced) * 1000) / 10 : 0,
+        };
       };
 
       const resources = state.map((row) => {
@@ -4772,6 +4807,17 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
             };
           } catch {
             out.coverage = null;   // table absent on an older DB
+          }
+        } else if (resource === 'clients') {
+          try {
+            const rows = (sqlite.prepare('SELECT count(*) AS rows FROM clients WHERE team_id = ?').get(teamId) as { rows: number }).rows;
+            const linkage = clientLinkage();
+            out.coverage = {
+              grain: 'reference', earliest: null, latest: null, days: null, spanDays: null,
+              rows, missingDays: null, linkage,
+            };
+          } catch {
+            out.coverage = null;
           }
         } else if (ROW_ONLY[resource]) {
           try {

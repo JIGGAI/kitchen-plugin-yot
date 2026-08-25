@@ -77,6 +77,32 @@ export async function fetchClients(
   return [];
 }
 
+/**
+ * Fetch ONE client by id: GET /1/api/client/{id} (singular — the plural
+ * /clients/{id} form 404s).
+ *
+ * Why this exists: the paginated /clients walk is an OFFSET scan that degrades
+ * past ~page 2000 and starts returning 500s when a page crosses YOT's ~30s
+ * server-side query budget, so a full pass has not completed since 2026-05-11.
+ * Fetching by id is a keyed lookup — it returns in ~0.3s at any id — which lets
+ * us repair/maintain the roster from the client_ids the appointments sync
+ * already gives us, instead of re-walking the whole tenant.
+ *
+ * Returns null on 404 (deleted/merged client); throws on any other non-2xx so
+ * the caller can retry.
+ */
+export async function fetchClient(
+  config: YotConfig,
+  clientId: string | number,
+  opts: { timeoutMs?: number } = {},
+): Promise<Record<string, any> | null> {
+  const res = await yotFetch(config, `/client/${encodeURIComponent(String(clientId))}`, { timeoutMs: opts.timeoutMs });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`YOT /client/${clientId} failed: ${res.status}`);
+  const data = await res.json().catch(() => null);
+  return data && typeof data === 'object' ? (data as Record<string, any>) : null;
+}
+
 export async function fetchLocationServices(config: YotConfig, locationId: number): Promise<Record<string, any>[]> {
   const res = await yotFetch(config, `/${locationId}/services`);
   if (!res.ok) throw new Error(`YOT /${locationId}/services failed: ${res.status}`);
