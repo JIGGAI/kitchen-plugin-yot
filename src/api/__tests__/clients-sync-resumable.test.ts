@@ -76,17 +76,33 @@ describe('/clients/sync (resumable, streaming)', () => {
     expect(stateRow(teamId).resumePage).toBeNull();
   });
 
-  it('preserves the cursor at the failing page when a fetch errors persistently', async () => {
+  it('preserves the cursor at the failing page when skipping is disabled', async () => {
+    fetchClientsMock.mockImplementation(async (_config: any, { page }: { page: number }) => {
+      if (page === 1) return makePage(1);
+      throw new Error('timeout past page boundary');
+    });
+    const teamId = freshTeam();
+    const res: any = await sync(teamId, { maxPages: '10', retryBackoffMs: '0', maxSkippedPages: '0' });
+    expect(res.data).toMatchObject({ complete: false, lastPage: 1, nextPage: 2, stoppedBecause: 'error' });
+    expect(res.data.error).toMatch(/timeout/);
+    expect(stateRow(teamId).resumePage).toBe(2); // retry from the failed page next run
+    expect(clientCount(teamId)).toBe(25);         // page 1 persisted despite the later failure
+  });
+
+  it('by default steps over persistently failing pages instead of parking on one', async () => {
+    // The real failure this guards: YOT 500s deterministically on some deep
+    // pages, and stopping there pinned the cursor so the weekly walk spent
+    // every run re-failing the same page — zero progress for ten weeks.
     fetchClientsMock.mockImplementation(async (_config: any, { page }: { page: number }) => {
       if (page === 1) return makePage(1);
       throw new Error('timeout past page boundary');
     });
     const teamId = freshTeam();
     const res: any = await sync(teamId, { maxPages: '10', retryBackoffMs: '0' });
-    expect(res.data).toMatchObject({ complete: false, lastPage: 1, nextPage: 2, stoppedBecause: 'error' });
-    expect(res.data.error).toMatch(/timeout/);
-    expect(stateRow(teamId).resumePage).toBe(2); // retry from the failed page next run
-    expect(clientCount(teamId)).toBe(25);         // page 1 persisted despite the later failure
+    expect(res.data.skippedPages).toEqual([2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    expect(res.data).toMatchObject({ stoppedBecause: 'maxPages', lastPage: 10, nextPage: 11 });
+    expect(stateRow(teamId).resumePage).toBe(11);  // the walk moved on
+    expect(clientCount(teamId)).toBe(25);
   });
 
   it('retries a transient page error within the chunk and keeps going', async () => {
@@ -112,7 +128,7 @@ describe('/clients/sync (resumable, streaming)', () => {
       throw new Error('stuck');
     });
     const teamId = freshTeam();
-    const res: any = await sync(teamId, { maxPages: '10', pageRetries: '3', retryBackoffMs: '0' });
+    const res: any = await sync(teamId, { maxPages: '10', pageRetries: '3', retryBackoffMs: '0', maxSkippedPages: '0' });
     expect(res.data).toMatchObject({ stoppedBecause: 'error', lastPage: 1 });
     expect(attempts[2]).toBe(3); // tried 3 times before giving up
   });

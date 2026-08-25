@@ -38,7 +38,7 @@ function normalizeFullName(item: Record<string, any> | null | undefined): string
   return composed || null;
 }
 
-function readYotConfig(teamId: string): YotConfig | null {
+export function readYotConfig(teamId: string): YotConfig | null {
   const { db } = initializeDatabase(teamId);
   const rows = db
     .select()
@@ -55,6 +55,48 @@ function readYotConfig(teamId: string): YotConfig | null {
   }
 }
 
+/**
+ * Map one raw YOT client object to a `clients` row. Shared by the paginated
+ * walk and the by-id roster repair so both write identical shapes.
+ */
+export function mapClientRow(
+  item: Record<string, any>,
+  ctx: { teamId: string; now: string; locationIdRaw?: string | null },
+): schema.NewClient {
+  return {
+    id: String(item.id ?? item.privateId),
+    teamId: ctx.teamId,
+    firstName: cleanString(item.givenName ?? item.firstName),
+    lastName: cleanString(item.surname ?? item.lastName),
+    email: cleanString(item.emailAddress ?? item.email),
+    phone: cleanString(item.mobilePhone ?? item.homePhone ?? item.businessPhone ?? item.phone),
+    address: null,
+    tags: null,
+    lastVisitAt: cleanString(item.lastVisitAt),
+    totalVisits: typeof item.totalVisits === 'number' ? item.totalVisits : null,
+    totalSpend: typeof item.totalSpend === 'number' ? item.totalSpend : null,
+    raw: JSON.stringify(item),
+    syncedAt: ctx.now,
+    privateId: cleanString(item.privateId),
+    otherName: cleanString(item.otherName),
+    fullName: normalizeFullName(item),
+    homePhone: cleanString(item.homePhone),
+    mobilePhone: cleanString(item.mobilePhone),
+    businessPhone: cleanString(item.businessPhone),
+    emailAddress: cleanString(item.emailAddress),
+    birthday: cleanString(item.birthday),
+    gender: cleanString(item.gender),
+    active: typeof item.active === 'boolean' ? item.active : null,
+    street: cleanString(item.street),
+    suburb: cleanString(item.suburb),
+    state: cleanString(item.state),
+    postcode: cleanString(item.postcode),
+    country: cleanString(item.country),
+    sourceLocationId: ctx.locationIdRaw ?? null,
+    createdAtRemote: cleanString(item.createdDate ?? item.createdAt),
+  };
+}
+
 export type ClientsSyncOptions = {
   teamId: string;
   /** Explicit start page; otherwise resume from sync_state.resume_page, else page 1. */
@@ -65,6 +107,12 @@ export type ClientsSyncOptions = {
   pageTimeoutMs?: number | null;
   pageRetries?: number | null;
   retryBackoffMs?: number | null;
+  /**
+   * Pages that still fail after their retries are SKIPPED (cursor advances)
+   * rather than parking the walk, up to this many per chunk. Default 25.
+   * Set 0 to restore the old stop-on-first-bad-page behavior.
+   */
+  maxSkippedPages?: number | null;
 };
 
 export type ClientsSyncResult = {
@@ -76,6 +124,8 @@ export type ClientsSyncResult = {
   complete: boolean;
   stoppedBecause: string;
   totalClients: number;
+  /** Pages abandoned after retries and stepped over; each costs up to 25 clients until the next full pass. */
+  skippedPages: number[];
   startedAt: string;
   completedAt: string;
   error: string | null;
@@ -119,38 +169,8 @@ export async function runClientsSync(opts: ClientsSyncOptions): Promise<ClientsS
     db.run(sql`INSERT INTO sync_state (team_id, resource, last_synced_at) VALUES (${teamId}, 'clients', ${startedAt})
                ON CONFLICT(team_id, resource) DO UPDATE SET last_synced_at = ${startedAt}`);
 
-    const toRow = (item: Record<string, any>, now: string): schema.NewClient => ({
-      id: String(item.id ?? item.privateId),
-      teamId,
-      firstName: cleanString(item.givenName ?? item.firstName),
-      lastName: cleanString(item.surname ?? item.lastName),
-      email: cleanString(item.emailAddress ?? item.email),
-      phone: cleanString(item.mobilePhone ?? item.homePhone ?? item.businessPhone ?? item.phone),
-      address: null,
-      tags: null,
-      lastVisitAt: cleanString(item.lastVisitAt),
-      totalVisits: typeof item.totalVisits === 'number' ? item.totalVisits : null,
-      totalSpend: typeof item.totalSpend === 'number' ? item.totalSpend : null,
-      raw: JSON.stringify(item),
-      syncedAt: now,
-      privateId: cleanString(item.privateId),
-      otherName: cleanString(item.otherName),
-      fullName: normalizeFullName(item),
-      homePhone: cleanString(item.homePhone),
-      mobilePhone: cleanString(item.mobilePhone),
-      businessPhone: cleanString(item.businessPhone),
-      emailAddress: cleanString(item.emailAddress),
-      birthday: cleanString(item.birthday),
-      gender: cleanString(item.gender),
-      active: typeof item.active === 'boolean' ? item.active : null,
-      street: cleanString(item.street),
-      suburb: cleanString(item.suburb),
-      state: cleanString(item.state),
-      postcode: cleanString(item.postcode),
-      country: cleanString(item.country),
-      sourceLocationId: locationIdRaw,
-      createdAtRemote: cleanString(item.createdDate ?? item.createdAt),
-    });
+    const toRow = (item: Record<string, any>, now: string): schema.NewClient =>
+      mapClientRow(item, { teamId, now, locationIdRaw });
 
     // Upsert one page inside a transaction (fast); returns rows written.
     const upsertPage = (rows: Record<string, any>[], now: string): number => sqlite.transaction(() => {
@@ -174,6 +194,14 @@ export async function runClientsSync(opts: ClientsSyncOptions): Promise<ClientsS
 
     // Per-page retry so a transient YOT blip doesn't end the whole chunk.
     const PAGE_RETRIES = Math.max(1, Math.min(Number(opts.pageRetries) || 3, 10));
+    // Why skip rather than stop: YOT's OFFSET scan blows its ~30s server-side
+    // query budget on some deep pages and 500s DETERMINISTICALLY. Stopping left
+    // the cursor pinned to that page, and the weekly job spent every run
+    // re-failing it — the walk made zero progress from 2026-06-18 to 2026-08-25.
+    // Stepping over the page loses at most 25 clients (recoverable by the by-id
+    // repair, see repair-clients.ts) instead of losing the entire walk.
+    const MAX_SKIPPED = Math.max(0, Math.min(opts.maxSkippedPages == null ? 25 : Number(opts.maxSkippedPages) || 0, 500));
+    const skippedPages: number[] = [];
     const RETRY_BACKOFF_MS = Math.max(0, Math.min(opts.retryBackoffMs == null ? 750 : (Number(opts.retryBackoffMs) || 0), 10000));
     const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -191,9 +219,15 @@ export async function runClientsSync(opts: ClientsSyncOptions): Promise<ClientsS
         }
       }
       if (pageErr !== null) {
-        stoppedBecause = 'error';
         errMsg = pageErr;
-        break; // retries exhausted — leave resume cursor at this page for the next run
+        if (skippedPages.length < MAX_SKIPPED) {
+          skippedPages.push(page);
+          lastPage = page;
+          db.run(sql`UPDATE sync_state SET resume_page = ${page + 1} WHERE team_id = ${teamId} AND resource = 'clients'`);
+          continue; // step over the bad page; the walk keeps moving
+        }
+        stoppedBecause = 'error';
+        break; // too many bad pages in a row-ish — stop and preserve the cursor
       }
       if (!chunk!.length) { stoppedBecause = 'empty-page'; break; } // full pass complete
       const now = new Date().toISOString();
@@ -213,13 +247,13 @@ export async function runClientsSync(opts: ClientsSyncOptions): Promise<ClientsS
                last_success_at = ${complete ? completedAt : (stateRow?.lastSuccessAt ?? null)},
                last_error = ${errMsg} WHERE team_id = ${teamId} AND resource = 'clients'`);
     db.update(schema.syncRuns).set({
-      status: errMsg ? 'error' : 'success', completedAt,
+      status: stoppedBecause === 'error' ? 'error' : 'success', completedAt,
       rowsWritten: upserts, pageCount: Math.max(0, lastPage - startPage + 1),
-      notes: `startPage=${startPage}; lastPage=${lastPage}; stop=${stoppedBecause}; nextPage=${nextPage ?? 'done'}`,
+      notes: `startPage=${startPage}; lastPage=${lastPage}; stop=${stoppedBecause}; nextPage=${nextPage ?? 'done'}; skipped=${skippedPages.length}`,
       error: errMsg,
     }).where(eq(schema.syncRuns.id, runId)).run();
 
-    return { ok: true, synced: upserts, fromPage: startPage, lastPage, nextPage, complete, stoppedBecause, totalClients, startedAt, completedAt, error: errMsg };
+    return { ok: true, synced: upserts, fromPage: startPage, lastPage, nextPage, complete, stoppedBecause, totalClients, skippedPages, startedAt, completedAt, error: errMsg };
   } catch (error: any) {
     const errMsg = error?.message || String(error);
     const now = new Date().toISOString();

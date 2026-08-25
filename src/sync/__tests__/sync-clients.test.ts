@@ -69,3 +69,45 @@ describe('runClientsSync (out-of-process callable)', () => {
     expect(clientCount(teamId)).toBe(25);
   });
 });
+
+describe('poison-page handling', () => {
+  it('steps over a page that fails every retry instead of parking the cursor', async () => {
+    // Page 2 is deterministically broken (YOT 500s when its OFFSET scan blows
+    // the server-side query budget); 1 and 3 are fine, 4 ends the walk.
+    fetchClientsMock.mockImplementation(async (_c: any, { page }: { page: number }) => {
+      if (page === 2) throw new Error('YOT /clients failed: 500');
+      return page <= 3 ? makePage(page) : [];
+    });
+    const teamId = freshTeam();
+    const res = await runClientsSync({ teamId, maxPages: 10, pageRetries: 2, retryBackoffMs: 0 });
+
+    expect(res.skippedPages).toEqual([2]);
+    expect(res.complete).toBe(true);             // the walk still finished
+    expect(res.stoppedBecause).toBe('empty-page');
+    expect(clientCount(teamId)).toBe(50);        // pages 1 + 3, page 2's 25 lost
+  });
+
+  it('stops and preserves the cursor once too many pages fail', async () => {
+    fetchClientsMock.mockImplementation(async () => { throw new Error('YOT /clients failed: 500'); });
+    const teamId = freshTeam();
+    const res = await runClientsSync({ teamId, maxPages: 10, pageRetries: 1, retryBackoffMs: 0, maxSkippedPages: 3 });
+
+    expect(res.stoppedBecause).toBe('error');
+    expect(res.skippedPages).toHaveLength(3);
+    const { sqlite } = initializeDatabase(teamId);
+    const row = sqlite.prepare("SELECT resume_page FROM sync_state WHERE team_id=? AND resource='clients'").get(teamId) as any;
+    expect(row.resume_page).toBe(4);             // advanced past the 3 skipped, then held
+  });
+
+  it('maxSkippedPages=0 restores stop-on-first-bad-page', async () => {
+    fetchClientsMock.mockImplementation(async (_c: any, { page }: { page: number }) => {
+      if (page === 2) throw new Error('YOT /clients failed: 500');
+      return makePage(page);
+    });
+    const teamId = freshTeam();
+    const res = await runClientsSync({ teamId, maxPages: 10, pageRetries: 1, retryBackoffMs: 0, maxSkippedPages: 0 });
+    expect(res.stoppedBecause).toBe('error');
+    expect(res.skippedPages).toEqual([]);
+    expect(clientCount(teamId)).toBe(25);
+  });
+});
