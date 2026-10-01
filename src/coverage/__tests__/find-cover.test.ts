@@ -76,6 +76,13 @@ describe('findStaffAvailable', () => {
     expect(out[0].gapEnd).toBe('2026-05-05T11:00:00');
   });
 
+  it('drops staff explicitly marked unavailable by the roster', () => {
+    const out = findStaffAvailable(baseInputs({
+      unavailableStylistIds: new Set(['s1', 's2']),
+    }));
+    expect(out.map((o) => o.stylistId)).toEqual(['s3']);
+  });
+
   it('drops non-home-location staff in the same pool', () => {
     const out = findStaffAvailable(baseInputs({
       pool: 'same',

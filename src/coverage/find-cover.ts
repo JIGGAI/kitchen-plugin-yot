@@ -35,6 +35,7 @@ export type FindCoverInputs = {
   pool: FindCoverPool;
   stylists: StylistRecord[];
   scheduled: StylistInterval[];                            // across all locations today
+  unavailableStylistIds?: Set<string>;                      // absent/holiday rows from the roster
   appointments: Array<Interval & { stylistId: string }>;   // across all locations
   pastAppointmentsAtLocation: Map<string, string>;         // stylistId -> last ISO ts at this loc
 };
@@ -67,6 +68,7 @@ export function findStaffAvailable(input: FindCoverInputs): CoverCandidate[] {
   const out: CoverCandidate[] = [];
 
   for (const s of input.stylists) {
+    if (input.unavailableStylistIds?.has(s.id)) continue;
     if (input.pool === 'same' && s.homeLocationId !== input.locationId) continue;
 
     const myAppointments = input.appointments.filter((a) => a.stylistId === s.id);

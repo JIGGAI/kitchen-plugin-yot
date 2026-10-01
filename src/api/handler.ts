@@ -3296,7 +3296,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
   // Triggers the sync library. Wraps options in the same way the other
   // /sync endpoints do.
   if (req.path === '/staff-timecards/sync' && req.method === 'POST') {
-    const { db } = initializeDatabase(teamId);
+    const { db, sqlite } = initializeDatabase(teamId);
     try {
       const today = dateOnlyNow();
       const firstOfMonth = today.slice(0, 8) + '01';
@@ -3630,7 +3630,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
 
   // POST /staff-retention/sync?startDate=&endDate=&organisationId=
   if (req.path === '/staff-retention/sync' && req.method === 'POST') {
-    const { db } = initializeDatabase(teamId);
+    const { db, sqlite } = initializeDatabase(teamId);
     const today = dateOnlyNow();
     const firstOfMonth = today.slice(0, 8) + '01';
     const startDate = toDateOnlyInput(req.query.startDate || req.query.start) || firstOfMonth;
@@ -5665,7 +5665,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     const pool = (cleanString(req.query.pool) === 'same' ? 'same' : 'cross') as 'cross' | 'same';
     if (!locationId || !from || !to) return apiError(400, 'BAD_REQUEST', 'locationId, from, to required');
 
-    const { db } = initializeDatabase(teamId);
+    const { db, sqlite } = initializeDatabase(teamId);
     const { findStaffAvailable } = await import('../coverage/find-cover');
 
     // stylists.id is stored as `LOCATION:YOT_ID` (per-location scoped record),
@@ -5692,35 +5692,54 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     }
     const stylists = Array.from(stylistByYotId.values());
 
-    const apptsRaw = db.select().from(schema.appointments).where(eq(schema.appointments.teamId, teamId)).all() as schema.Appointment[];
-    const appointments = apptsRaw
-      .map((a) => ({
-        stylistId: (a.stylistId ?? a.staffId) as string | null,
-        startsAt: (a.startAt ?? a.startsAt) as string | null,
-        endsAt: (a.endAt ?? a.endsAt) as string | null,
-        locationId: a.locationId ?? null,
-      }))
-      .filter((a): a is { stylistId: string; startsAt: string; endsAt: string; locationId: string | null } =>
-        !!a.stylistId && !!a.startsAt && !!a.endsAt);
+    const appointments = sqlite.prepare(`
+      SELECT COALESCE(stylist_id, staff_id) AS stylistId,
+             COALESCE(start_at, starts_at) AS startsAt,
+             COALESCE(end_at, ends_at) AS endsAt
+        FROM appointments
+       WHERE team_id = ?
+         AND COALESCE(stylist_id, staff_id) IS NOT NULL
+         AND COALESCE(start_at, starts_at) IS NOT NULL
+         AND COALESCE(end_at, ends_at) IS NOT NULL
+         AND COALESCE(start_at, starts_at) < ?
+         AND COALESCE(end_at, ends_at) > ?
+    `).all(teamId, to, from) as Array<{ stylistId: string; startsAt: string; endsAt: string }>;
 
     const pastAppointmentsAtLocation = new Map<string, string>();
-    for (const a of appointments) {
-      if (a.locationId !== locationId) continue;
-      const prev = pastAppointmentsAtLocation.get(a.stylistId);
-      if (!prev || a.startsAt > prev) pastAppointmentsAtLocation.set(a.stylistId, a.startsAt);
+    const pastRows = sqlite.prepare(`
+      SELECT COALESCE(stylist_id, staff_id) AS stylistId,
+             MAX(COALESCE(start_at, starts_at)) AS lastWorkedHereAt
+        FROM appointments
+       WHERE team_id = ?
+         AND location_id = ?
+         AND COALESCE(stylist_id, staff_id) IS NOT NULL
+         AND COALESCE(start_at, starts_at) IS NOT NULL
+       GROUP BY COALESCE(stylist_id, staff_id)
+    `).all(teamId, locationId) as Array<{ stylistId: string; lastWorkedHereAt: string | null }>;
+    for (const row of pastRows) {
+      if (row.stylistId && row.lastWorkedHereAt) {
+        pastAppointmentsAtLocation.set(row.stylistId, row.lastWorkedHereAt);
+      }
     }
 
     // Roster: union all rostered shifts cached for the team on `from`'s date.
     const date = from.slice(0, 10);
-    const allCached = (db.select().from(schema.locationCoverageFacts).all() as schema.LocationCoverageFact[])
-      .filter((r) => r.teamId === teamId && r.date === date);
+    const allCached = sqlite.prepare(`
+      SELECT rostered_payload AS rosteredPayload
+        FROM location_coverage_facts
+       WHERE team_id = ?
+         AND date = ?
+    `).all(teamId, date) as Array<Pick<schema.LocationCoverageFact, 'rosteredPayload'>>;
     const scheduled: Array<{ stylistId: string; startsAt: string; endsAt: string }> = [];
+    const unavailableStylistIds = new Set<string>();
     for (const r of allCached) {
       try {
         const payload = JSON.parse(r.rosteredPayload) as { rows: Array<{ stylistId: string | null; status: string; startsAt: string | null; endsAt: string | null }> };
         for (const row of payload.rows) {
           if (row.status === 'scheduled' && row.stylistId && row.startsAt && row.endsAt) {
             scheduled.push({ stylistId: row.stylistId, startsAt: row.startsAt, endsAt: row.endsAt });
+          } else if ((row.status === 'absent' || row.status === 'holiday') && row.stylistId) {
+            unavailableStylistIds.add(row.stylistId);
           }
         }
       } catch { /* ignore malformed cache rows */ }
@@ -5734,7 +5753,8 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       pool,
       stylists,
       scheduled,
-      appointments: appointments.map((a) => ({ stylistId: a.stylistId, startsAt: a.startsAt, endsAt: a.endsAt })),
+      unavailableStylistIds,
+      appointments: appointments.map((a) => ({ stylistId: String(a.stylistId), startsAt: a.startsAt, endsAt: a.endsAt })),
       pastAppointmentsAtLocation,
     });
 
