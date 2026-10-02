@@ -4942,7 +4942,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
   //   required   = round(appts / ratio(dayOfWeek))
   //   lightHours = number of business hours during which the per-hour distinct
   //                stylist count fell below the day's `required` value
-  //   underCover = lightHours >= LIGHT_HOURS_RED_THRESHOLD (3)
+  //   underCover = lightHours >= LIGHT_HOURS_RED_THRESHOLD (6)
   // Locations with zero appointments across the entire window are omitted.
   // New-client referral sources, broken out by calendar month. For each month
   // overlapping the range we run YOT's ClientNew_2121 report (full calendar
@@ -5090,6 +5090,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     const { db, sqlite } = initializeDatabase(teamId);
     const { holidaysByDate } = await import('../coverage/sync-holidays');
     const { attachHolidayToCells } = await import('./coverage-holiday');
+    const { isUnderCover } = await import('./coverage-threshold');
 
     type ActualRow = { locationId: string; date: string; stylists: number };
     const actualRows = sqlite.prepare(
@@ -5128,7 +5129,6 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
           AND date BETWEEN ? AND ?`
     ).all(teamId, start, end) as CacheRow[];
 
-    const LIGHT_HOURS_RED_THRESHOLD = 3;
     type DayMeta = {
       lightHours: number;
       peakStylists: number;
@@ -5279,7 +5279,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
           ? (meta.peakStylists > 0 ? meta.peakStylists : meta.rosteredStylists)
           : (stylistsByDate.get(date) ?? 0);
         const lightHours = meta?.lightHours ?? 0;
-        const underCover = lightHours >= LIGHT_HOURS_RED_THRESHOLD;
+        const underCover = isUnderCover(lightHours);
         return { date, stylists, appts, required, lightHours, underCover, closed: false, hasRoster: !!meta };
       });
       return { locationId, days: attachHolidayToCells(out, holidaysByDate(sqlite, teamId, days, locationId)) };
