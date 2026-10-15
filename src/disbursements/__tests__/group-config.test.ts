@@ -50,6 +50,11 @@ describe('corp config preserves existing production behavior', () => {
     expect(corp.dispursementsTemplateTab).toBe('CSV BLANK MASTER ');
   });
 
+  it('keeps its BRANCH MASTER template tab and roster sheet label', () => {
+    expect(corp.branchMasterTemplateTab).toBe('BRANCH MASTER');
+    expect(corp.rosterSheetLabel).toBe('Branch Daily Totals');
+  });
+
   it('does not prefix its CSV-mirror tab (separate spreadsheet, no collision)', () => {
     expect(corp.dispursementsTabPrefix).toBe('');
   });
@@ -62,10 +67,14 @@ describe('hmx-group config', () => {
     expect(grp.filePrefix).toBe('hmxgroup-');
   });
 
-  it('uses its own roster tab and its own spreadsheet for per-day tabs', () => {
-    expect(grp.rosterTab).toBe('HAIR MX GROUP CSV MASTER');
-    expect(grp.rosterSheetId).toBe(GROUP_CONFIGS.corp.rosterSheetId);
-    expect(grp.dailyTotalsSheetId).toBe('1LsYEOuwjxmiCrbuTmAgD5-PTXxNL2gjCmKWaHhqxToc');
+  it('keeps its roster, per-day tabs and CSV mirror all on its own spreadsheet', () => {
+    // Moved off the Branch Daily Totals sheet on 2026-10-15: the customer
+    // maintains their roster on their own sheet.
+    expect(grp.rosterTab).toBe('HAIR MX GROUP STAFF CSV MASTER');
+    expect(grp.rosterSheetId).toBe('1LsYEOuwjxmiCrbuTmAgD5-PTXxNL2gjCmKWaHhqxToc');
+    expect(grp.rosterSheetId).not.toBe(GROUP_CONFIGS.corp.rosterSheetId);
+    expect(grp.rosterSheetLabel).toBe('HMX Group Branch Daily Totals');
+    expect(grp.dailyTotalsSheetId).toBe(grp.rosterSheetId);
     expect(grp.dispursementsSheetId).toBe(grp.dailyTotalsSheetId);
   });
 
@@ -84,8 +93,11 @@ describe('hmx-group config', () => {
     expect([grp.branchMasterFirstLocationRow, grp.branchMasterLastLocationRow, grp.branchMasterTotalRow]).toEqual([4, 7, 10]);
   });
 
-  it('uses a template tab name with no trailing space', () => {
-    expect(grp.dispursementsTemplateTab).toBe('CSV BLANK MASTER');
+  it('uses the customer-renamed template tabs, leading spaces included', () => {
+    // Both renamed by the customer on 2026-10-15; the leading space is part
+    // of each tab's real title and the lookups match by exact title.
+    expect(grp.dispursementsTemplateTab).toBe(' HAIR MX GROUP DISBURSEMENT CSV MASTER');
+    expect(grp.branchMasterTemplateTab).toBe(' HAIR MX GROUP BRANCH DAILY TOTALS MASTER');
   });
 
   it('prefixes its CSV-mirror tab so it cannot overwrite the daily tab', () => {

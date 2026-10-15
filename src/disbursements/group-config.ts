@@ -13,16 +13,24 @@ export type DisbursementGroupConfig = {
    *  names ("CORP") are internal shorthand — staff know the two payout runs as
    *  "HMX" and "HMX Group". */
   displayLabel: string;
-  /** Spreadsheet holding the roster tab. Both groups' rosters live on the
-   *  Branch Daily Totals sheet, which is why this is separate from
-   *  dailyTotalsSheetId. */
+  /** Spreadsheet holding the roster tab. Separate from dailyTotalsSheetId
+   *  because corp's roster lives on the Branch Daily Totals sheet while its
+   *  daily tabs do too — hmx-group keeps both on its own sheet. */
   rosterSheetId: string;
+  /** Human name of rosterSheetId, for the disbursements email prose. */
+  rosterSheetLabel: string;
   /** Roster tab: staff id, first, last, location. Defines this group's
    *  in-scope locations. */
   rosterTab: string;
   /** Spreadsheet receiving the per-day BRANCH MASTER tabs, and holding the
    *  BRANCH MASTER template. */
   dailyTotalsSheetId: string;
+  /** Template tab for the per-day BRANCH MASTER tabs: supplies the row-2
+   *  header labels and the location labels in rows
+   *  branchMasterFirstLocationRow..branchMasterLastLocationRow, and anchors
+   *  where each new daily tab is positioned. Read for content, so a rename
+   *  or an incomplete copy produces blank daily tabs rather than an error. */
+  branchMasterTemplateTab: string;
   /** Spreadsheet receiving the per-day CSV mirror tabs. */
   dispursementsSheetId: string;
   /** Template tab supplying the CSV mirror header. */
@@ -61,8 +69,10 @@ export const GROUP_CONFIGS: Record<DisbursementGroupId, DisbursementGroupConfig>
     label: 'CORP',
     displayLabel: 'HMX',
     rosterSheetId: BRANCH_DAILY_TOTALS_SHEET_ID,
+    rosterSheetLabel: 'Branch Daily Totals',
     rosterTab: 'CORP CSV MASTER',
     dailyTotalsSheetId: BRANCH_DAILY_TOTALS_SHEET_ID,
+    branchMasterTemplateTab: 'BRANCH MASTER',
     dispursementsSheetId: CORP_DISPURSEMENTS_SHEET_ID,
     // Trailing space is intentional — that is the tab's real name.
     dispursementsTemplateTab: 'CSV BLANK MASTER ',
@@ -81,11 +91,20 @@ export const GROUP_CONFIGS: Record<DisbursementGroupId, DisbursementGroupConfig>
     id: 'hmx-group',
     label: 'HMX GROUP',
     displayLabel: 'HMX Group',
-    rosterSheetId: BRANCH_DAILY_TOTALS_SHEET_ID,
-    rosterTab: 'HAIR MX GROUP CSV MASTER',
+    // Moved 2026-10-15 from 'HAIR MX GROUP CSV MASTER' on the Branch Daily
+    // Totals sheet: the customer maintains their roster on their own sheet.
+    rosterSheetId: HMX_GROUP_SHEET_ID,
+    rosterSheetLabel: 'HMX Group Branch Daily Totals',
+    rosterTab: 'HAIR MX GROUP STAFF CSV MASTER',
     dailyTotalsSheetId: HMX_GROUP_SHEET_ID,
+    // Leading space is intentional — that is the tab's real name. Renamed by
+    // the customer from 'BRANCH MASTER' on 2026-10-15.
+    branchMasterTemplateTab: ' HAIR MX GROUP BRANCH DAILY TOTALS MASTER',
     dispursementsSheetId: HMX_GROUP_SHEET_ID,
-    dispursementsTemplateTab: 'CSV BLANK MASTER',
+    // Leading space is intentional — that is the tab's real name. The customer
+    // renamed the template from 'CSV BLANK MASTER' on 2026-10-15; the export
+    // only uses it to position each day's CSV tab, so a mismatch is silent.
+    dispursementsTemplateTab: ' HAIR MX GROUP DISBURSEMENT CSV MASTER',
     dispursementsTabPrefix: 'CSV ',
     branchMasterFirstLocationRow: 4,
     branchMasterLastLocationRow: 7,
