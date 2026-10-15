@@ -38,6 +38,7 @@ import { sendGmail } from '../src/mail/google-mailer';
 import { normalizeLocation, normalizeText } from '../src/disbursements/normalize';
 import { otherGroupConfigs, resolveGroupConfig, type DisbursementGroupConfig } from '../src/disbursements/group-config';
 import { findRosterCollisions, type RosterCollision, type RosterEntry } from '../src/disbursements/roster-collisions';
+import { findRosterDuplicates, formatLocationDriftSection, formatRosterDuplicateSection, isLocationDrift, type LocationDriftRow, type RosterDuplicate } from '../src/disbursements/location-drift';
 
 type Args = {
   date: string;
@@ -183,6 +184,11 @@ type MatchDiagnostics = {
   zeroNetOmittedRows: ExportRow[];
   reportRowsWithPositiveAmountButNoBranchMatch: UnmatchedReportRow[];
   fuzzyMatchedRows: FuzzyMatchedRow[];
+  /** Matched stylists whose roster location differs from YOT's for the day.
+   *  Paid normally, but under the roster's shop — see location-drift.ts. */
+  locationDriftRows: LocationDriftRow[];
+  /** Same staff id or name on more than one row of this group's roster. */
+  rosterDuplicates: RosterDuplicate[];
   garnishmentRuleCount: number;
   garnishmentAdjustedRowCount: number;
   garnishmentPayoutRows: GarnishmentPayoutRow[];
@@ -409,6 +415,8 @@ function toDisbursementsCsv(rows: ExportRow[], date: string): string {
 
 function buildWatchdogEmailSection(args: {
   typoRows: FuzzyMatchedRow[];
+  locationDriftRows: LocationDriftRow[];
+  rosterDuplicates: RosterDuplicate[];
   inScopeUnmatched: UnmatchedReportRow[];
   loansPaidOff: LoanPaidOff[];
   // The running group's roster tab. Named explicitly in the prose so an
@@ -424,6 +432,11 @@ function buildWatchdogEmailSection(args: {
     const lines = args.typoRows.map((r) => `- ${roster} row ${r.csvMasterRowNumber} has "${r.csvMasterName}"; YOT has "${r.reportName}" (${r.locationName || '?'}). The export paid them via fuzzy match. Please fix the spelling on ${roster}.`);
     sections.push(`${roster} spelling drift vs YOT:\n${lines.join('\n')}`);
   }
+
+  const driftSection = formatLocationDriftSection(roster, args.locationDriftRows);
+  if (driftSection) sections.push(driftSection);
+  const duplicateSection = formatRosterDuplicateSection(roster, args.rosterDuplicates);
+  if (duplicateSection) sections.push(duplicateSection);
 
   if (args.inScopeUnmatched.length) {
     const lines = args.inScopeUnmatched.map((r) => `- ${r.staffName || '?'} @ ${r.locationName || '?'} earned $${r.bankToBankAmount} today (YOT bank-to-bank). They aren't on ${roster}, so they were not in tonight's deposit CSV. Action: pay them manually for today's amount, then add them to ${roster} (with their Branch STAFF ID) so tomorrow's export covers them.`);
@@ -1065,6 +1078,9 @@ async function main() {
 
   const exportRows: ExportRow[] = [];
   const fuzzyMatchedRows: FuzzyMatchedRow[] = [];
+  const locationDriftRows: LocationDriftRow[] = [];
+  const rosterDuplicates = findRosterDuplicates(masterRows);
+  for (const d of rosterDuplicates) console.error(`[duplicate] ${d.kind} ${d.value} on roster rows ${d.rows.map((r) => r.rowNumber).join(', ')}`);
   const unmatchedReport: UnmatchedReportRow[] = [];
   const garnishmentPayoutRows: GarnishmentPayoutRow[] = [];
   const loanPaymentsThisRun: LoanPaymentRow[] = [];
@@ -1135,6 +1151,19 @@ async function main() {
         reportName: yotRow.staffName || '',
         locationName: yotRow.locationName,
         matchKind: match.kind,
+      });
+    }
+
+    // Roster says one shop, YOT says another. The row is still paid (under
+    // the roster's shop) — recorded so the email + watchdog can name it.
+    if (isLocationDrift(match.row.location, yotRow.locationName)) {
+      locationDriftRows.push({
+        csvMasterRowNumber: match.row.rowNumber,
+        csvMasterName: `${match.row.firstName} ${match.row.lastName}`.trim(),
+        staffId: match.row.staffId,
+        csvMasterLocation: match.row.location,
+        reportLocation: yotRow.locationName || '',
+        bankToBankAmount: rawAmount,
       });
     }
 
@@ -1515,8 +1544,11 @@ async function main() {
   const inScopeUnmatchedRows = unmatchedReport.filter((r) => r.inScope);
   const unmatchedInScope = inScopeUnmatchedRows.length;
   const unmatchedOutOfScope = unmatchedReport.length - unmatchedInScope;
+  for (const r of locationDriftRows) console.error(`[drift] ${r.csvMasterName} rostered at "${r.csvMasterLocation}" but YOT paid $${r.bankToBankAmount} at "${r.reportLocation}"`);
   const watchdogEmailSection = buildWatchdogEmailSection({
     typoRows,
+    locationDriftRows,
+    rosterDuplicates,
     inScopeUnmatched: inScopeUnmatchedRows,
     loansPaidOff: loansPaidOffToday,
     rosterTab: args.group.rosterTab,
@@ -1596,6 +1628,8 @@ Sourced from ${args.group.rosterTab} on the ${args.group.rosterSheetLabel} sheet
     zeroNetOmittedRows: zeroNetRows,
     reportRowsWithPositiveAmountButNoBranchMatch: unmatchedReport,
     fuzzyMatchedRows,
+    locationDriftRows,
+    rosterDuplicates,
     garnishmentRuleCount: garnishmentRules.size,
     garnishmentAdjustedRowCount: garnishmentPayoutRows.length,
     garnishmentPayoutRows,
@@ -1636,6 +1670,8 @@ Sourced from ${args.group.rosterTab} on the ${args.group.rosterSheetLabel} sheet
     unmatchedInScopeCount: unmatchedInScope,
     unmatchedOutOfScopeCount: unmatchedOutOfScope,
     fuzzyMatchedRowCount: fuzzyMatchedRows.length,
+    locationDriftRowCount: locationDriftRows.length,
+    rosterDuplicateCount: rosterDuplicates.length,
     garnishmentRuleCount: garnishmentRules.size,
     garnishmentAdjustedRowCount: garnishmentPayoutRows.length,
     loanRuleCount: activeLoans.length,
