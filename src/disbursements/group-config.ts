@@ -23,6 +23,12 @@ export type DisbursementGroupConfig = {
   /** Spreadsheet receiving the per-day BRANCH MASTER tabs, and holding the
    *  BRANCH MASTER template. */
   dailyTotalsSheetId: string;
+  /** Template tab for the per-day BRANCH MASTER tabs: supplies the row-2
+   *  header labels and the location labels in rows
+   *  branchMasterFirstLocationRow..branchMasterLastLocationRow, and anchors
+   *  where each new daily tab is positioned. Read for content, so a rename
+   *  or an incomplete copy produces blank daily tabs rather than an error. */
+  branchMasterTemplateTab: string;
   /** Spreadsheet receiving the per-day CSV mirror tabs. */
   dispursementsSheetId: string;
   /** Template tab supplying the CSV mirror header. */
@@ -63,6 +69,7 @@ export const GROUP_CONFIGS: Record<DisbursementGroupId, DisbursementGroupConfig>
     rosterSheetId: BRANCH_DAILY_TOTALS_SHEET_ID,
     rosterTab: 'CORP CSV MASTER',
     dailyTotalsSheetId: BRANCH_DAILY_TOTALS_SHEET_ID,
+    branchMasterTemplateTab: 'BRANCH MASTER',
     dispursementsSheetId: CORP_DISPURSEMENTS_SHEET_ID,
     // Trailing space is intentional — that is the tab's real name.
     dispursementsTemplateTab: 'CSV BLANK MASTER ',
@@ -84,6 +91,9 @@ export const GROUP_CONFIGS: Record<DisbursementGroupId, DisbursementGroupConfig>
     rosterSheetId: BRANCH_DAILY_TOTALS_SHEET_ID,
     rosterTab: 'HAIR MX GROUP CSV MASTER',
     dailyTotalsSheetId: HMX_GROUP_SHEET_ID,
+    // Leading space is intentional — that is the tab's real name. Renamed by
+    // the customer from 'BRANCH MASTER' on 2026-10-15.
+    branchMasterTemplateTab: ' HAIR MX GROUP BRANCH DAILY TOTALS MASTER',
     dispursementsSheetId: HMX_GROUP_SHEET_ID,
     // Leading space is intentional — that is the tab's real name. The customer
     // renamed the template from 'CSV BLANK MASTER' on 2026-10-15; the export
