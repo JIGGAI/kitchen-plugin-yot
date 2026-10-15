@@ -85,7 +85,10 @@ export const GROUP_CONFIGS: Record<DisbursementGroupId, DisbursementGroupConfig>
     rosterTab: 'HAIR MX GROUP CSV MASTER',
     dailyTotalsSheetId: HMX_GROUP_SHEET_ID,
     dispursementsSheetId: HMX_GROUP_SHEET_ID,
-    dispursementsTemplateTab: 'CSV BLANK MASTER',
+    // Leading space is intentional — that is the tab's real name. The customer
+    // renamed the template from 'CSV BLANK MASTER' on 2026-10-15; the export
+    // only uses it to position each day's CSV tab, so a mismatch is silent.
+    dispursementsTemplateTab: ' HAIR MX GROUP DISBURSEMENT CSV MASTER',
     dispursementsTabPrefix: 'CSV ',
     branchMasterFirstLocationRow: 4,
     branchMasterLastLocationRow: 7,
