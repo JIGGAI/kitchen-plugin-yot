@@ -1025,7 +1025,9 @@ async function main() {
     crossGroupCollisions.length = 0;
     console.error(`[warn] cross-roster collision check failed: ${err?.message || err} — proceeding without it`);
   }
-  const collidingStaffIds = new Set(crossGroupCollisions.filter((c) => c.kind === 'staff-id').map((c) => c.value));
+  // Keyed on id + location: the same Branch staff id at a different location
+  // is a different person (ids are per Branch company, one per group).
+  const collidingStaffKeys = new Set(crossGroupCollisions.filter((c) => c.kind === 'staff-id').map((c) => `${c.value}|${c.location}`));
   const collidingLocations = new Set(crossGroupCollisions.filter((c) => c.kind === 'location').map((c) => c.value));
   for (const c of crossGroupCollisions) console.error(`[collision] ${c.detail}`);
 
@@ -1122,7 +1124,7 @@ async function main() {
     // bank-to-bank amount also loses their "FIRSTNAME OWES $X" YOT NOTES
     // annotation on the BRANCH MASTER daily tab — accepted, since the
     // collision itself is reported and needs manual handling anyway.
-    if (collidingStaffIds.has(String(match.row.staffId).trim()) || collidingLocations.has(normalizeLocation(match.row.location))) {
+    if (collidingStaffKeys.has(`${String(match.row.staffId).trim()}|${normalizeLocation(match.row.location)}`) || collidingLocations.has(normalizeLocation(match.row.location))) {
       continue;
     }
 
