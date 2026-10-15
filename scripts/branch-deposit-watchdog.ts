@@ -34,9 +34,12 @@ import { existsSync, readFileSync, appendFileSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { resolveGroupConfig, type DisbursementGroupConfig } from '../src/disbursements/group-config';
 import type { RosterCollision } from '../src/disbursements/roster-collisions';
+import { formatLocationDriftSection, formatRosterDuplicateSection, type LocationDriftRow, type RosterDuplicate } from '../src/disbursements/location-drift';
 
 const NEW_YORK_TZ = 'America/New_York';
-const EXPORT_DIR = '/Users/hairmx/hmx-reports';
+// HMX_PAYOUT_EXPORT_DIR lets a dry run read fixture diagnostics instead of
+// the live payroll files (same override the /daily-payouts API honours).
+const EXPORT_DIR = process.env.HMX_PAYOUT_EXPORT_DIR || '/Users/hairmx/hmx-reports';
 const FROM_ACCOUNT = 'govna.assistant@gmail.com';
 const DEFAULT_ALERT_TO = 'rjdjohnston@gmail.com';
 const LOG_PATH = `${process.env.HOME || ''}/.openclaw/logs/cron/branch-deposit-watchdog.log`;
@@ -131,6 +134,9 @@ type Diag = {
   masterRowCount?: number;
   reportRowsWithPositiveAmountButNoBranchMatch?: UnmatchedReportRow[];
   fuzzyMatchedRows?: FuzzyMatchedRow[];
+  /** Added 2026-10-15; absent on older diagnostics files. */
+  locationDriftRows?: LocationDriftRow[];
+  rosterDuplicates?: RosterDuplicate[];
   loansPaidOffToday?: LoanPaidOff[];
   // Cross-group roster safety (Task 5). `crossGroupCollisionCheckStatus`
   // is 'failed' when the other group's roster couldn't be read this run —
@@ -188,8 +194,10 @@ Watchdog log: ${LOG_PATH}`,
   const inScopeUnmatched = unmatched.filter((r) => r.inScope);
   const outOfScopeCount = unmatched.length - inScopeUnmatched.length;
   const loansPaidOff = diag.loansPaidOffToday || [];
+  const locationDrift = diag.locationDriftRows || [];
+  const rosterDuplicates = diag.rosterDuplicates || [];
 
-  log(`diagnostics: export=${diag.exportRowCount} typos=${typoRows.length} unmatched=${unmatched.length} (inScope=${inScopeUnmatched.length}, outOfScope=${outOfScopeCount}) loansPaidOff=${loansPaidOff.length} emailStatus=${diag.disbursementsEmailStatus ?? 'n/a'} dryRun=${diag.dryRun ?? 'n/a'}`);
+  log(`diagnostics: export=${diag.exportRowCount} typos=${typoRows.length} locationDrift=${locationDrift.length} rosterDuplicates=${rosterDuplicates.length} unmatched=${unmatched.length} (inScope=${inScopeUnmatched.length}, outOfScope=${outOfScopeCount}) loansPaidOff=${loansPaidOff.length} emailStatus=${diag.disbursementsEmailStatus ?? 'n/a'} dryRun=${diag.dryRun ?? 'n/a'}`);
 
   // The CSV + diagnostics can exist yet the real send never happened — a
   // manual --dry-run / --skip-email run, or the nightly send failed. These
@@ -230,6 +238,18 @@ Watchdog log: ${LOG_PATH}`,
     summaryBits.push(`${typoRows.length} typo${typoRows.length > 1 ? 's' : ''}`);
     const lines = typoRows.map((r) => `- ${args.group.rosterTab} row ${r.csvMasterRowNumber} has "${r.csvMasterName}"; YOT has "${r.reportName}" (${r.locationName || '?'}). The export paid them via fuzzy match. Please fix the spelling on ${args.group.rosterTab}.`);
     sections.push(`${args.group.rosterTab} spelling drift vs YOT:\n${lines.join('\n')}`);
+  }
+
+  const driftSection = formatLocationDriftSection(args.group.rosterTab, locationDrift);
+  if (driftSection) {
+    summaryBits.push(`${locationDrift.length} at wrong location`);
+    sections.push(driftSection);
+  }
+
+  const duplicateSection = formatRosterDuplicateSection(args.group.rosterTab, rosterDuplicates);
+  if (duplicateSection) {
+    summaryBits.push(`${rosterDuplicates.length} duplicate roster row${rosterDuplicates.length === 1 ? '' : 's'}`);
+    sections.push(duplicateSection);
   }
 
   if (inScopeUnmatched.length) {
