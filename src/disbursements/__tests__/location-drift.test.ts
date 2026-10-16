@@ -53,12 +53,22 @@ describe('formatLocationDriftSection', () => {
 
   it('names the roster tab, row, both shops, the amount and the fix', () => {
     const out = formatLocationDriftSection('HAIR MX GROUP STAFF CSV MASTER', [row])!;
-    expect(out).toContain('HAIR MX GROUP STAFF CSV MASTER row 38');
+    expect(out).toContain('(row 38)');
     expect(out).toContain('Kristin Baxter (staff id 7666)');
     expect(out).toContain('"World of Golf Fl."');
     expect(out).toContain('"Treaty Oaks St. Aug. FL."');
     expect(out).toContain('$162.00');
-    expect(out).toContain('move their row to the "Treaty Oaks St. Aug. FL." section');
+    expect(out).toContain('add a row for them under "Treaty Oaks St. Aug. FL." too');
+  });
+
+  it('says plainly that the stylist was paid, so the section does not read as a payout error', () => {
+    // 2026-10-15: the first corp email with this section was read as "people on the
+    // wrong stores" because the heading said "paid under the wrong shop".
+    const out = formatLocationDriftSection('CORP CSV MASTER', [row])!;
+    expect(out).toContain('paid correctly');
+    expect(out).toContain('They were paid in full');
+    expect(out).not.toContain('wrong shop');
+    expect(out).not.toContain('move their row to');
   });
 
   it('shows a positive amount for an owes-the-shop (negative) row', () => {
