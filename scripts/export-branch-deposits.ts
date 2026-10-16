@@ -145,6 +145,11 @@ type LoanPaymentRow = {
   withholding: number;     // amount taken this payment (may be less than loan.withholding if balance/deposit ran out)
   day: string;
   transactionId: string;
+  /** Shop of the deposit row the withholding came off, roster spelling.
+   *  Not written to the LOAN PAYMENTS tab; used to place the daily tab's
+   *  "WH $X LOAN" note under the right shop when a stylist has two rows.
+   *  Absent on rows read back from the sheet. */
+  location?: string;
 };
 
 type FuzzyMatchedRow = {
@@ -1329,6 +1334,7 @@ async function main() {
         withholding: actual,
         day: loan.day,
         transactionId: buildTransactionId(loan.lastName, loan.staffId, actual, args.date, csvLocation),
+        location: csvLocation,
       });
       loanCellUpdates.push({
         rowNumber: loan.rowNumber,
@@ -1488,7 +1494,9 @@ async function main() {
   // row. Matches the format the operator has been writing manually on
   // daily tabs.
   for (const p of loanPaymentsThisRun) {
-    const loc = exportRowLocByStaff.get(p.staffId);
+    // The row the withholding came off; a stylist with two shop rows has
+    // two entries in exportRows and exportRowLocByStaff keeps only the last.
+    const loc = p.location || exportRowLocByStaff.get(p.staffId);
     if (!loc) continue;
     const key = normalizeLocation(loc);
     if (!key) continue;
