@@ -32,13 +32,14 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { runStaffCashoutReport } from '../src/reports/run-staff-cashout';
+import { initializeDatabase } from '../src/db';
 import type { StaffCashoutRow } from '../src/reports/reports/staff-cashout';
 import * as sheetsApi from '../src/sheets/google-sheets';
 import { sendGmail } from '../src/mail/google-mailer';
 import { normalizeLocation, normalizeText } from '../src/disbursements/normalize';
 import { otherGroupConfigs, resolveGroupConfig, type DisbursementGroupConfig } from '../src/disbursements/group-config';
 import { findRosterCollisions, type RosterCollision, type RosterEntry } from '../src/disbursements/roster-collisions';
-import { findRosterDuplicates, isLocationDrift, type LocationDriftRow, type RosterDuplicate } from '../src/disbursements/location-drift';
+import { findRosterDuplicates, isLocationDrift, isSameShop, type LocationDriftRow, type RosterDuplicate } from '../src/disbursements/location-drift';
 
 type Args = {
   date: string;
@@ -64,7 +65,15 @@ type Args = {
   // email is sent (regardless of dryRun). Useful when you want to inspect
   // the file but not bother Miranda.
   skipEmail: boolean;
+  /** How the YOT staff cashout report is fetched. 'per-location' (default)
+   *  runs it once per active YOT location so a stylist who worked two shops
+   *  gets one row per shop. 'org-wide' is the single call the export made
+   *  until 2026-10-16: YOT rolls each stylist up to ONE shop in that mode
+   *  (Dawn Rowe: Shelby $37 + Sterling $30 came back as Sterling $67). */
+  reportMode: ReportMode;
 };
+
+type ReportMode = 'per-location' | 'org-wide';
 
 type MasterRow = {
   rowNumber: number;
@@ -136,6 +145,11 @@ type LoanPaymentRow = {
   withholding: number;     // amount taken this payment (may be less than loan.withholding if balance/deposit ran out)
   day: string;
   transactionId: string;
+  /** Shop of the deposit row the withholding came off, roster spelling.
+   *  Not written to the LOAN PAYMENTS tab; used to place the daily tab's
+   *  "WH $X LOAN" note under the right shop when a stylist has two rows.
+   *  Absent on rows read back from the sheet. */
+  location?: string;
 };
 
 type FuzzyMatchedRow = {
@@ -176,6 +190,9 @@ type MatchDiagnostics = {
    *  the collision list is empty by degradation, not by absence of overlap. */
   crossGroupCollisionCheckStatus: 'ok' | 'failed';
   generatedAt: string;
+  reportMode: 'per-location' | 'org-wide' | 'org-wide-fallback';
+  reportLocationCallCount: number;
+  reportLocationFailure: string | null;
   reportRowCount: number;
   masterRowCount: number;
   exportRowCount: number;
@@ -277,7 +294,76 @@ function parseArgs(argv: string[]): Args {
     dryRun: (map.get('dry-run') ?? 'false') !== 'false',
     testRecipient: map.get('test-recipient') || null,
     skipEmail: (map.get('skip-email') ?? 'false') !== 'false',
+    reportMode: parseReportMode(map.get('report-mode')),
   };
+}
+
+function parseReportMode(value: string | undefined): ReportMode {
+  const v = (value || 'per-location').trim();
+  if (v === 'per-location' || v === 'org-wide') return v;
+  throw new Error(`Invalid --report-mode value: ${value} (expected per-location or org-wide)`);
+}
+
+// ---------------------------------------------------------------------------
+// YOT staff cashout report, one call per active location.
+//
+// The org-wide report (no LocationId) returns ONE row per stylist per day and
+// files a stylist who worked at two shops under a single shop with the
+// amounts summed — on 2026-10-15 Dawn Rowe's Shelby $37 + Sterling $30 came
+// back as "Sterling Warren MI $67". Scoped to a location the report returns
+// only that shop's figures, so running it per location and concatenating
+// gives one row per shop worked. The grand total is unchanged (verified
+// $19,715.00 both ways that night); ~28 calls take ~4 minutes.
+//
+// Fail-safe: if any per-location call fails (YOT's report SQL has timed out
+// before), fall back to the org-wide call so payroll still goes out, and
+// record that in diagnostics so the watchdog/operator can see it.
+type CashoutRows = Awaited<ReturnType<typeof runStaffCashoutReport>>['rows'];
+type CashoutFetch = {
+  rows: CashoutRows;
+  /** 'org-wide-fallback' = per-location was requested but a call failed. */
+  reportMode: ReportMode | 'org-wide-fallback';
+  reportLocationCallCount: number;
+  reportLocationFailure: string | null;
+};
+
+function loadActiveYotLocations(teamId: string): Array<{ id: number; name: string }> {
+  const { sqlite } = initializeDatabase(teamId);
+  return sqlite
+    .prepare('SELECT id, name FROM locations WHERE team_id = ? AND active = 1 ORDER BY name')
+    .all(teamId) as Array<{ id: number; name: string }>;
+}
+
+async function fetchCashoutRows(args: Args): Promise<CashoutFetch> {
+  const base = {
+    teamId: args.teamId,
+    startDateIso: args.date,
+    endDateIso: args.date,
+    organisationId: args.organisationId,
+    // This export reads only staffName / locationName / bankToBankAmount, so
+    // it can ride the CSV renderer while YOT's XLSX extension is down. The
+    // CSV parser refuses to return rows that don't reconcile against the
+    // report's own stated total.
+    allowCsvFallback: true,
+  };
+  if (args.reportMode === 'org-wide') {
+    const report = await runStaffCashoutReport(base);
+    return { rows: report.rows, reportMode: 'org-wide', reportLocationCallCount: 0, reportLocationFailure: null };
+  }
+  const locations = loadActiveYotLocations(args.teamId);
+  const rows: CashoutRows = [];
+  try {
+    for (const loc of locations) {
+      const report = await runStaffCashoutReport({ ...base, locationId: loc.id });
+      rows.push(...report.rows);
+    }
+    return { rows, reportMode: 'per-location', reportLocationCallCount: locations.length, reportLocationFailure: null };
+  } catch (err: any) {
+    const message = String(err?.message || err);
+    console.error(`[warn] per-location cashout report failed (${message}) — falling back to the org-wide report; stylists who worked two shops today will be rolled up to one`);
+    const report = await runStaffCashoutReport(base);
+    return { rows: report.rows, reportMode: 'org-wide-fallback', reportLocationCallCount: locations.length, reportLocationFailure: message };
+  }
 }
 
 function expandHome(value: string): string {
@@ -977,17 +1063,8 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   mkdirSync(args.outputDir, { recursive: true });
 
-  const report = await runStaffCashoutReport({
-    teamId: args.teamId,
-    startDateIso: args.date,
-    endDateIso: args.date,
-    organisationId: args.organisationId,
-    // This export reads only staffName / locationName / bankToBankAmount, so
-    // it can ride the CSV renderer while YOT's XLSX extension is down. The
-    // CSV parser refuses to return rows that don't reconcile against the
-    // report's own stated total.
-    allowCsvFallback: true,
-  });
+  const report = await fetchCashoutRows(args);
+  console.error(`[report] mode=${report.reportMode} rows=${report.rows.length} locationCalls=${report.reportLocationCallCount}`);
   const masterRows = await loadCsvMasterRows(args.group.rosterSheetId, args.group.rosterTab, args.account);
   const garnishmentRules = args.group.garnishmentsEnabled
     ? await loadGarnishmentRules(args.garnishmentsSheetId, args.account)
@@ -1009,6 +1086,26 @@ async function main() {
     const norm = normalizeLocation(row.location);
     if (norm) supportedLocations.add(norm);
   }
+  // The roster's spelling of each shop, keyed by its normalized form. A paid
+  // row is filed under the shop YOT says the work happened at, written the
+  // way the roster writes it (Branch and the daily tab key on that string).
+  // Falls back to the matched roster row's shop only when YOT's shop is not
+  // on the roster at all — which is what the location-drift alert reports.
+  const rosterShopSpelling = new Map<string, string>();
+  for (const row of masterRows) {
+    const norm = normalizeLocation(row.location);
+    if (norm && !rosterShopSpelling.has(norm)) rosterShopSpelling.set(norm, row.location);
+  }
+  const rosterShopFor = (yotLocation: string | null | undefined): string | null => {
+    const norm = normalizeLocation(yotLocation);
+    if (!norm) return null;
+    const exact = rosterShopSpelling.get(norm);
+    if (exact) return exact;
+    // Corp's roster says "Sterling"/"Clinton" where YOT says "Sterling
+    // Warren MI"/"Macomb - Clinton MI".
+    for (const [rosterNorm, spelling] of rosterShopSpelling) if (isSameShop(rosterNorm, norm)) return spelling;
+    return null;
+  };
 
   // Cross-roster safety: a stylist on two groups' rosters would be paid by
   // both nightly runs. Exclude them here and surface them in diagnostics +
@@ -1083,6 +1180,7 @@ async function main() {
   const garnishmentPayoutRows: GarnishmentPayoutRow[] = [];
   const loanPaymentsThisRun: LoanPaymentRow[] = [];
   const loansPaidOffToday: LoanPaidOff[] = [];
+  const loansWithheldThisRun = new Set<number>();
   const loanCellUpdates: Array<{ rowNumber: number; totalPaid: number; remainingBalance: number }> = [];
   // Tracks stylists whose bankToBank was negative for the day — the
   // stylist OWES the shop that amount (e.g. rebate/void absorbed by the
@@ -1152,9 +1250,12 @@ async function main() {
       });
     }
 
-    // Roster says one shop, YOT says another. The row is still paid (under
-    // the roster's shop) — recorded so the email + watchdog can name it.
-    if (isLocationDrift(match.row.location, yotRow.locationName)) {
+    // The row is filed under YOT's shop when the roster knows that shop
+    // (rosterShopFor). Only when it does not — YOT names a shop that is on no
+    // roster row — is the row filed under the matched roster row's shop, and
+    // that is what gets reported here.
+    const yotShop = rosterShopFor(yotRow.locationName);
+    if (!yotShop && isLocationDrift(match.row.location, yotRow.locationName)) {
       locationDriftRows.push({
         csvMasterRowNumber: match.row.rowNumber,
         csvMasterName: `${match.row.firstName} ${match.row.lastName}`.trim(),
@@ -1169,7 +1270,7 @@ async function main() {
       // Stylist owes the shop $baseAmount. Annotate BRANCH MASTER YOT
       // NOTES only — no disbursement, garnishment, or loan withholding
       // (no payment is going out for those to act on).
-      const csvLocation = match.row.location || yotRow.locationName || null;
+      const csvLocation = yotShop || match.row.location || yotRow.locationName || null;
       negativeRebates.push({
         staffName: `${match.row.firstName} ${match.row.lastName}`.trim() || yotRow.staffName || '?',
         locationName: csvLocation,
@@ -1179,15 +1280,14 @@ async function main() {
       continue;
     }
 
-    // Use CSV MASTER's location (column G on the Branch Daily Totals
-    // sheet) as the canonical location string. YOT's report appends the
-    // state abbreviation (e.g. "Brighton MI") which doesn't match the
-    // sheet's location field downstream consumers join against.
-    // matchedReportLocation keeps the raw YOT string for traceability in
-    // the watchdog log; only `location` (the field that flows to the CSV)
-    // gets normalized. Hoisted above the loan loop because transaction ids
-    // (deposit, garnishment, and loan rows alike) embed the location.
-    const csvLocation = match.row.location || yotRow.locationName || '';
+    // File the row under the shop YOT says the work happened at, spelled the
+    // roster's way (YOT appends state suffixes — "Brighton MI" — that the
+    // sheet's location field and Branch don't use). Before 2026-10-16 this
+    // was always the matched roster row's shop, which filed a floater's
+    // second shop under their first. matchedReportLocation keeps the raw YOT
+    // string for traceability. Hoisted above the loan loop because
+    // transaction ids (deposit, garnishment, and loan rows alike) embed it.
+    const csvLocation = yotShop || match.row.location || yotRow.locationName || '';
 
     const garnishmentRule = garnishmentRules.get(match.row.staffId) || null;
     const garnishmentPercent = garnishmentRule?.percent ?? null;
@@ -1207,6 +1307,12 @@ async function main() {
       if (loan.remainingBalance <= 0) continue;
       if (loan.withholding <= 0) continue;
       if (availableForLoan <= 0) break;
+      // A stylist who worked two shops today has two rows in this loop; the
+      // loan's withholding is a per-day amount, so take it from the first
+      // row only (the balance mutation below already stops over-withholding,
+      // but would still take a second instalment).
+      if (loansWithheldThisRun.has(loan.rowNumber)) continue;
+      loansWithheldThisRun.add(loan.rowNumber);
 
       const desired = Math.min(loan.withholding, loan.remainingBalance);
       const actual = Number(Math.min(desired, availableForLoan).toFixed(2));
@@ -1228,6 +1334,7 @@ async function main() {
         withholding: actual,
         day: loan.day,
         transactionId: buildTransactionId(loan.lastName, loan.staffId, actual, args.date, csvLocation),
+        location: csvLocation,
       });
       loanCellUpdates.push({
         rowNumber: loan.rowNumber,
@@ -1387,7 +1494,9 @@ async function main() {
   // row. Matches the format the operator has been writing manually on
   // daily tabs.
   for (const p of loanPaymentsThisRun) {
-    const loc = exportRowLocByStaff.get(p.staffId);
+    // The row the withholding came off; a stylist with two shop rows has
+    // two entries in exportRows and exportRowLocByStaff keeps only the last.
+    const loc = p.location || exportRowLocByStaff.get(p.staffId);
     if (!loc) continue;
     const key = normalizeLocation(loc);
     if (!key) continue;
@@ -1431,7 +1540,11 @@ async function main() {
     const branchNoteParts: string[] = [];
     const yotNoteParts: string[] = [];
     for (const [k, v] of perLocation) {
-      if (k === key || k.startsWith(`${key} `)) {
+      // Same-shop rule shared with the roster lookup: equal, or one name is
+      // the other with extra words ("Sterling" / "sterling warren", and
+      // "Clinton" / "macomb - clinton", which the old prefix test missed so
+      // the Clinton row's YOT column was always $0).
+      if (isSameShop(key, k)) {
         found = true;
         combined.branchAmount = Number((combined.branchAmount + v.branchAmount).toFixed(2));
         combined.yotAmount = Number((combined.yotAmount + v.yotAmount).toFixed(2));
@@ -1618,6 +1731,9 @@ Sourced from ${args.group.rosterTab} on the ${args.group.rosterSheetLabel} sheet
     crossGroupCollisions,
     crossGroupCollisionCheckStatus,
     generatedAt: new Date().toISOString(),
+    reportMode: report.reportMode,
+    reportLocationCallCount: report.reportLocationCallCount,
+    reportLocationFailure: report.reportLocationFailure,
     reportRowCount: report.rows.length,
     masterRowCount: masterRows.length,
     exportRowCount: depositRows.length,
