@@ -53,9 +53,9 @@ export function formatLocationDriftSection(rosterTab: string, rows: LocationDrif
   if (!rows.length) return null;
   const lines = rows.map((r) => {
     const amount = `$${Math.abs(r.bankToBankAmount).toFixed(2)}`;
-    return `- ${rosterTab} row ${r.csvMasterRowNumber} lists ${r.csvMasterName} (staff id ${r.staffId}) at "${r.csvMasterLocation}", but YOT paid them ${amount} at "${r.reportLocation}" today. The deposit went out under "${r.csvMasterLocation}", so that shop's BRANCH total is ${amount} high and "${r.reportLocation}" is ${amount} low. Action: move their row to the "${r.reportLocation}" section of ${rosterTab} (or correct their location in YOT if the roster is right).`;
+    return `- ${r.csvMasterName} (staff id ${r.staffId}) worked at "${r.reportLocation}" today per YOT (${amount}), but ${rosterTab} only lists them at "${r.csvMasterLocation}" (row ${r.csvMasterRowNumber}). They were paid in full; the deposit is just filed under "${r.csvMasterLocation}", so that shop's BRANCH total is ${amount} high and "${r.reportLocation}" is ${amount} low. If they float between shops, add a row for them under "${r.reportLocation}" too (one row per shop they work, like the other floaters). If they have transferred, move the row instead.`;
   });
-  return `${rosterTab} location drift vs YOT (paid under the wrong shop):\n${lines.join('\n')}`;
+  return `${rosterTab} does not list these stylists at the shop YOT paid them at today (paid correctly, filed under the roster's shop):\n${lines.join('\n')}`;
 }
 
 // ---------------------------------------------------------------------------

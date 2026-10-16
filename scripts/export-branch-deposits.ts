@@ -38,7 +38,7 @@ import { sendGmail } from '../src/mail/google-mailer';
 import { normalizeLocation, normalizeText } from '../src/disbursements/normalize';
 import { otherGroupConfigs, resolveGroupConfig, type DisbursementGroupConfig } from '../src/disbursements/group-config';
 import { findRosterCollisions, type RosterCollision, type RosterEntry } from '../src/disbursements/roster-collisions';
-import { findRosterDuplicates, formatLocationDriftSection, formatRosterDuplicateSection, isLocationDrift, type LocationDriftRow, type RosterDuplicate } from '../src/disbursements/location-drift';
+import { findRosterDuplicates, isLocationDrift, type LocationDriftRow, type RosterDuplicate } from '../src/disbursements/location-drift';
 
 type Args = {
   date: string;
@@ -415,8 +415,6 @@ function toDisbursementsCsv(rows: ExportRow[], date: string): string {
 
 function buildWatchdogEmailSection(args: {
   typoRows: FuzzyMatchedRow[];
-  locationDriftRows: LocationDriftRow[];
-  rosterDuplicates: RosterDuplicate[];
   inScopeUnmatched: UnmatchedReportRow[];
   loansPaidOff: LoanPaidOff[];
   // The running group's roster tab. Named explicitly in the prose so an
@@ -433,10 +431,10 @@ function buildWatchdogEmailSection(args: {
     sections.push(`${roster} spelling drift vs YOT:\n${lines.join('\n')}`);
   }
 
-  const driftSection = formatLocationDriftSection(roster, args.locationDriftRows);
-  if (driftSection) sections.push(driftSection);
-  const duplicateSection = formatRosterDuplicateSection(roster, args.rosterDuplicates);
-  if (duplicateSection) sections.push(duplicateSection);
+  // Roster location drift and duplicate rows are deliberately NOT in this
+  // email: it goes to Miranda, who uploads the CSV, and on 2026-10-15 the
+  // first such section was read as the payout being wrong. They are in the
+  // diagnostics and the 22:00 watchdog email, which is the alerting channel.
 
   if (args.inScopeUnmatched.length) {
     const lines = args.inScopeUnmatched.map((r) => `- ${r.staffName || '?'} @ ${r.locationName || '?'} earned $${r.bankToBankAmount} today (YOT bank-to-bank). They aren't on ${roster}, so they were not in tonight's deposit CSV. Action: pay them manually for today's amount, then add them to ${roster} (with their Branch STAFF ID) so tomorrow's export covers them.`);
@@ -1547,8 +1545,6 @@ async function main() {
   for (const r of locationDriftRows) console.error(`[drift] ${r.csvMasterName} rostered at "${r.csvMasterLocation}" but YOT paid $${r.bankToBankAmount} at "${r.reportLocation}"`);
   const watchdogEmailSection = buildWatchdogEmailSection({
     typoRows,
-    locationDriftRows,
-    rosterDuplicates,
     inScopeUnmatched: inScopeUnmatchedRows,
     loansPaidOff: loansPaidOffToday,
     rosterTab: args.group.rosterTab,

@@ -242,7 +242,7 @@ Watchdog log: ${LOG_PATH}`,
 
   const driftSection = formatLocationDriftSection(args.group.rosterTab, locationDrift);
   if (driftSection) {
-    summaryBits.push(`${locationDrift.length} at wrong location`);
+    summaryBits.push(`${locationDrift.length} not rostered at today's shop`);
     sections.push(driftSection);
   }
 
