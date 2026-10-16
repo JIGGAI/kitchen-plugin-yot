@@ -1532,7 +1532,11 @@ async function main() {
     const branchNoteParts: string[] = [];
     const yotNoteParts: string[] = [];
     for (const [k, v] of perLocation) {
-      if (k === key || k.startsWith(`${key} `)) {
+      // Same-shop rule shared with the roster lookup: equal, or one name is
+      // the other with extra words ("Sterling" / "sterling warren", and
+      // "Clinton" / "macomb - clinton", which the old prefix test missed so
+      // the Clinton row's YOT column was always $0).
+      if (isSameShop(key, k)) {
         found = true;
         combined.branchAmount = Number((combined.branchAmount + v.branchAmount).toFixed(2));
         combined.yotAmount = Number((combined.yotAmount + v.yotAmount).toFixed(2));
