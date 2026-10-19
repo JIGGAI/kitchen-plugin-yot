@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildDayNotices, formatLoansPaidOffSection, formatMissingFromRosterSection, formatNoticesBlock, formatSpellingDriftSection } from '../operator-notices';
+import { buildDayNotices, formatCollisionSection, formatLoansPaidOffSection, formatMissingFromRosterSection, formatNoticesBlock, formatSpellingDriftSection } from '../operator-notices';
 
 const heath = { staffName: 'Antonio Heath', locationName: 'Howell MI', bankToBankAmount: 208, inScope: true };
 const outOfScope = { staffName: 'Heather Everett', locationName: 'Mandarin FL.', bankToBankAmount: 147, inScope: false };
@@ -57,5 +57,23 @@ describe('buildDayNotices + formatNoticesBlock', () => {
     const block = formatNoticesBlock(sections);
     expect(block.startsWith('\n\nWatchdog messages:\n')).toBe(true);
     expect(block).toContain('Antonio Heath');
+  });
+});
+
+describe('formatCollisionSection', () => {
+  const c = { detail: 'Staff id 7777 is on both rosters at the same location: Marcella Belles @ Troy and Marcy Belles @ Troy MI.' };
+
+  it('tells the operator the stylist was excluded and must be paid by hand if owed', () => {
+    const out = formatCollisionSection([c], 'Saturday 2026-10-17')!;
+    expect(out).toContain('Excluded Saturday 2026-10-17');
+    expect(out).toContain('Marcella Belles @ Troy');
+    expect(out).toContain('pay that day\'s amount by hand if it is owed');
+    expect(formatCollisionSection([])).toBeNull();
+  });
+
+  it('is included by buildDayNotices when the diagnostics carry collisions', () => {
+    const sections = buildDayNotices('CORP CSV MASTER', { crossGroupCollisions: [c] }, 'Sunday 2026-10-18');
+    expect(sections).toHaveLength(1);
+    expect(sections[0]).toContain('Excluded Sunday 2026-10-18');
   });
 });

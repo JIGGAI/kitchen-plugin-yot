@@ -35,11 +35,20 @@ export type LoanPaidOff = {
   loanRow: number;
 };
 
+export type RosterCollisionNotice = {
+  /** Human-readable explanation naming both sides (roster-collisions.ts). */
+  detail: string;
+};
+
 /** The subset of a day's diagnostics JSON these notices are built from. */
 export type DayNoticeSource = {
   reportRowsWithPositiveAmountButNoBranchMatch?: UnmatchedReportRow[];
   fuzzyMatchedRows?: FuzzyMatchedRow[];
   loansPaidOffToday?: LoanPaidOff[];
+  /** Stylists excluded from the CSV because they are on both groups'
+   *  rosters at the same shop. The nightly export email carries these in
+   *  its own block; the weekend combine takes them from here. */
+  crossGroupCollisions?: RosterCollisionNotice[];
 };
 
 export function formatMissingFromRosterSection(rosterTab: string, rows: UnmatchedReportRow[], dayLabel = 'today'): string | null {
@@ -62,7 +71,13 @@ export function formatLoansPaidOffSection(rows: LoanPaidOff[]): string | null {
   return `Loans paid off:\n${lines.join('\n')}`;
 }
 
-/** All three sections for one day, in the order the nightly email has
+export function formatCollisionSection(rows: RosterCollisionNotice[], dayLabel = 'today'): string | null {
+  if (!rows.length) return null;
+  const lines = rows.map((c) => `- ${c.detail}`);
+  return `Excluded ${dayLabel} — on more than one group's roster (not in the CSV):\n${lines.join('\n')}\nThese were excluded to prevent the same person being paid twice, once by each group's run. They need manual handling: remove the duplicate from whichever roster is wrong, and pay that day's amount by hand if it is owed.`;
+}
+
+/** Every action-needed section for one day, in the order the nightly email has
  *  always used. `dayLabel` names the day when several days share an email
  *  ("Saturday 2026-10-17"); the nightly email uses the default "today". */
 export function buildDayNotices(rosterTab: string, day: DayNoticeSource, dayLabel = 'today'): string[] {
@@ -73,6 +88,8 @@ export function buildDayNotices(rosterTab: string, day: DayNoticeSource, dayLabe
   if (missing) sections.push(missing);
   const loans = formatLoansPaidOffSection(day.loansPaidOffToday || []);
   if (loans) sections.push(loans);
+  const collisions = formatCollisionSection(day.crossGroupCollisions || [], dayLabel);
+  if (collisions) sections.push(collisions);
   return sections;
 }
 
