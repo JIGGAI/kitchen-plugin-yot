@@ -35,6 +35,7 @@ import path from 'node:path';
 import { resolveGroupConfig, type DisbursementGroupConfig } from '../src/disbursements/group-config';
 import type { RosterCollision } from '../src/disbursements/roster-collisions';
 import { formatLocationDriftSection, formatRosterDuplicateSection, type LocationDriftRow, type RosterDuplicate } from '../src/disbursements/location-drift';
+import { formatLoansPaidOffSection, formatMissingFromRosterSection, formatSpellingDriftSection } from '../src/disbursements/operator-notices';
 
 const NEW_YORK_TZ = 'America/New_York';
 // HMX_PAYOUT_EXPORT_DIR lets a dry run read fixture diagnostics instead of
@@ -234,10 +235,10 @@ Watchdog log: ${LOG_PATH}`,
   const sections: string[] = [];
   const summaryBits: string[] = [];
 
-  if (typoRows.length) {
+  const spellingSection = formatSpellingDriftSection(args.group.rosterTab, typoRows);
+  if (spellingSection) {
     summaryBits.push(`${typoRows.length} typo${typoRows.length > 1 ? 's' : ''}`);
-    const lines = typoRows.map((r) => `- ${args.group.rosterTab} row ${r.csvMasterRowNumber} has "${r.csvMasterName}"; YOT has "${r.reportName}" (${r.locationName || '?'}). The export paid them via fuzzy match. Please fix the spelling on ${args.group.rosterTab}.`);
-    sections.push(`${args.group.rosterTab} spelling drift vs YOT:\n${lines.join('\n')}`);
+    sections.push(spellingSection);
   }
 
   const driftSection = formatLocationDriftSection(args.group.rosterTab, locationDrift);
@@ -252,16 +253,16 @@ Watchdog log: ${LOG_PATH}`,
     sections.push(duplicateSection);
   }
 
-  if (inScopeUnmatched.length) {
+  const missingSection = formatMissingFromRosterSection(args.group.rosterTab, inScopeUnmatched);
+  if (missingSection) {
     summaryBits.push(`${inScopeUnmatched.length} need manual payout`);
-    const lines = inScopeUnmatched.map((r) => `- ${r.staffName || '?'} @ ${r.locationName || '?'} earned $${r.bankToBankAmount} today (YOT bank-to-bank). They aren't on ${args.group.rosterTab}, so they were not in tonight's deposit CSV. Action: pay them manually for today's amount, then add them to ${args.group.rosterTab} (with their Branch STAFF ID) so tomorrow's export covers them.`);
-    sections.push(`Missing from ${args.group.rosterTab} (manual payout for today):\n${lines.join('\n')}`);
+    sections.push(missingSection);
   }
 
-  if (loansPaidOff.length) {
+  const loansSection = formatLoansPaidOffSection(loansPaidOff);
+  if (loansSection) {
     summaryBits.push(`${loansPaidOff.length} loan${loansPaidOff.length > 1 ? 's' : ''} paid off`);
-    const lines = loansPaidOff.map((l) => `- ${l.firstName} ${l.lastName} (staff id ${l.staffId}) finished a $${l.totalAmount.toFixed(2)} loan today (LOANS row ${l.loanRow}). Archive the row to a "PAID …" tab when convenient.`);
-    sections.push(`Loans paid off today:\n${lines.join('\n')}`);
+    sections.push(loansSection);
   }
 
   const collisions = diag.crossGroupCollisions || [];

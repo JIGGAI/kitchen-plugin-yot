@@ -40,6 +40,7 @@ import { normalizeLocation, normalizeText } from '../src/disbursements/normalize
 import { otherGroupConfigs, resolveGroupConfig, type DisbursementGroupConfig } from '../src/disbursements/group-config';
 import { findRosterCollisions, type RosterCollision, type RosterEntry } from '../src/disbursements/roster-collisions';
 import { findRosterDuplicates, isLocationDrift, isSameShop, type LocationDriftRow, type RosterDuplicate } from '../src/disbursements/location-drift';
+import { buildDayNotices, formatNoticesBlock } from '../src/disbursements/operator-notices';
 
 type Args = {
   date: string;
@@ -509,31 +510,17 @@ function buildWatchdogEmailSection(args: {
   // stylist excluded from BOTH groups' payouts.
   rosterTab: string;
 }): string {
-  const sections: string[] = [];
-  const roster = args.rosterTab;
-
-  if (args.typoRows.length) {
-    const lines = args.typoRows.map((r) => `- ${roster} row ${r.csvMasterRowNumber} has "${r.csvMasterName}"; YOT has "${r.reportName}" (${r.locationName || '?'}). The export paid them via fuzzy match. Please fix the spelling on ${roster}.`);
-    sections.push(`${roster} spelling drift vs YOT:\n${lines.join('\n')}`);
-  }
-
-  // Roster location drift and duplicate rows are deliberately NOT in this
-  // email: it goes to Miranda, who uploads the CSV, and on 2026-10-15 the
-  // first such section was read as the payout being wrong. They are in the
-  // diagnostics and the 22:00 watchdog email, which is the alerting channel.
-
-  if (args.inScopeUnmatched.length) {
-    const lines = args.inScopeUnmatched.map((r) => `- ${r.staffName || '?'} @ ${r.locationName || '?'} earned $${r.bankToBankAmount} today (YOT bank-to-bank). They aren't on ${roster}, so they were not in tonight's deposit CSV. Action: pay them manually for today's amount, then add them to ${roster} (with their Branch STAFF ID) so tomorrow's export covers them.`);
-    sections.push(`Missing from ${roster} (manual payout for today):\n${lines.join('\n')}`);
-  }
-
-  if (args.loansPaidOff.length) {
-    const lines = args.loansPaidOff.map((l) => `- ${l.firstName} ${l.lastName} (staff id ${l.staffId}) finished a $${l.totalAmount.toFixed(2)} loan today (LOANS row ${l.loanRow}). Archive the row to a "PAID …" tab when convenient.`);
-    sections.push(`Loans paid off today:\n${lines.join('\n')}`);
-  }
-
-  if (!sections.length) return '';
-  return `\n\nWatchdog messages:\n${sections.join('\n\n')}`;
+  // Shared with the watchdog and the Sunday weekend combine
+  // (src/disbursements/operator-notices.ts) so Miranda reads the same
+  // notice wherever it appears. Roster location drift and duplicate rows
+  // are deliberately NOT in this email: it goes to Miranda, who uploads the
+  // CSV, and on 2026-10-15 the first such section was read as the payout
+  // being wrong. They are in the diagnostics and the 22:00 watchdog email.
+  return formatNoticesBlock(buildDayNotices(args.rosterTab, {
+    fuzzyMatchedRows: args.typoRows,
+    reportRowsWithPositiveAmountButNoBranchMatch: args.inScopeUnmatched,
+    loansPaidOffToday: args.loansPaidOff,
+  }));
 }
 
 async function emailDisbursementsCsv(filePath: string, account: string, recipients: string | string[], subject: string, body: string): Promise<void> {

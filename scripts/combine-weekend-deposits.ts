@@ -33,6 +33,7 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import { sendGmail } from '../src/mail/google-mailer';
 import { resolveGroupConfig, type DisbursementGroupConfig } from '../src/disbursements/group-config';
+import { buildDayNotices, formatNoticesBlock, type DayNoticeSource } from '../src/disbursements/operator-notices';
 
 const NEW_YORK_TZ = 'America/New_York';
 const DEFAULT_OUTPUT_DIR = path.join(homedir(), 'hmx-reports');
@@ -248,6 +249,27 @@ async function main() {
   const total = [...satRows, ...sunRows].reduce((s, r) => s + parseAmount(r.fields[AMOUNT]), 0);
   const totalStr = total.toFixed(2);
 
+  // Miranda works the weekend from THIS email, not the Saturday/Sunday
+  // nightly ones, so the two days' operator notices (stylists missing from
+  // the roster who must be paid by hand, spelling drift, loans paid off)
+  // have to be repeated here. On 2026-10-17/18 they were only in the
+  // nightly emails and two visiting stylists went unpaid.
+  const noticeSections: string[] = [];
+  const noticeGaps: string[] = [];
+  for (const [label, day] of [[`Saturday ${saturday}`, saturday], [`Sunday ${sunday}`, sunday]] as const) {
+    const diagPath = path.join(args.outputDir, `${args.group.filePrefix}branch-deposits-${day}.diagnostics.json`);
+    if (!existsSync(diagPath)) { noticeGaps.push(label); continue; }
+    try {
+      const diag = JSON.parse(readFileSync(diagPath, 'utf8')) as DayNoticeSource;
+      noticeSections.push(...buildDayNotices(args.group.rosterTab, diag, label));
+    } catch (err: any) {
+      console.error(`[warn] could not read ${diagPath} for notices: ${err?.message || err}`);
+      noticeGaps.push(label);
+    }
+  }
+  const noticesBlock = formatNoticesBlock(noticeSections)
+    + (noticeGaps.length ? `\n\n(No diagnostics found for ${noticeGaps.join(' or ')}, so that day's notices could not be checked — see that day's nightly email.)` : '');
+
   const recipient = args.testRecipient || args.group.emailTo;
   const sendTo: string | string[] = args.testRecipient
     ? recipient
@@ -262,12 +284,12 @@ async function main() {
   Sunday   ${sunday}: ${sunRows.length} deposits
   Combined: ${outRows.length} deposits, $${totalStr}
 
-${mergedNote} A stylist who worked two DIFFERENT locations over the weekend keeps a separate row per location. Every row carries a Monday (${monday}) disbursement date, and merged rows also carry a fresh transaction id for the summed amount. Auto-generated Sunday afternoon.`;
+${mergedNote} A stylist who worked two DIFFERENT locations over the weekend keeps a separate row per location. Every row carries a Monday (${monday}) disbursement date, and merged rows also carry a fresh transaction id for the summed amount. Auto-generated Sunday afternoon.${noticesBlock}`;
 
   let emailStatus: 'sent' | 'skipped' | 'failed' = 'skipped';
   if (args.dryRun || args.skipEmail) {
     const displayRecipients = Array.isArray(sendTo) ? sendTo.join(', ') : sendTo;
-    console.error(`[${args.dryRun ? 'dry-run' : 'skip-email'}] would email ${combinedPath} to ${displayRecipients}: ${subject}`);
+    console.error(`[${args.dryRun ? 'dry-run' : 'skip-email'}] would email ${combinedPath} to ${displayRecipients}: ${subject}\n--- body ---\n${body}\n--- end ---`);
   } else {
     try {
       await sendGmail({
@@ -298,6 +320,7 @@ ${mergedNote} A stylist who worked two DIFFERENT locations over the weekend keep
     sundayRowCount: sunRows.length,
     combinedRowCount: outRows.length,
     mergedStylistCount,
+    noticeSectionCount: noticeSections.length,
     totalAmount: Number(totalStr),
   }, null, 2));
 }
