@@ -214,6 +214,88 @@ export function cleanRosterStylistName(name: string | null | undefined): string 
  * Caller MUST skip pruning when the feed came back empty (seen.size === 0) to
  * avoid wiping good data on a zombie/empty response.
  */
+/**
+ * The window one /appointments/sync run covers. Two shapes:
+ *
+ *  - lookback (default): `lookbackDays` back from now, clamped to 365, or the
+ *    auto-resume gap from the cache when absent; plus `forwardDays` ahead.
+ *  - explicit: `startDate` + `endDate` (YYYY-MM-DD, whole local days, at most
+ *    400 days apart). No clamp to today, so a backfill can walk as far back
+ *    as YOT holds data one bounded window at a time. This is what moves the
+ *    cache floor: lookback alone can never reach past 365 days from the day
+ *    it runs, which is why the floor sat at 2025-05-24 while the "days of
+ *    history" grew one per day.
+ *
+ * Pruning is scoped to [windowStartDate, windowEndDate] either way, so an
+ * explicit historical window only ever touches rows inside itself.
+ */
+export type AppointmentsSyncWindow = {
+  mode: 'lookback' | 'explicit';
+  lookbackDays: number;
+  forwardDays: number;
+  windowStartDate: string;
+  windowEndDate: string;
+  date: number;     // epoch ms — fetchAppointmentsRange `date`
+  enddate: number;  // epoch ms — fetchAppointmentsRange `enddate`
+  note: string;
+};
+
+const MAX_EXPLICIT_WINDOW_DAYS = 400;
+
+export function resolveAppointmentsSyncWindow(
+  query: Record<string, any>,
+  nowMs: number,
+  autoLookbackDays: () => number,
+): AppointmentsSyncWindow {
+  const dayMs = 24 * 60 * 60 * 1000;
+  const hasStart = query?.startDate != null && query.startDate !== '';
+  const hasEnd = query?.endDate != null && query.endDate !== '';
+  if (hasStart || hasEnd) {
+    if (!(hasStart && hasEnd)) throw new Error('startDate and endDate must be given together');
+    const startDate = String(query.startDate);
+    const endDate = String(query.endDate);
+    const iso = /^\d{4}-\d{2}-\d{2}$/;
+    if (!iso.test(startDate) || !iso.test(endDate)) throw new Error('startDate and endDate must be YYYY-MM-DD');
+    const date = new Date(`${startDate}T00:00:00`).getTime();
+    const enddate = new Date(`${endDate}T23:59:59.999`).getTime();
+    if (!Number.isFinite(date) || !Number.isFinite(enddate)) throw new Error('startDate and endDate must be YYYY-MM-DD');
+    if (startDate > endDate) throw new Error('startDate must be on or before endDate');
+    const spanDays = Math.round((Date.parse(`${endDate}T00:00:00Z`) - Date.parse(`${startDate}T00:00:00Z`)) / dayMs) + 1;
+    if (spanDays > MAX_EXPLICIT_WINDOW_DAYS) throw new Error(`startDate..endDate may span at most ${MAX_EXPLICIT_WINDOW_DAYS} days`);
+    return {
+      mode: 'explicit',
+      lookbackDays: spanDays,
+      forwardDays: 0,
+      windowStartDate: startDate,
+      windowEndDate: endDate,
+      date,
+      enddate,
+      note: `startDate=${startDate}; endDate=${endDate} (explicit window, ${spanDays} days)`,
+    };
+  }
+  const explicitLookback = query?.lookbackDays != null;
+  const lookbackDays = explicitLookback
+    ? Math.max(1, Math.min(parseInt(query.lookbackDays || '30', 10) || 30, 365))
+    : autoLookbackDays();
+  // Forward window — pulls upcoming bookings (default 0 = past-only,
+  // backwards-compatible). ?forwardDays=N also fetches appointments scheduled
+  // up to N days from now (e.g. dashboards that surface tomorrow's schedule).
+  const explicitForward = query?.forwardDays != null;
+  const forwardDays = explicitForward
+    ? Math.max(0, Math.min(parseInt(query.forwardDays || '0', 10) || 0, 365))
+    : 0;
+  return {
+    mode: 'lookback',
+    lookbackDays,
+    forwardDays,
+    windowStartDate: new Date(nowMs - lookbackDays * dayMs).toISOString().slice(0, 10),
+    windowEndDate: new Date(nowMs + forwardDays * dayMs).toISOString().slice(0, 10),
+    date: nowMs - lookbackDays * dayMs,
+    enddate: nowMs + forwardDays * dayMs,
+    note: `lookbackDays=${lookbackDays}${explicitLookback ? '' : ' (auto-resume)'}; forwardDays=${forwardDays}`,
+  };
+}
+
 export function selectStaleAppointmentRows(
   localRows: Array<{ id: string; appointmentId: string | null; startAt: string | null }>,
   seenAppointmentIds: Set<string>,
@@ -4411,32 +4493,20 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
 
     const startedAt = new Date().toISOString();
     const runId = randomUUID();
-    const explicitLookback = req.query.lookbackDays != null;
-    const lookbackDays = explicitLookback
-      ? Math.max(1, Math.min(parseInt(req.query.lookbackDays || '30', 10) || 30, 365))
-      : autoResumeRange(teamId, 'appointments').lookbackDays;
-    // Forward window — pulls upcoming bookings (default 0 = past-only,
-    // backwards-compatible). Use ?forwardDays=N to also fetch appointments
-    // scheduled up to N days from now (e.g. dashboards that need to surface
-    // tomorrow's schedule).
-    const explicitForward = req.query.forwardDays != null;
-    const forwardDays = explicitForward
-      ? Math.max(0, Math.min(parseInt(req.query.forwardDays || '0', 10) || 0, 365))
-      : 0;
+    let window: AppointmentsSyncWindow;
+    try {
+      window = resolveAppointmentsSyncWindow(req.query, Date.now(), () => autoResumeRange(teamId, 'appointments').lookbackDays);
+    } catch (error: any) {
+      return apiError(400, 'BAD_REQUEST', error?.message || 'invalid sync window');
+    }
+    const { lookbackDays, forwardDays, windowStartDate, windowEndDate, date, enddate } = window;
     try {
       const { db, sqlite } = initializeDatabase(teamId);
-      db.insert(schema.syncRuns).values({ id: runId, teamId, resource: 'appointments', status: 'running', startedAt, notes: `lookbackDays=${lookbackDays}${explicitLookback ? '' : ' (auto-resume)'}; forwardDays=${forwardDays}` }).run();
+      db.insert(schema.syncRuns).values({ id: runId, teamId, resource: 'appointments', status: 'running', startedAt, notes: window.note }).run();
       const locations = await fetchLocations(config);
       const activeLocations = locations.filter((item) => item?.id != null && item?.active !== false);
       const now = new Date().toISOString();
-      const nowMs = Date.now();
       let appointmentsPruned = 0;
-      // The window the feed covers this run — used to scope pruning so we never
-      // touch historical rows outside what was re-fetched.
-      const windowStartDate = new Date(nowMs - lookbackDays * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-      const windowEndDate = new Date(nowMs + forwardDays * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-      const enddate = nowMs + forwardDays * 24 * 60 * 60 * 1000;
-      const date = nowMs - lookbackDays * 24 * 60 * 60 * 1000;
       let rowsSeen = 0;
       let rowsWritten = 0;
       let locationsSynced = 0;
