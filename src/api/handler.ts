@@ -12,8 +12,8 @@ import * as schema from '../db/schema';
 import { listAppointmentsForRequest, AGGREGATE_COLUMNS } from './list-appointments';
 import { stylistsByLocationForRange } from './stylists-by-location';
 import { buildAppointmentLookupsForRows } from './appointment-lookups';
-import { characterizeClientPaging, extractAppointmentsRangeRows, fetchAppointmentsRange, fetchBusiness, fetchClients, fetchLocationServices, fetchLocationStaff, fetchLocations, fetchStaffProfile, ping } from '../drivers/yot-client';
-import { runClientsSync, NotConfiguredError } from '../sync/sync-clients';
+import { characterizeClientPaging, extractAppointmentsRangeRows, fetchAppointmentsRange, fetchBusiness, fetchClient, fetchClients, fetchLocationServices, fetchLocationStaff, fetchLocations, fetchStaffProfile, ping, saveClient } from '../drivers/yot-client';
+import { runClientsSync, NotConfiguredError, mapClientRow } from '../sync/sync-clients';
 import { runStaffCashoutReport } from '../reports/run-staff-cashout';
 import { listStaffCashoutFacts, syncStaffCashoutFromReport } from '../reports/sync-staff-cashout';
 import { syncPromotionUsageRange } from '../reports/sync-promotion-usage';
@@ -4220,6 +4220,66 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     } catch (error: any) {
       return apiError(502, 'YOT_ERROR', error?.message || String(error));
     }
+  }
+
+  // POST /clients — add a client by hand (walk-in, lead). YOT is the system
+  // of record: save there first, then cache the record exactly as the roster
+  // sync would so Client Marketing segments can see it at once.
+  if (req.path === '/clients' && req.method === 'POST') {
+    const config = readYotConfig(teamId);
+    if (!config) return apiError(400, 'NOT_CONFIGURED', 'YOT apiKey not set for this team. POST /config first.');
+    const b = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, any>;
+    const givenName = cleanString(b.givenName ?? b.firstName);
+    const mobilePhone = cleanString(b.mobilePhone);
+    const homePhone = cleanString(b.homePhone);
+    const businessPhone = cleanString(b.businessPhone);
+    if (!givenName) return apiError(400, 'BAD_REQUEST', 'givenName (first name) is required');
+    const primaryPhone = mobilePhone ?? homePhone ?? businessPhone;
+    if (!primaryPhone) return apiError(400, 'BAD_REQUEST', 'a phone number is required (mobilePhone, homePhone or businessPhone)');
+    const { db } = initializeDatabase(teamId);
+    // Same person twice is the usual mistake; match on the digits of the
+    // primary phone against every phone column on the roster.
+    const digits = primaryPhone.replace(/\D/g, '').replace(/^1(\d{10})$/, '$1');
+    if (digits.length >= 10) {
+      const rows = db.select().from(schema.clients).where(eq(schema.clients.teamId, teamId)).all() as schema.Client[];
+      const same = (v: string | null | undefined) => !!v && v.replace(/\D/g, '').replace(/^1(\d{10})$/, '$1') === digits;
+      const existing = rows.find((r) => same(r.mobilePhone) || same(r.phone) || same(r.homePhone) || same(r.businessPhone));
+      if (existing) {
+        return apiError(409, 'DUPLICATE_PHONE', `That number already belongs to ${existing.firstName ?? 'a client'} on the roster`, {
+          existing: { id: existing.id, firstName: existing.firstName, lastName: existing.lastName, mobilePhone: existing.mobilePhone },
+        });
+      }
+    }
+    const payload: Record<string, any> = { givenName, active: true };
+    for (const [from, to] of [
+      ['surname', 'surname'], ['lastName', 'surname'], ['otherName', 'otherName'], ['mobilePhone', 'mobilePhone'],
+      ['homePhone', 'homePhone'], ['businessPhone', 'businessPhone'], ['emailAddress', 'emailAddress'], ['email', 'emailAddress'],
+      ['birthday', 'birthday'], ['gender', 'gender'], ['street', 'street'], ['suburb', 'suburb'], ['state', 'state'],
+      ['postcode', 'postcode'], ['country', 'country'],
+    ] as const) {
+      const v = cleanString(b[from]);
+      if (v && payload[to] == null) payload[to] = v;
+    }
+    let saved: Record<string, any>;
+    try {
+      saved = await saveClient(config, payload, { timeoutMs: 30_000 });
+    } catch (error: any) {
+      return apiError(502, 'YOT_ERROR', error?.message || 'YOT rejected the client');
+    }
+    const newId = saved?.id ?? saved?.privateId;
+    if (newId == null) return apiError(502, 'YOT_ERROR', 'YOT saved the client but returned no id');
+    // Re-read so the cache holds YOT's canonical shape; fall back to the save
+    // reply if the read lags behind the write.
+    let record: Record<string, any> | null = null;
+    try { record = await fetchClient(config, newId, { timeoutMs: 15_000 }); } catch { record = null; }
+    const item = record ?? { ...payload, ...saved, id: newId };
+    const sourceLocationId = cleanString(b.sourceLocationId ?? b.locationId);
+    const values = mapClientRow(item, { teamId, now: new Date().toISOString(), locationIdRaw: sourceLocationId ?? null });
+    const existingRow = db.select().from(schema.clients).where(and(eq(schema.clients.teamId, teamId), eq(schema.clients.id, values.id))).all();
+    if (existingRow.length) db.update(schema.clients).set({ ...values }).where(and(eq(schema.clients.teamId, teamId), eq(schema.clients.id, values.id))).run();
+    else db.insert(schema.clients).values(values).run();
+    const client = db.select().from(schema.clients).where(and(eq(schema.clients.teamId, teamId), eq(schema.clients.id, values.id))).all()[0];
+    return { status: 201, data: { ok: true, client, yot: { id: newId, reRead: !!record } } };
   }
 
   const clientMatch = req.path.match(/^\/clients\/([^/]+)$/);
