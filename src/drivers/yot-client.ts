@@ -91,6 +91,29 @@ export async function fetchClients(
  * Returns null on 404 (deleted/merged client); throws on any other non-2xx so
  * the caller can retry.
  */
+/**
+ * Create (no id) or update (with id) a client in YOT. POST /1/api/client/save
+ * takes the same field names GET /client/{id} returns — givenName, surname,
+ * mobilePhone, emailAddress, birthday, gender, street, suburb, state,
+ * postcode, country, otherName, homePhone, businessPhone, active — and
+ * answers with the saved record, id included.
+ */
+export async function saveClient(
+  config: YotConfig,
+  client: Record<string, any>,
+  opts: { timeoutMs?: number } = {},
+): Promise<Record<string, any>> {
+  const res = await yotFetch(config, '/client/save', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(client),
+    timeoutMs: opts.timeoutMs,
+  });
+  if (!res.ok) throw new Error(`YOT /client/save failed: ${res.status}`);
+  const data = await res.json().catch(() => null);
+  return data && typeof data === 'object' ? (data as Record<string, any>) : {};
+}
+
 export async function fetchClient(
   config: YotConfig,
   clientId: string | number,
