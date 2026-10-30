@@ -2793,15 +2793,9 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         // Distinct from tipsTotal, which is StaffCashout's actual tips column;
         // hoursMinutes sums parsed "Xh, Ym" cells.
         avgTipWeighted: number; tipsTotal: number; tipsMatched: boolean; hoursMinutes: number;
-        // StaffWorkSummary ratios. salesPerHour and avgLength are averages, so
-        // they're accumulated as Σ(value × weight) and divided by Σ(weight) at
-        // the end — a weighted mean, never a mean of means.
-        //
-        // Each carries its OWN weight: the report can supply an Avg Length with
-        // no Sales per hour (real, 2026-08-04). A shared weight turned that
-        // missing value into a 0.00 on the leaderboard, which reads as "sold
-        // nothing per hour" rather than "not reported".
-        salesPerHourWeighted: number; salesPerHourWeight: number;
+        // StaffWorkSummary's Avg Length is an average, so it's accumulated as
+        // Σ(value × weight) and divided by Σ(weight) at the end — a weighted
+        // mean, never a mean of means.
         avgLengthWeighted: number; avgLengthWeight: number;
       };
       // StaffWorkSummary facts for the same window, keyed like the cashout join
@@ -2842,95 +2836,26 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
        *  contributes instead of vanishing from their own average.
        *
        *  Still used for chair time (Avg Length), which IS an average this can
-       *  legitimately weight. It is no longer used for Sales per hour — see
-       *  the range lookup below. */
+       *  legitimately weight. Sales per hour is not read from this report at
+       *  all — see salesPerHourStatus below. */
       const workSummaryWeightOf = (ws: WorkSummaryFact) => (
         Number(ws.workLessBreaksMinutes || 0) > 0
           ? Number(ws.workLessBreaksMinutes)
           : (Number(ws.daysWorked || 0) > 0 ? Number(ws.daysWorked) * 60 : 60)
       );
 
-      /* Sales per hour for the requested window, from YOT's own figure for
-       * that window — never rebuilt from the daily rows, which produces a
-       * different statistic (see db/migrations/0023).
+      /* Sales per hour = haircuts over hours worked, both from this same
+       * StaffPerformance report, rederived from the window's sums below. It is
+       * NOT YOT's Staff Work Summary "Sales per hour": that figure's divisor
+       * is neither worked nor scheduled hours and could not be reproduced
+       * (see staff-work-summary.ts), and its range form disagreed with the
+       * Haircuts and Hours worked columns sitting next to it — one stylist,
+       * 2026-10-01..26: 83 cuts in 52h 15m on the page, 0.89 from YOT.
+       * The customer's definition is the one next to it: 83 / 52.25 = 1.59.
        *
-       * A single-day request needs no range pull: the daily row already IS
-       * YOT's value for that window. Anything longer is looked up by exact
-       * (start, end); a miss starts a background pull and reports 'computing'
-       * rather than showing a number we know to be wrong. Whatever gets
-       * computed is cached, so a repeat of the same window is instant however
-       * it was first filled — nightly preset warm or an ad-hoc range. */
-      const isSingleDay = startDate === endDate;
-      const rangeSalesPerHour = new Map<string, number | null>();
-      /* Same rows keyed by staff alone, for the location-keyed join's two
-       * known misses — the mirror of workSummaryByStaff on the daily path:
-       *
-       *   - StaffWorkSummary files a stylist under the shop they were
-       *     SCHEDULED at, StaffPerformance under where the SALE happened, so
-       *     anyone covering a second shop misses on location.
-       *   - The report's location column is sometimes a stylist's name rather
-       *     than a shop (283 of 6,543 rows; every World of Golf FL. row for
-       *     2026-08-01..09 is filed under "Alex Stanley"). Those rows carry a
-       *     correct rate against an unusable location.
-       *
-       * Only used when exactly one candidate exists. Two rows for one person
-       * means two shops with two different rates and no basis for picking, and
-       * a blank beats a coin toss. */
-      const rangeByStaff = new Map<string, Array<{ locationName: string; staffName: string; salesPerHour: number | null }>>();
-      let salesPerHourStatus: 'ready' | 'computing' | 'unavailable' = 'ready';
-      if (!isSingleDay) {
-        try {
-          const rangeRows = sqlite.prepare(
-            `SELECT location_name AS locationName, staff_name AS staffName, sales_per_hour AS salesPerHour
-               FROM staff_work_summary_range_facts
-              WHERE team_id = ? AND start_date = ? AND end_date = ?`,
-          ).all(teamId, startDate, endDate) as Array<{ locationName: string; staffName: string; salesPerHour: number | null }>;
-          if (rangeRows.length) {
-            for (const row of rangeRows) {
-              rangeSalesPerHour.set(tipsKey(row.locationName, row.staffName, ''), row.salesPerHour);
-              const staffKey = String(row.staffName || '').replace(/\s+/g, ' ').trim().toLowerCase();
-              rangeByStaff.set(staffKey, [...(rangeByStaff.get(staffKey) || []), row]);
-            }
-          } else {
-            const job = sqlite.prepare(
-              `SELECT status, error FROM staff_work_summary_range_jobs
-                WHERE team_id = ? AND start_date = ? AND end_date = ?`,
-            ).get(teamId, startDate, endDate) as { status?: string; error?: string } | undefined;
-            // A previous pull that failed is reported as unavailable rather
-            // than retried on every page load — the report outage that caused
-            // it is not going to clear inside one refresh.
-            if (job?.status === 'failed') {
-              salesPerHourStatus = 'unavailable';
-            } else {
-              salesPerHourStatus = 'computing';
-              const cfg = readYotConfig(teamId);
-              if (cfg) {
-                ensureRangeSyncStarted(
-                  sqlite, teamId, startDate, endDate,
-                  Number(cleanString(req.query.organisationId || req.query.org) || String(DEFAULT_REVENUE_ORGANISATION_ID)),
-                  cfg,
-                );
-              } else {
-                salesPerHourStatus = 'unavailable';
-              }
-            }
-          }
-        } catch {
-          // Table missing (pre-migration) — fall back to reporting the figure
-          // as unavailable rather than serving the old inflated roll-up.
-          salesPerHourStatus = 'unavailable';
-        }
-      }
-
-      /** This window's figure for one (shop, stylist): by location first, then
-       *  by name alone when the location-keyed join misses for one of the two
-       *  reasons noted on rangeByStaff. */
-      const rangeSalesPerHourFor = (locationName: string | null, staffName: string | null): number | null => {
-        const direct = rangeSalesPerHour.get(tipsKey(locationName, staffName, ''));
-        if (direct !== undefined) return direct;
-        const candidates = rangeByStaff.get(String(staffName || '').replace(/\s+/g, ' ').trim().toLowerCase());
-        return candidates?.length === 1 ? candidates[0].salesPerHour : null;
-      };
+       * Always ready: nothing is pulled on demand any more. The field stays
+       * in the payload because the dashboard reads it. */
+      const salesPerHourStatus: 'ready' | 'computing' | 'unavailable' = 'ready';
 
       const buckets = new Map<string, Acc>();
       let lastUpdatedAt: string | null = null;
@@ -2945,7 +2870,6 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
           productsSold: 0, productsValue: 0, totalSalesValue: 0,
           pointsEarned: 0, commissionTipsTotal: 0,
           avgTipWeighted: 0, tipsTotal: 0, tipsMatched: false, hoursMinutes: 0,
-          salesPerHourWeighted: 0, salesPerHourWeight: 0,
           avgLengthWeighted: 0, avgLengthWeight: 0,
         };
         acc.totalSalesCount += Number(f.totalSalesCount || 0);
@@ -2968,10 +2892,6 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         const matches = exact ? [exact] : (workSummaryByStaff.get(staffKey) || []);
         for (const ws of matches) {
           const weight = workSummaryWeightOf(ws);
-          if (ws.salesPerHour != null) {
-            acc.salesPerHourWeighted += Number(ws.salesPerHour) * weight;
-            acc.salesPerHourWeight += weight;
-          }
           if (ws.avgLengthMinutes != null) {
             acc.avgLengthWeighted += Number(ws.avgLengthMinutes) * weight;
             acc.avgLengthWeight += weight;
@@ -2996,16 +2916,12 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
           hoursWorkedMinutes: a.hoursMinutes,
           hoursWorked: formatMinutesAsHours(a.hoursMinutes),
           totalPerHour: hours > 0 ? a.totalSalesValue / hours : null,
-          // Null (not zero) when unknown — an unmatched stylist has no
-          // recorded rate, and a zero would read as "sold nothing per hour".
-          //
-          // A single day uses YOT's value for that day; a longer window uses
-          // YOT's value for that window. Neither is derived from the other.
-          // While a window is still being pulled every row is null and the
-          // payload's salesPerHourStatus says why.
-          salesPerHour: isSingleDay
-            ? (a.salesPerHourWeight > 0 ? a.salesPerHourWeighted / a.salesPerHourWeight : null)
-            : rangeSalesPerHourFor(a.locationName, a.staffName),
+          // Haircuts over hours worked. Null (not zero) with no hours — a
+          // zero would read as "sold nothing per hour", and three cuts on a
+          // day with no timecard is not a rate. The weight is the minutes so
+          // a per-person merge across shops rederives cuts / hours from sums.
+          salesPerHour: hours > 0 ? a.totalSalesCount / hours : null,
+          salesPerHourWeight: a.hoursMinutes,
           chairTimeMinutes: a.avgLengthWeight > 0 ? a.avgLengthWeighted / a.avgLengthWeight : null,
         };
       }).sort((a, b) => b.totalSalesValue - a.totalSalesValue);
