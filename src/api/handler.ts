@@ -951,213 +951,6 @@ async function syncStaffWorkSummaryDay(
   }
 }
 
-/**
- * Pull StaffWorkSummary for a whole window and store YOT's own figure for it.
- *
- * This is the only correct source for a multi-day "Sales per hour". See
- * db/migrations/0023 for why the per-day rows cannot be rolled up into one.
- *
- * Every window that gets computed is persisted — the nightly preset warm and
- * an ad-hoc range a user picked land in the same table, so the second request
- * for a given window is served from cache no matter which path filled it.
- *
- * Never throws, for the same reason syncStaffWorkSummaryDay doesn't: this runs
- * detached from a request, and an unhandled rejection would take the process
- * with it. The failure is recorded on the job row instead.
- */
-/** Document-poll ceiling for a range pull: 1600 × 1.5s ≈ 40 minutes. */
-const RANGE_REPORT_MAX_POLLS = 1600;
-
-export async function syncStaffWorkSummaryRange(
-  sqlite: ReturnType<typeof initializeDatabase>['sqlite'],
-  teamId: string,
-  startDate: string,
-  endDate: string,
-  organisationId: number,
-  config: YotConfig,
-): Promise<{ rowsWritten: number; error?: string }> {
-  const markJob = (status: string, extra: Record<string, unknown> = {}) => {
-    sqlite.prepare(
-      `INSERT INTO staff_work_summary_range_jobs
-         (team_id, start_date, end_date, status, started_at, finished_at, row_count, error)
-       VALUES (?,?,?,?,?,?,?,?)
-       ON CONFLICT (team_id, start_date, end_date) DO UPDATE SET
-         status = excluded.status,
-         finished_at = excluded.finished_at,
-         row_count = excluded.row_count,
-         error = excluded.error`,
-    ).run(
-      teamId, startDate, endDate, status, new Date().toISOString(),
-      (extra.finishedAt as string) ?? null,
-      (extra.rowCount as number) ?? null,
-      (extra.error as string) ?? null,
-    );
-  };
-
-  markJob('running');
-  try {
-    const client = createReportClient(config, { maxPolls: RANGE_REPORT_MAX_POLLS });
-    const r = reportRegistry.staffWorkSummary;
-
-    /* One report per shop, not one for the whole org.
-     *
-     * Asked org-wide, this report has a hard cliff: it renders a 10-day window
-     * in 107s, and for anything around a month or longer it reports the
-     * document READY at ~303s and hands back an empty file — 3KB of chrome as
-     * XLSX, literally "\r\n" as CSV. Same 303s either way, so it is neither a
-     * format problem nor a poll budget we could raise our way out of; waiting
-     * longer does nothing because the document is already "ready".
-     *
-     * Asked one location at a time, the identical 31-day window that empties
-     * out org-wide returns 11 real rows in SIX seconds, and the full month
-     * across all 28 shops completes in 150s. So the fan-out is not a
-     * workaround for slowness — it sidesteps whatever the org-wide query
-     * degenerates into, and it is faster in absolute terms.
-     *
-     * Correctness is untouched: each pull still asks YOT for its own figure
-     * over the exact window. We split by shop, never by time — splitting by
-     * time is the very thing that produced the wrong numbers this all started
-     * with (see db/migrations/0023). */
-    const locationRows = sqlite.prepare(
-      `SELECT id, name FROM locations WHERE team_id = ? AND (active = 1 OR active IS NULL) ORDER BY name`,
-    ).all(teamId) as Array<{ id: string; name: string }>;
-    if (!locationRows.length) throw new Error('no active locations to pull');
-
-    const collected: Array<{
-      locationName: string; staffName: string; salesPerHour: number | null;
-      avgLengthMinutes: number | null; scheduledMinutes: number | null;
-      workLessBreaksMinutes: number | null; daysWorked: number | null;
-    }> = [];
-    const failedLocations: string[] = [];
-
-    for (const loc of locationRows) {
-      const params = {
-        startDateIso: `${startDate}T00:00:00`,
-        endDateIso: `${endDate}T23:59:59`,
-        organisationId,
-        locationId: Number(loc.id),
-        staffId: null,
-      };
-      try {
-        const defs = await client.getParameters(r.reportType, r.buildParameterDiscovery(params, config.apiKey));
-        const inst = await client.createInstance(r.reportType, r.buildInstanceParams(params));
-        const doc = await client.createDocument(inst, r.preferredFormat);
-        await client.waitForDocument(inst, doc.documentId);
-        const file = await client.fetchDocument(inst, doc.documentId);
-        collected.push(...r.parseDocument(file.buffer, defs).rows);
-      } catch (err: any) {
-        // One shop failing must not lose the other twenty-seven. The window is
-        // still written; the job records which shops are missing from it.
-        failedLocations.push(`${loc.name}: ${err?.message || err}`);
-      }
-    }
-
-    const parsed = { rows: collected };
-
-    const upsert = sqlite.prepare(
-      `INSERT INTO staff_work_summary_range_facts (
-        team_id, start_date, end_date, location_name, staff_name,
-        sales_per_hour, avg_length_minutes, scheduled_minutes,
-        work_less_breaks_minutes, days_worked, computed_at
-      ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
-      ON CONFLICT (team_id, start_date, end_date, location_name, staff_name) DO UPDATE SET
-        sales_per_hour = excluded.sales_per_hour,
-        avg_length_minutes = excluded.avg_length_minutes,
-        scheduled_minutes = excluded.scheduled_minutes,
-        work_less_breaks_minutes = excluded.work_less_breaks_minutes,
-        days_worked = excluded.days_worked,
-        computed_at = excluded.computed_at`,
-    );
-
-    // Wipe first so a stylist who left YOT doesn't linger in a recomputed window.
-    sqlite.prepare(
-      'DELETE FROM staff_work_summary_range_facts WHERE team_id = ? AND start_date = ? AND end_date = ?',
-    ).run(teamId, startDate, endDate);
-
-    const now = new Date().toISOString();
-    let rowsWritten = 0;
-    for (const row of parsed.rows) {
-      if (!row.locationName || !row.staffName) continue;
-      upsert.run(
-        teamId, startDate, endDate, row.locationName, row.staffName,
-        row.salesPerHour, row.avgLengthMinutes, row.scheduledMinutes,
-        row.workLessBreaksMinutes, row.daysWorked, now,
-      );
-      rowsWritten += 1;
-    }
-    /* A pull that produced nothing is a failure, not an empty success.
-     *
-     * Recording zero rows as 'ready' makes it indistinguishable from "never
-     * pulled", and the miss branch in GET /staff-performance then starts a
-     * fresh pull on every page load — a multi-minute report job per view, for
-     * a window that just came back empty, showing "computing…" forever. That
-     * is exactly what the org-wide query used to produce on every month-plus
-     * window; the fan-out above fixes the cause, and this stays as the guard
-     * so any future cause surfaces instead of looping. */
-    if (rowsWritten === 0) {
-      const message = failedLocations.length
-        ? `every location failed — ${failedLocations[0]}`
-        : 'report returned no rows for this window';
-      markJob('failed', { finishedAt: now, rowCount: 0, error: message });
-      return { rowsWritten: 0, error: message };
-    }
-    /* Partial windows are kept, not discarded. Twenty-seven shops' worth of
-     * correct figures beats none, and the shops that failed already render the
-     * same "—" as a stylist the report does not cover. The job row names them
-     * so a partial window is diagnosable rather than merely incomplete. */
-    markJob('ready', {
-      finishedAt: now,
-      rowCount: rowsWritten,
-      error: failedLocations.length
-        ? `${failedLocations.length} of ${locationRows.length} locations failed: ${failedLocations.join('; ').slice(0, 400)}`
-        : null,
-    });
-    return { rowsWritten };
-  } catch (error: any) {
-    const message = error?.message || String(error);
-    markJob('failed', { finishedAt: new Date().toISOString(), error: message });
-    return { rowsWritten: 0, error: message };
-  }
-}
-
-/**
- * Windows currently being pulled in this process.
- *
- * The jobs table records status durably, but a second request arriving while
- * the first is mid-pull would read 'running' and still need to know not to
- * start its own. Kept on globalThis for the same reason the DB connections are
- * (see src/db/index.ts): the gateway re-evaluates this module, and a
- * module-local Set would be empty every time.
- */
-const RANGE_INFLIGHT_KEY = '__yotWorkSummaryRangeInflight__';
-function rangeInflight(): Set<string> {
-  const g = globalThis as any;
-  return g[RANGE_INFLIGHT_KEY] || (g[RANGE_INFLIGHT_KEY] = new Set<string>());
-}
-
-/**
- * Start a range pull in the background unless one is already running.
- *
- * Deliberately not awaited by the caller — the report takes minutes, far
- * longer than a page load, so the request returns "computing" and the row
- * lands for the next one.
- */
-export function ensureRangeSyncStarted(
-  sqlite: ReturnType<typeof initializeDatabase>['sqlite'],
-  teamId: string,
-  startDate: string,
-  endDate: string,
-  organisationId: number,
-  config: YotConfig,
-): void {
-  const key = `${teamId}::${startDate}::${endDate}`;
-  const inflight = rangeInflight();
-  if (inflight.has(key)) return;
-  inflight.add(key);
-  void syncStaffWorkSummaryRange(sqlite, teamId, startDate, endDate, organisationId, config)
-    .finally(() => inflight.delete(key));
-}
-
 export function listDisbursementGroups(): DisbursementGroupConfig[] {
   return Object.values(GROUP_CONFIGS);
 }
@@ -2837,7 +2630,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
        *
        *  Still used for chair time (Avg Length), which IS an average this can
        *  legitimately weight. Sales per hour is not read from this report at
-       *  all — see salesPerHourStatus below. */
+       *  all — it is haircuts over hours worked, below. */
       const workSummaryWeightOf = (ws: WorkSummaryFact) => (
         Number(ws.workLessBreaksMinutes || 0) > 0
           ? Number(ws.workLessBreaksMinutes)
@@ -2851,11 +2644,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
        * (see staff-work-summary.ts), and its range form disagreed with the
        * Haircuts and Hours worked columns sitting next to it — one stylist,
        * 2026-10-01..26: 83 cuts in 52h 15m on the page, 0.89 from YOT.
-       * The customer's definition is the one next to it: 83 / 52.25 = 1.59.
-       *
-       * Always ready: nothing is pulled on demand any more. The field stays
-       * in the payload because the dashboard reads it. */
-      const salesPerHourStatus: 'ready' | 'computing' | 'unavailable' = 'ready';
+       * The customer's definition is the one next to it: 83 / 52.25 = 1.59. */
 
       const buckets = new Map<string, Acc>();
       let lastUpdatedAt: string | null = null;
@@ -2929,9 +2718,6 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         status: 200,
         data: {
           ok: true, startDate, endDate, rowCount: rows.length, lastUpdatedAt, rows,
-          // ready | computing | unavailable. Lets the page show that the
-          // column is being fetched rather than silently rendering blanks.
-          salesPerHourStatus,
         },
       };
     } catch (error: any) {
@@ -2942,53 +2728,6 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
   // POST /staff-performance/sync?date=YYYY-MM-DD (default today)
   // Pulls the YOT StaffPerformance_2121 report for a single day and upserts
   // per-(location, staff) facts. To sync a range, call once per day.
-  // POST /staff-work-summary/sync-range?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
-  // Pulls YOT's StaffWorkSummary for the whole window and stores its own
-  // Sales-per-hour for it. Runs to completion (minutes) — this is the cron
-  // path that warms the leaderboard presets. Ad-hoc windows take the
-  // background path from GET /staff-performance instead.
-  if (req.path === '/staff-work-summary/sync-range' && req.method === 'POST') {
-    const config = readYotConfig(teamId);
-    if (!config) return apiError(400, 'NOT_CONFIGURED', 'YOT apiKey not set for this team. POST /config first.');
-    const startDate = toDateOnlyInput(req.query.startDate || req.query.start);
-    const endDate = toDateOnlyInput(req.query.endDate || req.query.end);
-    if (!startDate || !endDate) return apiError(400, 'BAD_REQUEST', 'startDate and endDate required (YYYY-MM-DD)');
-    if (startDate > endDate) return apiError(400, 'BAD_REQUEST', 'startDate must not be after endDate');
-    const { sqlite } = initializeDatabase(teamId);
-    const organisationId = Number(
-      cleanString(req.query.organisationId || req.query.org) || String(DEFAULT_REVENUE_ORGANISATION_ID),
-    );
-    /* Starts the pull and returns immediately rather than holding the request
-     * open for it.
-     *
-     * A month across every shop takes ~150s and a year will take longer, while
-     * Node's HTTP server abandons a request at 300s by default — so a
-     * synchronous version killed the caller's connection at five minutes no
-     * matter what timeout the caller set. Poll
-     * /staff-work-summary/range-status for the outcome. */
-    ensureRangeSyncStarted(sqlite, teamId, startDate, endDate, organisationId, config);
-    return { status: 202, data: { ok: true, startDate, endDate, status: 'running' } };
-  }
-
-  // GET /staff-work-summary/range-status?startDate=&endDate=
-  // The outcome of a range pull: running | ready | failed, or missing when no
-  // pull has ever been started for that window.
-  if (req.path === '/staff-work-summary/range-status' && req.method === 'GET') {
-    const startDate = toDateOnlyInput(req.query.startDate || req.query.start);
-    const endDate = toDateOnlyInput(req.query.endDate || req.query.end);
-    if (!startDate || !endDate) return apiError(400, 'BAD_REQUEST', 'startDate and endDate required (YYYY-MM-DD)');
-    const { sqlite } = initializeDatabase(teamId);
-    const job = sqlite.prepare(
-      `SELECT status, started_at AS startedAt, finished_at AS finishedAt, row_count AS rowCount, error
-         FROM staff_work_summary_range_jobs
-        WHERE team_id = ? AND start_date = ? AND end_date = ?`,
-    ).get(teamId, startDate, endDate) as Record<string, unknown> | undefined;
-    return {
-      status: 200,
-      data: { ok: true, startDate, endDate, ...(job ?? { status: 'missing' }) },
-    };
-  }
-
   if (req.path === '/staff-performance/sync' && req.method === 'POST') {
     const config = readYotConfig(teamId);
     if (!config) return apiError(400, 'NOT_CONFIGURED', 'YOT apiKey not set for this team. POST /config first.');

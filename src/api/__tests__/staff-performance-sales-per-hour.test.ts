@@ -35,13 +35,6 @@ function perf(teamId: string, locationName: string, staffName: string, date: str
      VALUES (?,?,?,?,?,?,?,?)`,
   ).run(teamId, locationName, staffName, date, count, count * 40, hoursRaw, '2026-10-27T00:00:00Z');
 }
-function workSummaryRange(teamId: string, locationName: string, staffName: string, start: string, end: string, salesPerHour: number) {
-  const { sqlite } = initializeDatabase(teamId);
-  sqlite.prepare(
-    `INSERT INTO staff_work_summary_range_facts (team_id, start_date, end_date, location_name, staff_name, sales_per_hour, computed_at)
-     VALUES (?,?,?,?,?,?,?)`,
-  ).run(teamId, start, end, locationName, staffName, salesPerHour, '2026-10-27T00:00:00Z');
-}
 function workSummaryDay(teamId: string, locationName: string, staffName: string, date: string, salesPerHour: number) {
   const { sqlite } = initializeDatabase(teamId);
   sqlite.prepare(
@@ -61,7 +54,7 @@ beforeEach(() => {
 afterEach(() => { rmSync(tmp, { recursive: true, force: true }); });
 
 describe('GET /staff-performance salesPerHour', () => {
-  it('is haircuts over hours worked for a multi-day window, ignoring YOT\'s range figure', async () => {
+  it('is haircuts over hours worked for a multi-day window', async () => {
     const teamId = freshTeam();
     // One stylist's October, as the Staff Performance page showed it: 83 cuts, 52h 15m.
     perf(teamId, 'Livonia MI', 'Stylist One', '2026-10-01', 3, '0h, 0m');
@@ -73,8 +66,6 @@ describe('GET /staff-performance salesPerHour', () => {
     perf(teamId, 'Livonia MI', 'Stylist One', '2026-10-20', 10, '6h, 0m');
     perf(teamId, 'Livonia MI', 'Stylist One', '2026-10-22', 12, '7h, 0m');
     perf(teamId, 'Livonia MI', 'Stylist One', '2026-10-26', 13, '9h, 0m');
-    // What YOT's own range report said for the same window — must not be used.
-    workSummaryRange(teamId, 'Livonia MI', 'Stylist One', '2026-10-01', '2026-10-26', 0.8917);
     const res: any = await get(teamId, '2026-10-01', '2026-10-26');
     expect(res.status).toBe(200);
     const ashley = rowFor(res, 'Stylist One');
@@ -84,7 +75,7 @@ describe('GET /staff-performance salesPerHour', () => {
     // The weight behind it is the hours, so a per-person merge across shops
     // rederives cuts / hours from the sums.
     expect(ashley.salesPerHourWeight).toBe(52 * 60 + 15);
-    expect(res.data.salesPerHourStatus).toBe('ready');
+    expect(res.data.salesPerHourStatus).toBeUndefined();
   });
 
   it('a single day is the same rule, not YOT\'s daily figure', async () => {
@@ -103,12 +94,11 @@ describe('GET /staff-performance salesPerHour', () => {
     expect(rowFor(res, 'Stylist One').salesPerHourWeight).toBe(0);
   });
 
-  it('a window with no cached range figure is ready, not computing', async () => {
+  it('a window with no Work Summary rows at all still gets a rate', async () => {
     const teamId = freshTeam();
     perf(teamId, 'Livonia MI', 'Stylist One', '2026-10-20', 10, '6h, 0m');
     perf(teamId, 'Livonia MI', 'Stylist One', '2026-10-22', 12, '7h, 0m');
     const res: any = await get(teamId, '2026-10-19', '2026-10-25');
-    expect(res.data.salesPerHourStatus).toBe('ready');
     expect(rowFor(res, 'Stylist One').salesPerHour).toBeCloseTo(22 / 13, 6);
   });
 });
