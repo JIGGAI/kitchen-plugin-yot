@@ -2673,6 +2673,49 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
   }
 
   // ─── Staff Performance (StaffPerformance_2121 report) ──────────────────
+  // GET /staff-performance/monthly?endMonth=YYYY-MM&months=6
+  // Per-(location, stylist, month) sales value and count from
+  // staff_performance_facts, for the /stylists Avg ticket trend. Ships only
+  // the two additive columns: avg ticket is value / count and is rederived by
+  // whoever folds the rows (per person across shops, per month), the same
+  // rule GET /staff-performance follows for ratios. Default window = the six
+  // months ending with the last COMPLETE month — the month in progress is
+  // never a full month's figure.
+  if (req.path === '/staff-performance/monthly' && req.method === 'GET') {
+    try {
+      const { sqlite } = initializeDatabase(teamId);
+      const endMonthRaw = cleanString(req.query.endMonth);
+      if (endMonthRaw && !/^\d{4}-(0[1-9]|1[0-2])$/.test(endMonthRaw)) {
+        return apiError(400, 'BAD_REQUEST', 'endMonth must be YYYY-MM');
+      }
+      const monthsRaw = Number(req.query.months);
+      const monthCount = Number.isFinite(monthsRaw) && monthsRaw > 0 ? Math.min(24, Math.floor(monthsRaw)) : 6;
+      // "YYYY-MM" shifted by a number of months; UTC arithmetic on the 1st so
+      // no month length or DST can move it.
+      const shiftMonth = (yearMonth: string, by: number) => {
+        const [y, m] = yearMonth.split('-').map(Number);
+        const d = new Date(Date.UTC(y, m - 1 + by, 1));
+        return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+      };
+      const endMonth = endMonthRaw || shiftMonth(dateOnlyNow().slice(0, 7), -1);
+      const months: string[] = [];
+      for (let i = monthCount - 1; i >= 0; i -= 1) months.push(shiftMonth(endMonth, -i));
+      const rows = sqlite.prepare(
+        `SELECT location_name AS locationName, staff_name AS staffName, substr(date, 1, 7) AS yearMonth,
+                SUM(COALESCE(total_sales_value, 0)) AS totalSalesValue,
+                SUM(COALESCE(total_sales_count, 0)) AS totalSalesCount
+           FROM staff_performance_facts
+          WHERE team_id = ? AND date >= ? AND date < ?
+          GROUP BY location_name, staff_name, substr(date, 1, 7)`,
+      ).all(teamId, `${months[0]}-01`, `${shiftMonth(endMonth, 1)}-01`) as Array<{
+        locationName: string; staffName: string; yearMonth: string; totalSalesValue: number; totalSalesCount: number;
+      }>;
+      return { status: 200, data: { ok: true, months, rowCount: rows.length, rows } };
+    } catch (error: any) {
+      return apiError(500, 'INTERNAL', error?.message || 'Failed to read monthly staff performance facts');
+    }
+  }
+
   // GET /staff-performance?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
   // Aggregates per (location, staff) across the requested date range from
   // staff_performance_facts. Sums additive columns; ratios are recomputed
