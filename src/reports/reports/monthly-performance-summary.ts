@@ -3,11 +3,11 @@
 // Telerik report type:
 //   "YoureOnTime.Web.TelerikReports.MonthlyPerformanceSummary, YoureOnTime.Reports"
 //
-// Sheet name "MonthlyPerformanceSummary". 33-column workbook. Header lives
-// across rows 4-6 (split labels + sublabels). Data rows are positioned by
-// fixed column index (slightly off from header positions due to merged cells
-// in the Telerik layout — column positions verified by sum-checks against
-// Grand Total row). For each location:
+// Sheet name "MonthlyPerformanceSummary". Header lives across several rows
+// (split labels + sublabels). Telerik has changed the workbook width over time,
+// so data columns are resolved from those labels rather than assumed to live at
+// one permanent index. Some labels sit over decorative spacer columns; the
+// resolver accounts for those stable offsets. For each location:
 //   <Location Name>
 //   <Month label e.g. "May 2026"> — one detail row per month in range
 //   ...
@@ -97,6 +97,56 @@ const COL = {
   yoyPct: 32,
 } as const;
 
+type MonthlyPerformanceColumns = { [Key in keyof typeof COL]: number };
+
+function normalizeHeader(value: unknown): string {
+  return String(value ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function findHeaderColumn(rows: unknown[][], label: string): number | null {
+  const wanted = normalizeHeader(label);
+  for (const row of rows) {
+    const index = row.findIndex((value) => normalizeHeader(value) === wanted);
+    if (index >= 0) return index;
+  }
+  return null;
+}
+
+/**
+ * Resolve the numeric data columns from the workbook's visible headers.
+ *
+ * The Telerik export uses blank/decorative cells inside several metric groups,
+ * so not every number lands in the same cell as its label. Deriving each index
+ * from the nearest named header keeps both the legacy 33-column layout and the
+ * current 35-column layout working when a group is inserted or removed.
+ */
+export function resolveMonthlyPerformanceColumns(rows: unknown[][]): MonthlyPerformanceColumns {
+  const header = (label: string, fallback: number) => findHeaderColumn(rows, label) ?? fallback;
+  const cancelled = header('Cancelled', COL.cancelled);
+  const salesPerDayLabel = header('Sales per Day', COL.salesPerDay + 1);
+  const serviceSalesLabel = header('Service Sales Value', COL.serviceSales + 2);
+  const totalSalesLabel = header('Total Sales', COL.totalSales + 1);
+  const comparisonLabel = header('Last Year Comparison', COL.yoyAmount + 1);
+
+  return {
+    monthLabel: Math.max(0, header('Month Starting', COL.monthLabel + 1) - 1),
+    appointments: Math.max(0, cancelled - 1),
+    cancelled,
+    noShows: header('No Shows', COL.noShows),
+    onlineBookings: header('Online Bookings', COL.onlineBookings),
+    newClients: header('New Clients', COL.newClients),
+    totalClients: header('Total Clients', COL.totalClients),
+    salesCount: header('# of Sales', COL.salesCount),
+    salesPerDay: Math.max(0, salesPerDayLabel - 1),
+    voucherCount: header('# of Vouchers', COL.voucherCount),
+    productSales: header('Product Sales Value', COL.productSales),
+    serviceSales: Math.max(0, serviceSalesLabel - 2),
+    totalSales: Math.max(0, totalSalesLabel - 1),
+    yoyAmount: Math.max(0, comparisonLabel - 1),
+    yoyPct: comparisonLabel + 3,
+  };
+}
+
 function parseNumber(value: unknown): number | null {
   if (value == null) return null;
   if (typeof value === 'number') return Number.isFinite(value) ? value : null;
@@ -171,12 +221,13 @@ export function parseMonthlyPerformanceSummaryWorkbook(
     return { sheetName: null, parameters: [], locations: [], rows: [] };
   }
 
+  const columns = resolveMonthlyPerformanceColumns(sheet.rows);
   const rows: MonthlyPerformanceSummaryRow[] = [];
   const locations: string[] = [];
   let currentLocation: string | null = null;
 
   for (const row of sheet.rows) {
-    const colA = String(row[1] ?? '').trim();
+    const colA = String(row[columns.monthLabel] ?? '').trim();
     if (!colA) continue;
 
     // Header / footer rows we ignore.
@@ -185,20 +236,20 @@ export function parseMonthlyPerformanceSummaryWorkbook(
     if (colA === 'Month Starting') continue;
 
     const numeric = {
-      appointments: valueAt(row, COL.appointments),
-      cancelled: valueAt(row, COL.cancelled),
-      noShows: valueAt(row, COL.noShows),
-      onlineBookings: valueAt(row, COL.onlineBookings),
-      newClients: valueAt(row, COL.newClients),
-      totalClients: valueAt(row, COL.totalClients),
-      salesCount: valueAt(row, COL.salesCount),
-      salesPerDay: valueAt(row, COL.salesPerDay),
-      voucherCount: valueAt(row, COL.voucherCount),
-      productSales: valueAt(row, COL.productSales),
-      serviceSales: valueAt(row, COL.serviceSales),
-      totalSales: valueAt(row, COL.totalSales),
-      yoyAmount: valueAt(row, COL.yoyAmount),
-      yoyPct: parsePctParens(row[COL.yoyPct]),
+      appointments: valueAt(row, columns.appointments),
+      cancelled: valueAt(row, columns.cancelled),
+      noShows: valueAt(row, columns.noShows),
+      onlineBookings: valueAt(row, columns.onlineBookings),
+      newClients: valueAt(row, columns.newClients),
+      totalClients: valueAt(row, columns.totalClients),
+      salesCount: valueAt(row, columns.salesCount),
+      salesPerDay: valueAt(row, columns.salesPerDay),
+      voucherCount: valueAt(row, columns.voucherCount),
+      productSales: valueAt(row, columns.productSales),
+      serviceSales: valueAt(row, columns.serviceSales),
+      totalSales: valueAt(row, columns.totalSales),
+      yoyAmount: valueAt(row, columns.yoyAmount),
+      yoyPct: parsePctParens(row[columns.yoyPct]),
     };
     const hasNumericData = Object.values(numeric).some((v) => v != null);
 
