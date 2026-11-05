@@ -11,7 +11,7 @@ import { initializeDatabase } from '../db';
 import * as schema from '../db/schema';
 import type { YotConfig } from '../types';
 import { fetchLocationRosterHtml, withAutoLogin } from '../drivers/yot-mvc-client';
-import { parseRosterHtml, scheduledOnly } from './parse-roster-html';
+import { parseRosterHtml, scheduledOnly, type RosterEntry } from './parse-roster-html';
 import { computeCoverageSlots, aggregateLightWindows } from './compute';
 import { resolveBusinessHoursForDate, type BusinessHoursSchedule } from './business-hours';
 import {
@@ -24,6 +24,7 @@ import {
   type CoverageSlot,
   type CustomerToStylistRatios,
   type DayOfWeek,
+  type Interval,
 } from './types';
 
 type SqliteDb = ReturnType<typeof initializeDatabase>['sqlite'];
@@ -296,6 +297,103 @@ function dowOf(dateIso: string): DayOfWeek {
   return DOW_KEYS[new Date(y, m - 1, d).getDay()];
 }
 
+type CoverageAppointment = { startsAt: string; endsAt: string; stylistId: string | null };
+
+export type CoverageDayFact = {
+  slots: CoverageSlot[];
+  payload: {
+    slots: CoverageSlot[];
+    averageDailyAppointments: number;
+    customersPerStylistForDay: number;
+    requiredStylists: number;
+    closed: boolean;
+    averageByDow: AverageByDow;
+    closedByDow: ClosedByDow;
+    averageHourlyForDay: Record<number, number>;
+  };
+  rosterRows: RosterEntry[];
+};
+
+/**
+ * Build one persisted coverage day from the three facts that can prove a shop
+ * operated: configured hours, at least one scheduled shift, or an appointment.
+ *
+ * A recurring-DOW average says how many stylists an operating day normally
+ * needs; it does not prove this specific date was open. Treating it as proof
+ * created phantom requirements on one-off closures (all roster cells were
+ * "Not Scheduled" and there were no appointments). Closed days deliberately
+ * persist an empty roster so a stray exception label cannot surface as an
+ * employee absence when the shop itself was not operating.
+ */
+export function buildCoverageDayFact(input: {
+  date: string;
+  businessHours: Interval | null;
+  dayIsClosedByHistory: boolean;
+  dayAvg: number;
+  customersPerStylistForDay: number;
+  requiredStylists: number;
+  averageByDow: AverageByDow;
+  closedByDow: ClosedByDow;
+  averageHourlyForDay: Record<number, number>;
+  slotMinutes: number;
+  rosterEntries: RosterEntry[];
+  appointments: CoverageAppointment[];
+}): CoverageDayFact {
+  const hasScheduledShift = input.rosterEntries.some((entry) =>
+    entry.status === 'scheduled' && !!entry.startsAt && !!entry.endsAt,
+  );
+  const hasOperatingEvidence = hasScheduledShift || input.appointments.length > 0;
+  const closed = input.dayIsClosedByHistory || !input.businessHours || !hasOperatingEvidence;
+
+  if (closed) {
+    const slots: CoverageSlot[] = [];
+    return {
+      slots,
+      payload: {
+        slots,
+        averageDailyAppointments: input.dayAvg,
+        customersPerStylistForDay: input.customersPerStylistForDay,
+        requiredStylists: 0,
+        closed: true,
+        averageByDow: input.averageByDow,
+        closedByDow: input.closedByDow,
+        averageHourlyForDay: input.averageHourlyForDay,
+      },
+      rosterRows: [],
+    };
+  }
+
+  // `closed` includes !businessHours; this guard only makes that relationship
+  // explicit to TypeScript before the slot calculator's non-null input.
+  if (!input.businessHours) throw new Error('Open coverage day is missing business hours');
+  const scheduled = scheduledOnly(input.rosterEntries)
+    .map((entry) => ({ stylistId: entry.stylistId, startsAt: entry.startsAt, endsAt: entry.endsAt }));
+  const slots = computeCoverageSlots({
+    date: input.date,
+    businessHours: input.businessHours,
+    slotMinutes: input.slotMinutes,
+    requiredStylists: input.requiredStylists,
+    averageDailyAppointments: input.dayAvg,
+    customersPerStylistForDay: input.customersPerStylistForDay,
+    appointments: input.appointments,
+    scheduled,
+  });
+  return {
+    slots,
+    payload: {
+      slots,
+      averageDailyAppointments: input.dayAvg,
+      customersPerStylistForDay: input.customersPerStylistForDay,
+      requiredStylists: input.requiredStylists,
+      closed: false,
+      averageByDow: input.averageByDow,
+      closedByDow: input.closedByDow,
+      averageHourlyForDay: input.averageHourlyForDay,
+    },
+    rosterRows: input.rosterEntries,
+  };
+}
+
 /**
  * Fetch one week of roster HTML, parse, then write a day-row into
  * `location_coverage_facts` for each day in the week. Returns the slots
@@ -364,76 +462,38 @@ export async function syncCoverageForLocationDay(opts: SyncCoverageOptions): Pro
     const requiredStylists = Math.round(dayAvg / customersPerStylistForDay);
     const businessHours = resolveBusinessHoursForDate(date, schedule);
 
-    // Two separate "closed" signals:
-    //   1. dayIsClosedByHistory: store has never had an appointment on this DOW
-    //      across the averaging window. Strongest signal that the store is
-    //      systematically closed that day — we skip slot computation and tag
-    //      the response so the dashboard can render a "Closed" badge.
-    //   2. !businessHours: the configured business-hours schedule says closed.
-    //      (Today these are global defaults; future per-location overrides
-    //      could differ.)
     const averageHourlyForDay = averageHourlyByDow[dateDow];
-    if (dayIsClosedByHistory || !businessHours) {
-      const payload = {
-        slots: [],
-        averageDailyAppointments: dayAvg,
-        customersPerStylistForDay,
-        requiredStylists: 0,
-        closed: true,
-        averageByDow,
-        closedByDow,
-        averageHourlyForDay,
-      };
-      insert.run(opts.teamId, opts.locationId, date, JSON.stringify(payload),
-        JSON.stringify({ rows: [] }), '{}', computedAt, customersPerStylistForDay);
-      if (date === opts.date) {
-        requestedSlots = [];
-        requestedRequired = 0;
-        requestedRatio = customersPerStylistForDay;
-        requestedClosed = true;
-      }
-      continue;
-    }
-
-    const dayScheduled = scheduledOnly(allEntries.filter((e) => e.date === date))
-      .map((e) => ({ stylistId: e.stylistId, startsAt: e.startsAt, endsAt: e.endsAt }));
     const dayRosteredRaw = allEntries.filter((e) => e.date === date);
     const appointments = readAppointmentsForDay(db, opts.teamId, opts.locationId, date);
-
-    const slots = computeCoverageSlots({
+    const dayFact = buildCoverageDayFact({
       date,
       businessHours,
+      dayIsClosedByHistory,
       slotMinutes,
       requiredStylists,
-      averageDailyAppointments: dayAvg,
+      dayAvg,
       customersPerStylistForDay,
+      averageByDow,
+      closedByDow,
+      averageHourlyForDay,
+      rosterEntries: dayRosteredRaw,
       appointments,
-      scheduled: dayScheduled,
     });
 
     insert.run(
       opts.teamId, opts.locationId, date,
-      JSON.stringify({
-        slots,
-        averageDailyAppointments: dayAvg,
-        customersPerStylistForDay,
-        requiredStylists,
-        closed: false,
-        averageByDow,
-        closedByDow,
-        averageHourlyForDay,
-      }),
-      JSON.stringify({ rows: dayRosteredRaw }),
+      JSON.stringify(dayFact.payload),
+      JSON.stringify({ rows: dayFact.rosterRows }),
       '{}',                                    // unused timecard slot
       computedAt,
       customersPerStylistForDay,
     );
 
     if (date === opts.date) {
-      requestedSlots = slots;
-      requestedRequired = requiredStylists;
+      requestedSlots = dayFact.slots;
+      requestedRequired = dayFact.payload.requiredStylists;
       requestedRatio = customersPerStylistForDay;
-      requestedClosed = false;
+      requestedClosed = dayFact.payload.closed;
     }
   }
 
