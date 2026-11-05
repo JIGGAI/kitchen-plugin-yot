@@ -4963,6 +4963,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       rosteredStylists: number;
       cachedRequired: number | null;
       cachedAverageDailyAppts: number | null;
+      cachedClosed: boolean;
     };
     const cacheByLocDate = new Map<string, Map<string, DayMeta>>();
     for (const r of cacheRows) {
@@ -4970,13 +4971,16 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       let peakStylists = 0;
       let cachedRequired: number | null = null;
       let cachedAverageDailyAppts: number | null = null;
+      let cachedClosed = false;
       if (r.slot_payload) {
         try {
           const parsed = JSON.parse(r.slot_payload) as {
             slots?: Array<{ light?: boolean; scheduledStylists?: number; requiredStylists?: number; startsAt?: string; endsAt?: string }>;
             requiredStylists?: number;
             averageDailyAppointments?: number;
+            closed?: boolean;
           };
+          cachedClosed = parsed.closed === true;
           if (typeof parsed.requiredStylists === 'number') cachedRequired = parsed.requiredStylists;
           if (typeof parsed.averageDailyAppointments === 'number') {
             cachedAverageDailyAppts = parsed.averageDailyAppointments;
@@ -5022,7 +5026,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       }
       let byDate = cacheByLocDate.get(r.locationId);
       if (!byDate) { byDate = new Map(); cacheByLocDate.set(r.locationId, byDate); }
-      byDate.set(r.date, { lightHours, peakStylists, rosteredStylists, cachedRequired, cachedAverageDailyAppts });
+      byDate.set(r.date, { lightHours, peakStylists, rosteredStylists, cachedRequired, cachedAverageDailyAppts, cachedClosed });
     }
 
     // Enumerate every day in the window once so we know what columns to emit.
@@ -5083,11 +5087,18 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       const cacheByDate = cacheByLocDate.get(locationId);
       const out = days.map((date) => {
         const dow = dowOf(date);
+        const meta = cacheByDate?.get(date);
+        // A specific-date closure (no shifts and no appointments) can occur
+        // on a DOW the shop normally operates. The cache is the authoritative
+        // per-date signal; the historical DOW flag only covers recurring
+        // closures.
+        if (meta?.cachedClosed) {
+          return { date, stylists: 0, appts: 0, required: 0, lightHours: 0, underCover: false, closed: true, hasRoster: false };
+        }
         if (closedByDow[dow]) {
           return { date, stylists: 0, appts: 0, required: 0, lightHours: 0, underCover: false, closed: true, hasRoster: false };
         }
         const ratio = ratioForDate(date, ratios);
-        const meta = cacheByDate?.get(date);
         // Prefer the cached averageDailyAppointments (set at sync time with
         // a sync-date-anchored referenceDate, so it doesn't include today's
         // in-progress sales or future-rostered-but-empty days). Falling
