@@ -32,6 +32,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { runStaffCashoutReport } from '../src/reports/run-staff-cashout';
+import { retryTransient } from '../src/reports/transient-retry';
 import { initializeDatabase } from '../src/db';
 import type { StaffCashoutRow } from '../src/reports/reports/staff-cashout';
 import * as sheetsApi from '../src/sheets/google-sheets';
@@ -72,9 +73,18 @@ type Args = {
    *  until 2026-10-16: YOT rolls each stylist up to ONE shop in that mode
    *  (Dawn Rowe: Shelby $37 + Sterling $30 came back as Sterling $67). */
   reportMode: ReportMode;
+  /** How long (minutes after the first attempt starts) the YOT report fetch
+   *  keeps retrying transient report-server failures — YOT's Telerik SQL
+   *  timed out at 21:00 on 2026-10-12 and 2026-11-05 and the export exited
+   *  1 inside a minute both times. Attempts are 5 minutes apart. Default 50
+   *  so a weekday run is settled before the 22:00 watchdog and the Sunday
+   *  16:00 run before the 17:00 weekend combine. 0 = no retry. */
+  reportRetryMinutes: number;
 };
 
 type ReportMode = 'per-location' | 'org-wide';
+const REPORT_RETRY_INTERVAL_MINUTES = 5;
+const DEFAULT_REPORT_RETRY_MINUTES = 50;
 
 type MasterRow = {
   rowNumber: number;
@@ -194,6 +204,11 @@ type MatchDiagnostics = {
   reportMode: 'per-location' | 'org-wide' | 'org-wide-fallback';
   reportLocationCallCount: number;
   reportLocationFailure: string | null;
+  /** Attempts the YOT report fetch took (1 = first try worked) and the
+   *  error each failed attempt died with — the watchdog reports a late
+   *  fetch so a flaky report server is visible even when payroll went out. */
+  reportAttemptCount: number;
+  reportRetryFailures: string[];
   reportRowCount: number;
   masterRowCount: number;
   exportRowCount: number;
@@ -296,7 +311,15 @@ function parseArgs(argv: string[]): Args {
     testRecipient: map.get('test-recipient') || null,
     skipEmail: (map.get('skip-email') ?? 'false') !== 'false',
     reportMode: parseReportMode(map.get('report-mode')),
+    reportRetryMinutes: parseReportRetryMinutes(map.get('report-retry-minutes')),
   };
+}
+
+function parseReportRetryMinutes(value: string | undefined): number {
+  if (value === undefined) return DEFAULT_REPORT_RETRY_MINUTES;
+  const minutes = Number(value);
+  if (!Number.isFinite(minutes) || minutes < 0) throw new Error(`Invalid --report-retry-minutes value: ${value} (expected a number of minutes >= 0)`);
+  return minutes;
 }
 
 function parseReportMode(value: string | undefined): ReportMode {
@@ -365,6 +388,24 @@ async function fetchCashoutRows(args: Args): Promise<CashoutFetch> {
     const report = await runStaffCashoutReport(base);
     return { rows: report.rows, reportMode: 'org-wide-fallback', reportLocationCallCount: locations.length, reportLocationFailure: message };
   }
+}
+
+// Nothing has been written, emailed or pushed to Sheets at this point, so
+// re-asking YOT is free of side effects. Each attempt is the full
+// per-location pass with its org-wide fallback; only when both fail with
+// something transient (5xx, network) do we wait and go again. Any other
+// error, or the last transient one once the window is spent, surfaces
+// exactly as before: the script exits 1 and the 22:00 watchdog alerts.
+async function fetchCashoutRowsWithRetry(args: Args): Promise<CashoutFetch & { reportAttemptCount: number; reportRetryFailures: string[] }> {
+  const stamp = (ms: number) => new Date(ms).toLocaleTimeString('en-US', { timeZone: NEW_YORK_TZ, hour: 'numeric', minute: '2-digit' });
+  const { value, attempts, failures } = await retryTransient(() => fetchCashoutRows(args), {
+    windowMs: args.reportRetryMinutes * 60_000,
+    intervalMs: REPORT_RETRY_INTERVAL_MINUTES * 60_000,
+    onRetry: ({ attempt, error, nextAttemptAt, deadline }) => {
+      console.error(`[retry] ${stamp(Date.now())} ET report fetch attempt ${attempt} failed (${error.message.slice(0, 200)}) — next attempt at ${stamp(nextAttemptAt)} ET, giving up after ${stamp(deadline)} ET`);
+    },
+  });
+  return { ...value, reportAttemptCount: attempts, reportRetryFailures: failures };
 }
 
 function expandHome(value: string): string {
@@ -1050,8 +1091,8 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   mkdirSync(args.outputDir, { recursive: true });
 
-  const report = await fetchCashoutRows(args);
-  console.error(`[report] mode=${report.reportMode} rows=${report.rows.length} locationCalls=${report.reportLocationCallCount}`);
+  const report = await fetchCashoutRowsWithRetry(args);
+  console.error(`[report] mode=${report.reportMode} rows=${report.rows.length} locationCalls=${report.reportLocationCallCount} attempts=${report.reportAttemptCount}`);
   const masterRows = await loadCsvMasterRows(args.group.rosterSheetId, args.group.rosterTab, args.account);
   const garnishmentRules = args.group.garnishmentsEnabled
     ? await loadGarnishmentRules(args.garnishmentsSheetId, args.account)
@@ -1721,6 +1762,8 @@ Sourced from ${args.group.rosterTab} on the ${args.group.rosterSheetLabel} sheet
     reportMode: report.reportMode,
     reportLocationCallCount: report.reportLocationCallCount,
     reportLocationFailure: report.reportLocationFailure,
+    reportAttemptCount: report.reportAttemptCount,
+    reportRetryFailures: report.reportRetryFailures,
     reportRowCount: report.rows.length,
     masterRowCount: masterRows.length,
     exportRowCount: depositRows.length,
@@ -1761,6 +1804,7 @@ Sourced from ${args.group.rosterTab} on the ${args.group.rosterSheetLabel} sheet
     disbursementsRecipient: recipient,
     disbursementsEmailStatus: emailStatus,
     disbursementsFailureAlertStatus: failureAlertStatus,
+    reportAttemptCount: report.reportAttemptCount,
     exportRowCount: depositRows.length,
     zeroNetOmittedCount: zeroNetRows.length,
     masterRowCount: masterRows.length,

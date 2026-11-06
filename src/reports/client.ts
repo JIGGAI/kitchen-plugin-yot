@@ -107,7 +107,7 @@ export function createReportClient(config: YotConfig, options: ReportClientOptio
       contentType: response.headers.get('content-type'),
     });
     const text = buffer.toString('utf8');
-    if (!response.ok) throw new Error(`Report client creation failed: ${response.status} ${text.slice(0, 400)}`);
+    if (!response.ok) throw Object.assign(new Error(`Report client creation failed: ${response.status} ${text.slice(0, 400)}`), { status: response.status });
     const data = JSON.parse(text) as { clientId?: string };
     if (!data.clientId) throw new Error('Report client creation returned no clientId');
     clientId = String(data.clientId);
@@ -138,7 +138,11 @@ export function createReportClient(config: YotConfig, options: ReportClientOptio
     if (response.status === 410) {
       clientId = null;
     }
-    if (!response.ok) throw new Error(`Report request failed (${method} ${endpoint}): ${response.status} ${text.slice(0, 400)}`);
+    if (!response.ok) {
+      // `status` lets callers tell a retryable 5xx from a 4xx without
+      // parsing the message (see transient-retry.ts).
+      throw Object.assign(new Error(`Report request failed (${method} ${endpoint}): ${response.status} ${text.slice(0, 400)}`), { status: response.status });
+    }
     return JSON.parse(text) as T;
   }
 

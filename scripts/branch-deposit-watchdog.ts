@@ -152,6 +152,9 @@ type Diag = {
   skipEmail?: boolean;
   disbursementsRecipient?: string;
   disbursementsEmailStatus?: 'sent' | 'skipped' | 'failed';
+  // Report-fetch retry (export script >= 2026-11-05). Undefined before then.
+  reportAttemptCount?: number;
+  reportRetryFailures?: string[];
 };
 
 async function main() {
@@ -263,6 +266,17 @@ Watchdog log: ${LOG_PATH}`,
   if (loansSection) {
     summaryBits.push(`${loansPaidOff.length} loan${loansPaidOff.length > 1 ? 's' : ''} paid off`);
     sections.push(loansSection);
+  }
+
+  // Payroll went out, but only because the export kept asking YOT's report
+  // server after it timed out. Worth a line to RJ: a report server that is
+  // flaky at 21:00 every night is a trend to raise with YOT before the night
+  // it stays down past the retry window.
+  if ((diag.reportAttemptCount ?? 1) > 1) {
+    const retries = (diag.reportAttemptCount as number) - 1;
+    const first = (diag.reportRetryFailures || [])[0];
+    sections.push(`YOT report fetch needed ${retries} ${retries === 1 ? 'retry' : 'retries'} tonight before it answered — payroll was sent in full, just later than usual.${first ? `\nFirst failure: ${first.slice(0, 300)}` : ''}`);
+    summaryBits.push(`report fetched after ${retries} ${retries === 1 ? 'retry' : 'retries'}`);
   }
 
   const collisions = diag.crossGroupCollisions || [];
