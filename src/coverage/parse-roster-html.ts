@@ -36,8 +36,16 @@ export type RosterEntry = {
 // Reason labels that mean a store-wide closure / holiday rather than one
 // stylist being out. Matched case-insensitively as substrings against the
 // cell's visible text. Extend as new closure labels appear in YOT.
-const CLOSURE_REASON_RE =
-  /holiday|memorial|christmas|thanksgiving|new year|labor day|independence|july\s*4|closed/i;
+// Exported so the attendance report can re-classify absences already cached
+// before a label was added here (a cached 'absent' row whose reason matches
+// is a closure, not a call-off).
+//
+// "labor" and "independ" are deliberately loose: the live grid has carried
+// "Labor- Off" and "Independance Day Weekend" (sic), which the stricter
+// "labor day" / "independence" spellings missed — 437 closure cells landed
+// in the cache as individual absences.
+export const CLOSURE_REASON_RE =
+  /holiday|memorial|christmas|thanksgiving|new year|labor|independ|july\s*4|closed|easter/i;
 
 const ENTRY_RE = /<a\s+class="change_staff_day_schedule"[^>]*?data-id="(\d+)"[^>]*?data-name="([^"]*)"[^>]*?data-day="(\d+)"[^>]*?data-month="(\d+)"[^>]*?data-year="(\d+)"[^>]*>([\s\S]*?)(?:<\/a>|<\/td>)/g;
 const TIME_RANGE_RE = /(\d{1,2}):(\d{2})\s*(AM|PM)\s*to\s*<br\s*\/?>\s*(\d{1,2}):(\d{2})\s*(AM|PM)/i;

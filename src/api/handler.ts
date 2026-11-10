@@ -3072,6 +3072,69 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     }
   }
 
+  // ─── Staff Attendance ────────────────────────────────────────────────
+  // GET /staff-attendance?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
+  // Per-stylist absences (from the cached roster grid) and late arrivals
+  // (from staff_timecard_facts) grouped by location, for the /staff-attendance
+  // dashboard page. See ./staff-attendance for the rules. The window is
+  // clamped to today: a future roster day has nobody absent yet.
+  if (req.path === '/staff-attendance' && req.method === 'GET') {
+    try {
+      const { sqlite } = initializeDatabase(teamId);
+      const { buildStaffAttendance } = await import('./staff-attendance');
+      const { isSameShop } = await import('../disbursements/location-drift');
+      const LATE_THRESHOLD = 4;
+      const today = dateOnlyNow();
+      const firstOfMonth = today.slice(0, 8) + '01';
+      const startDate = toDateOnlyInput(req.query.startDate || req.query.start) || firstOfMonth;
+      const requestedEndDate = toDateOnlyInput(req.query.endDate || req.query.end) || today;
+      const endDate = requestedEndDate > today ? today : requestedEndDate;
+
+      const locationNameById = new Map<string, string>();
+      for (const row of sqlite.prepare('SELECT id, name FROM locations WHERE team_id = ?').all(teamId) as Array<{ id: string; name: string | null }>) {
+        if (row.name) locationNameById.set(String(row.id), row.name);
+      }
+      const coverageFrom = (sqlite.prepare(
+        'SELECT MIN(date) AS d FROM location_coverage_facts WHERE team_id = ?'
+      ).get(teamId) as { d: string | null } | undefined)?.d ?? null;
+
+      const empty = startDate > endDate;
+      const rosterRows = empty ? [] : sqlite.prepare(
+        `SELECT location_id AS locationId, date, rostered_payload AS rosteredPayload, computed_at AS computedAt
+           FROM location_coverage_facts
+          WHERE team_id = ? AND date BETWEEN ? AND ?`
+      ).all(teamId, startDate, endDate) as Array<{ locationId: string; date: string; rosteredPayload: string | null; computedAt: string | null }>;
+      const timecardRows = empty ? [] : sqlite.prepare(
+        `SELECT location_name AS locationName, staff_name AS staffName, shift_date AS shiftDate,
+                arrived_minutes AS arrivedMinutes, synced_at AS syncedAt
+           FROM staff_timecard_facts
+          WHERE team_id = ? AND shift_date BETWEEN ? AND ?`
+      ).all(teamId, startDate, endDate) as Array<{ locationName: string | null; staffName: string; shiftDate: string; arrivedMinutes: number | null; syncedAt: string | null }>;
+
+      const result = buildStaffAttendance({
+        rosterRows,
+        timecardRows,
+        locationNameById,
+        lateThreshold: LATE_THRESHOLD,
+        sameLocation: (rosterName, reportName) =>
+          canonicalLocationName(rosterName) === canonicalLocationName(reportName) || isSameShop(rosterName, reportName),
+      });
+
+      return {
+        status: 200,
+        data: {
+          ok: true,
+          scope: { startDate, endDate, requestedEndDate },
+          lateThreshold: LATE_THRESHOLD,
+          coverageFrom,
+          ...result,
+        },
+      };
+    } catch (error: any) {
+      return apiError(500, 'INTERNAL', error?.message || 'Failed to build staff attendance');
+    }
+  }
+
   // POST /staff-timecards/sync?startDate=&endDate=
   // Triggers the sync library. Wraps options in the same way the other
   // /sync endpoints do.

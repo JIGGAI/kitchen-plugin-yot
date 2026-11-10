@@ -105,6 +105,9 @@ describe('parseRosterHtml — absence / exception cells', () => {
     expect(only(`<span style='color:red'>Memorial Day</span>`).status).toBe('holiday');
     expect(only(`<span style='color:red'>Memorial weekend</span>`).status).toBe('holiday');
     expect(only(`<span style='color:red'>Holiday</span>`).status).toBe('holiday');
+    // Labels seen on the live grid that the stricter spellings used to miss.
+    expect(only(`<span style='color:red'>Labor- Off</span>`).status).toBe('holiday');
+    expect(only(`<span style='color:red'>Independance Day Weekend</span>`).status).toBe('holiday');
   });
 
   it('still treats "Not Scheduled" as not-scheduled with no reason', () => {
