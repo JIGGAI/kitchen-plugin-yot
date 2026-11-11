@@ -56,6 +56,14 @@ import {
   parseStaffPerformanceWorkbook,
 } from './reports/staff-performance';
 import {
+  STAFF_POPULARITY_REPORT,
+  type StaffPopularityParams,
+  type StaffPopularityResult,
+  buildStaffPopularityInstanceParams,
+  buildStaffPopularityParameterDiscovery,
+  parseStaffPopularityCsv,
+} from './reports/staff-popularity';
+import {
   STAFF_TIMECARD_SUMMARY_REPORT,
   type StaffTimecardSummaryParams,
   type StaffTimecardSummaryResult,
@@ -154,6 +162,15 @@ export const reportRegistry = {
     buildInstanceParams: buildStaffPerformanceInstanceParams,
     parseDocument: parseStaffPerformanceWorkbook,
   } satisfies YotReportDefinition<StaffPerformanceParams, StaffPerformanceResult>,
+  staffPopularity: {
+    key: STAFF_POPULARITY_REPORT.key,
+    reportName: STAFF_POPULARITY_REPORT.reportName,
+    reportType: STAFF_POPULARITY_REPORT.reportType,
+    preferredFormat: STAFF_POPULARITY_REPORT.preferredFormat,
+    buildParameterDiscovery: buildStaffPopularityParameterDiscovery,
+    buildInstanceParams: buildStaffPopularityInstanceParams,
+    parseDocument: parseStaffPopularityCsv,
+  } satisfies YotReportDefinition<StaffPopularityParams, StaffPopularityResult>,
   staffTimecardSummary: {
     key: STAFF_TIMECARD_SUMMARY_REPORT.key,
     reportName: STAFF_TIMECARD_SUMMARY_REPORT.reportName,
