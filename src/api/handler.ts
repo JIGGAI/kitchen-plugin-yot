@@ -60,6 +60,13 @@ const LOCATION_NAME_VARIANTS: Record<string, string> = {
   // "Treaty Oaks St. Aug. FL."). Canonical active record is id 7432.
   'st. augustine fl.': 'Treaty Oaks St. Aug. FL.',
   'treaty oaks st. augustine fl.': 'Treaty Oaks St. Aug. FL.',
+  // Waterford and Westland gained a state suffix on 2026-11-10: the reports
+  // print "Waterford" / "Westland" for every day before that and
+  // "Waterford Mi" / "Westland Mi." (the locations-table names, ids 1348 /
+  // 1347) from then on, while StaffPopularity prints the new name for all
+  // history.
+  'waterford': 'Waterford Mi',
+  'westland': 'Westland Mi.',
 };
 
 // Lookup table: every variant key AND every canonical name, both normalized.
@@ -948,6 +955,88 @@ async function syncStaffWorkSummaryDay(
       lastSyncedAt: new Date().toISOString(), lastError: message,
     });
     return { rowsWritten: 0, error: message };
+  }
+}
+
+/**
+ * Pull YOT's StaffPopularity report for one day and replace that day's rows.
+ *
+ * Rides POST /staff-performance/sync like StaffWorkSummary does: same grain,
+ * same cadence, and the existing jobs (today every 30 minutes, the trailing
+ * week nightly) already cover the days whose bookings are still moving.
+ *
+ * Rows with no bookings are not stored. The report lists every staff account
+ * a shop has ever had, most of them at 0 on any given day; a window's totals
+ * are sums over this table, so a missing zero changes nothing.
+ *
+ * Never throws, for the same reason syncStaffWorkSummaryDay does not.
+ */
+async function syncStaffPopularityDay(
+  sqlite: ReturnType<typeof initializeDatabase>['sqlite'],
+  db: ReturnType<typeof initializeDatabase>['db'],
+  teamId: string,
+  date: string,
+  organisationId: number,
+  config: YotConfig,
+): Promise<{ rowsWritten: number; totalBookings: number; error?: string }> {
+  try {
+    const client = createReportClient(config);
+    const r = reportRegistry.staffPopularity;
+    const params = {
+      startDateIso: `${date}T00:00:00`,
+      endDateIso: `${date}T00:00:00`,
+      organisationId,
+      locationId: null,
+      franchiseId: null,
+    };
+    const defs = await client.getParameters(r.reportType, r.buildParameterDiscovery(params, config.apiKey));
+    const inst = await client.createInstance(r.reportType, r.buildInstanceParams(params));
+    const doc = await client.createDocument(inst, r.preferredFormat);
+    await client.waitForDocument(inst, doc.documentId);
+    const file = await client.fetchDocument(inst, doc.documentId);
+    const parsed = r.parseDocument(file.buffer, defs);
+
+    const insert = sqlite.prepare(
+      `INSERT INTO staff_popularity_facts (
+        team_id, location_name, staff_name, date, first_available,
+        online_bookings, regular_bookings, total_bookings, last_updated_at
+      ) VALUES (?,?,?,?,?,?,?,?,?)
+      ON CONFLICT (team_id, location_name, staff_name, date) DO UPDATE SET
+        first_available = excluded.first_available,
+        online_bookings = staff_popularity_facts.online_bookings + excluded.online_bookings,
+        regular_bookings = staff_popularity_facts.regular_bookings + excluded.regular_bookings,
+        total_bookings = staff_popularity_facts.total_bookings + excluded.total_bookings,
+        last_updated_at = excluded.last_updated_at`,
+    );
+    const now = new Date().toISOString();
+    let rowsWritten = 0;
+    let totalBookings = 0;
+    // Wipe-then-insert in one transaction: a booking moved to another stylist
+    // must leave its old row, and a reader must never see the day half-written.
+    // The conflict clause adds because the report can print one person twice
+    // in a shop once their name's whitespace is collapsed.
+    sqlite.transaction(() => {
+      sqlite.prepare('DELETE FROM staff_popularity_facts WHERE team_id = ? AND date = ?').run(teamId, date);
+      for (const row of parsed.rows) {
+        if (!row.onlineBookings && !row.regularBookings) continue;
+        insert.run(
+          teamId, row.locationName, row.staffName, date, row.firstAvailable ? 1 : 0,
+          row.onlineBookings, row.regularBookings, row.onlineBookings + row.regularBookings, now,
+        );
+        rowsWritten += 1;
+        totalBookings += row.onlineBookings + row.regularBookings;
+      }
+    })();
+    upsertSyncState(db, teamId, 'staff_popularity_facts', {
+      lastSyncedAt: now, lastSuccessAt: now, lastError: null, rowCount: rowsWritten,
+    });
+    return { rowsWritten, totalBookings };
+  } catch (error: any) {
+    const message = error?.message || String(error);
+    upsertSyncState(db, teamId, 'staff_popularity_facts', {
+      lastSyncedAt: new Date().toISOString(), lastError: message,
+    });
+    return { rowsWritten: 0, totalBookings: 0, error: message };
   }
 }
 
@@ -2756,6 +2845,17 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         };
       }
 
+      // `?only=popularity` is the same escape hatch for StaffPopularity: its
+      // history is backfilled without re-pulling the other two reports.
+      if (cleanString(req.query.only) === 'popularity') {
+        const { sqlite: popSqlite } = initializeDatabase(teamId);
+        const popularity = await syncStaffPopularityDay(popSqlite, perfDb, teamId, date, organisationId, config);
+        return {
+          status: popularity.error ? 502 : 200,
+          data: { ok: !popularity.error, date, only: 'popularity', popularity },
+        };
+      }
+
       const params = {
         startDateIso: `${date}T00:00:00`,
         endDateIso: `${date}T00:00:00`,
@@ -2825,12 +2925,14 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       // staff-performance sync that already succeeded, so it is reported in the
       // response and its own sync_state row instead of throwing.
       const workSummary = await syncStaffWorkSummaryDay(sqlite, perfDb, teamId, date, organisationId, config);
+      // StaffPopularity rides along on the same terms.
+      const popularity = await syncStaffPopularityDay(sqlite, perfDb, teamId, date, organisationId, config);
 
       return {
         status: 200,
         data: {
           ok: true, date, rowsWritten, locationCount: parsed.locations.length,
-          startedAt, completedAt, workSummary,
+          startedAt, completedAt, workSummary, popularity,
         },
       };
     } catch (error: any) {
@@ -3069,6 +3171,114 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       };
     } catch (error: any) {
       return apiError(500, 'INTERNAL', error?.message || 'Failed to read staff timecard facts');
+    }
+  }
+
+  // ─── Staff Popularity ────────────────────────────────────────────────
+  // GET /staff-popularity?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
+  // YOT's Staff Popularity report (bookings that asked for each stylist,
+  // online vs. made by the shop) for any window, grouped by location, with
+  // customers per hour, sales dollars per hour and the last four months'
+  // new-client returns alongside. See ./staff-popularity for the rules.
+  // `cohortMonths` (default 4, max 12) sets how many months of returns.
+  if (req.path === '/staff-popularity' && req.method === 'GET') {
+    try {
+      const { sqlite } = initializeDatabase(teamId);
+      const { buildStaffPopularity, trailingCohortMonths } = await import('./staff-popularity');
+      const today = dateOnlyNow();
+      const firstOfMonth = today.slice(0, 8) + '01';
+      const startDate = toDateOnlyInput(req.query.startDate || req.query.start) || firstOfMonth;
+      const requestedEndDate = toDateOnlyInput(req.query.endDate || req.query.end) || today;
+      const endDate = requestedEndDate < startDate ? startDate : requestedEndDate;
+      const requestedMonths = Number(cleanString(req.query.cohortMonths) || '4');
+      const monthCount = Number.isFinite(requestedMonths) ? Math.min(12, Math.max(1, Math.floor(requestedMonths))) : 4;
+      const cohortMonths = trailingCohortMonths(today, monthCount);
+
+      const popularityRows = sqlite.prepare(
+        `SELECT location_name AS locationName, staff_name AS staffName,
+                MAX(first_available) AS firstAvailable,
+                SUM(online_bookings) AS onlineBookings, SUM(regular_bookings) AS regularBookings
+           FROM staff_popularity_facts
+          WHERE team_id = ? AND date BETWEEN ? AND ?
+          GROUP BY location_name, staff_name`,
+      ).all(teamId, startDate, endDate) as Array<{
+        locationName: string; staffName: string; firstAvailable: number | null;
+        onlineBookings: number | null; regularBookings: number | null;
+      }>;
+      // Hours are stored as YOT's "8h, 15m" text, so the rows come back per
+      // day and are summed in the builder rather than in SQL.
+      const performanceRows = sqlite.prepare(
+        `SELECT location_name AS locationName, staff_name AS staffName,
+                total_sales_count AS totalSalesCount, total_sales_value AS totalSalesValue,
+                hours_worked_raw AS hoursWorkedRaw
+           FROM staff_performance_facts
+          WHERE team_id = ? AND date BETWEEN ? AND ?`,
+      ).all(teamId, startDate, endDate) as Array<{
+        locationName: string; staffName: string; totalSalesCount: number | null;
+        totalSalesValue: number | null; hoursWorkedRaw: string | null;
+      }>;
+      // Same name rule as GET /new-client-cohort-retention: "First Last" when
+      // the staff API has a surname, else whatever full_name holds.
+      const cohortRows = sqlite.prepare(
+        `SELECT n.scope AS scope, l.name AS locationName,
+                CASE
+                  WHEN s.surname IS NOT NULL AND TRIM(s.surname) <> ''
+                    THEN TRIM(TRIM(COALESCE(s.given_name, s.full_name, '')) || ' ' || TRIM(s.surname))
+                  ELSE s.full_name
+                END AS stylistName,
+                n.cohort_month AS cohortMonth, n.new_count AS newCount, n.returned_count AS returnedCount
+           FROM new_client_cohort_retention n
+           LEFT JOIN locations l ON l.team_id = n.team_id AND l.id = n.location_id
+           LEFT JOIN stylists s ON s.team_id = n.team_id AND s.id = (n.location_id || ':' || n.stylist_id)
+          WHERE n.team_id = ? AND n.cohort_month IN (${cohortMonths.map(() => '?').join(',')})`,
+      ).all(teamId, ...cohortMonths) as Array<{
+        scope: 'stylist' | 'location'; locationName: string | null; stylistName: string | null;
+        cohortMonth: string; newCount: number | null; returnedCount: number | null;
+      }>;
+
+      const coverage = sqlite.prepare(
+        `SELECT MIN(date) AS dataFrom, MAX(date) AS dataTo, MAX(last_updated_at) AS lastSyncedAt
+           FROM staff_popularity_facts WHERE team_id = ?`,
+      ).get(teamId) as { dataFrom: string | null; dataTo: string | null; lastSyncedAt: string | null } | undefined;
+      const cohortComputedAt = (sqlite.prepare(
+        'SELECT MAX(computed_at) AS at FROM new_client_cohort_retention WHERE team_id = ?',
+      ).get(teamId) as { at: string | null } | undefined)?.at ?? null;
+
+      const result = buildStaffPopularity({
+        popularityRows, performanceRows, cohortRows, cohortMonths,
+        canonicalLocation: canonicalLocationName,
+      });
+
+      // The reports name a shop in free text; the dashboard scopes and filters
+      // by location id and by the locations table's exact spelling ("Yulee Rt.
+      // 200  FL." has two spaces there, one in the report). Tie each shop back
+      // to its locations row, active record first.
+      const shopKey = (name: string | null) => normalizeLocationName(canonicalLocationName(name));
+      const directory = new Map<string, { id: string; name: string }>();
+      for (const row of sqlite.prepare(
+        'SELECT id, name FROM locations WHERE team_id = ? AND name IS NOT NULL ORDER BY COALESCE(active, 0) DESC, id',
+      ).all(teamId) as Array<{ id: string; name: string }>) {
+        if (!directory.has(shopKey(row.name))) directory.set(shopKey(row.name), { id: String(row.id), name: row.name });
+      }
+      const locations = result.locations.map((loc) => {
+        const known = directory.get(shopKey(loc.locationName));
+        return { ...loc, locationId: known?.id ?? null, locationName: known?.name ?? loc.locationName };
+      });
+
+      return {
+        status: 200,
+        data: {
+          startDate, endDate,
+          dataFrom: coverage?.dataFrom ?? null,
+          dataTo: coverage?.dataTo ?? null,
+          lastSyncedAt: coverage?.lastSyncedAt ?? null,
+          cohortComputedAt,
+          ...result,
+          locations,
+        },
+      };
+    } catch (error: any) {
+      return apiError(500, 'INTERNAL', error?.message || 'Failed to read staff popularity');
     }
   }
 
@@ -4619,6 +4829,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         revenue_facts: { table: 'revenue_facts', dateExpr: 'date', grain: 'day' },
         staff_performance_facts: { table: 'staff_performance_facts', dateExpr: 'date', grain: 'day' },
         staff_work_summary_facts: { table: 'staff_work_summary_facts', dateExpr: 'date', grain: 'day' },
+        staff_popularity_facts: { table: 'staff_popularity_facts', dateExpr: 'date', grain: 'day' },
         staff_cashout_facts: { table: 'staff_cashout_facts', dateExpr: 'date', grain: 'day' },
         staff_retention_facts: { table: 'staff_retention_facts', dateExpr: 'period_start', grain: 'period' },
         location_coverage_facts: { table: 'location_coverage_facts', dateExpr: 'date', grain: 'day' },

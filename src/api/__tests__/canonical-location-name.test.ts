@@ -22,6 +22,13 @@ describe('canonicalLocationName', () => {
     expect(canonicalLocationName('  treaty oaks   st. aug.   fl.  ')).toBe(CANON);
   });
 
+  it('folds Waterford and Westland onto the names they took on 2026-11-10', () => {
+    expect(canonicalLocationName('Waterford')).toBe('Waterford Mi');
+    expect(canonicalLocationName('Waterford MI')).toBe('Waterford Mi');
+    expect(canonicalLocationName('Westland')).toBe('Westland Mi.');
+    expect(canonicalLocationName('westland mi.')).toBe('Westland Mi.');
+  });
+
   it('is idempotent — canonicalizing an already-canonical name is a no-op', () => {
     expect(canonicalLocationName(canonicalLocationName('Treaty Oaks St. Aug. Fl.'))).toBe(CANON);
     expect(canonicalLocationName(canonicalLocationName('Brighton MI'))).toBe('Brighton MI');
