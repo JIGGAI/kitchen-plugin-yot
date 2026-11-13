@@ -2114,6 +2114,99 @@ function writeExportFiles(teamId: string, db: ReturnType<typeof initializeDataba
   return manifest;
 }
 
+// ─── Monthly Revenue Summary sync ──────────────────────────────────────
+// One DailySalesSummaryTotals run for one calendar month, stored as that
+// month's rows in monthly_revenue_summary_facts (see ./monthly-revenue).
+// The month in progress is asked for up to today, so its row is a month to
+// date; a month in the future is refused rather than stored as zeros.
+//
+// EndDate goes out at midnight of the last day. This report counts that whole
+// day (a 31-day month for one shop came to exactly the sum of its 31 daily
+// rows), unlike StaffPopularity, where a time of day spills over.
+const MONTHLY_REVENUE_REFRESH_MS = 6 * 60 * 60 * 1000;
+
+export type MonthlyRevenueSyncResult = {
+  yearMonth: string; startDate: string; endDate: string; rowsWritten: number;
+  unmatchedLocations: number; startedAt: string; completedAt: string;
+};
+
+export async function syncMonthlyRevenueMonth(
+  teamId: string,
+  config: YotConfig,
+  yearMonth: string,
+  organisationId: number = DEFAULT_REVENUE_ORGANISATION_ID,
+): Promise<MonthlyRevenueSyncResult> {
+  const { lastDayOfYearMonth, monthRowsForStorage, replaceMonthlyRevenueMonth } = await import('./monthly-revenue');
+  const today = dateOnlyNow();
+  const startDate = `${yearMonth}-01`;
+  if (startDate > today) throw new Error(`${yearMonth} has not started yet`);
+  const monthEnd = lastDayOfYearMonth(yearMonth);
+  const endDate = monthEnd > today ? today : monthEnd;
+  const startedAt = new Date().toISOString();
+
+  const params = {
+    startDateIso: `${startDate}T00:00:00`, endDateIso: `${endDate}T00:00:00`,
+    organisationId, locationId: null, staffId: null, dayOfWeek: null,
+  };
+  const client = createReportClient(config);
+  const r = reportRegistry.dailySalesSummaryTotals;
+  const defs = await client.getParameters(r.reportType, r.buildParameterDiscovery(params, config.apiKey));
+  const inst = await client.createInstance(r.reportType, r.buildInstanceParams(params));
+  const doc = await client.createDocument(inst, r.preferredFormat);
+  await client.waitForDocument(inst, doc.documentId);
+  const file = await client.fetchDocument(inst, doc.documentId);
+  const parsed = r.parseDocument(file.buffer, defs);
+
+  const { db, sqlite } = initializeDatabase(teamId);
+  const locations = db.select().from(schema.locations).where(eq(schema.locations.teamId, teamId)).all() as schema.Location[];
+  const byName = new Map<string, schema.Location[]>();
+  for (const loc of locations) {
+    const key = normalizeNameForLookup(canonicalLocationName(loc.name));
+    if (!key) continue;
+    byName.set(key, [...(byName.get(key) || []), loc]);
+  }
+  let unmatchedLocations = 0;
+  const resolveId = (name: string): string | null => {
+    const matches = byName.get(normalizeNameForLookup(name) || '') || [];
+    // Two location rows under one name (YOT keeps a retired id beside the
+    // live one for a couple of shops): the exact spelling wins, else none.
+    const hit = matches.length === 1 ? matches[0] : matches.find((l) => cleanString(l.name) === cleanString(name));
+    if (!hit) unmatchedLocations += 1;
+    return hit?.id ?? null;
+  };
+  const rows = monthRowsForStorage(parsed.rows, yearMonth, canonicalLocationName, resolveId);
+  const rowsWritten = replaceMonthlyRevenueMonth(sqlite, teamId, yearMonth, endDate, rows, startedAt);
+  return { yearMonth, startDate, endDate, rowsWritten, unmatchedLocations, startedAt, completedAt: new Date().toISOString() };
+}
+
+// Which months the half-hourly monthly-performance job should also refresh
+// in the revenue summary: the month in progress when its rows are missing or
+// older than six hours (the report takes about a minute, so not every tick),
+// and the month before when it was last stored as a month to date — the job
+// only ever names the current month, so without this a month would stay
+// frozen at whatever day it was last synced on.
+export function monthlyRevenueMonthsDue(
+  sqlite: any,
+  teamId: string,
+  yearMonth: string,
+  nowMs: number,
+  lastDayOf: (yearMonth: string) => string,
+  previousOf: (yearMonth: string) => string,
+): string[] {
+  const state = (ym: string) => sqlite.prepare(
+    `SELECT MIN(through_date) AS throughDate, MAX(last_updated_at) AS lastUpdatedAt, COUNT(*) AS n
+     FROM monthly_revenue_summary_facts WHERE team_id = ? AND year_month = ?`,
+  ).get(teamId, ym) as { throughDate: string | null; lastUpdatedAt: string | null; n: number };
+  const due: string[] = [];
+  const previous = previousOf(yearMonth);
+  const prev = state(previous);
+  if (prev.n > 0 && prev.throughDate != null && prev.throughDate < lastDayOf(previous)) due.push(previous);
+  const cur = state(yearMonth);
+  const age = cur.lastUpdatedAt ? nowMs - Date.parse(cur.lastUpdatedAt) : Infinity;
+  if (cur.n === 0 || !(age < MONTHLY_REVENUE_REFRESH_MS)) due.push(yearMonth);
+  return due;
+}
+
 export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginContext): Promise<PluginResponse> {
   const teamId = getTeamId(req);
 
@@ -2452,9 +2545,85 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         );
         rowsWritten += 1;
       }
-      return { status: 200, data: { ok: true, yearMonth, startDate, endDate, rowsWritten, unmatched, locationCount: parsed.locations.length, startedAt, completedAt: new Date().toISOString() } };
+      // The Monthly Revenue Summary rides on this job's schedule (non-fatal,
+      // and throttled — see monthlyRevenueMonthsDue). ?revenue=0 skips it.
+      const revenueSummary: { synced: MonthlyRevenueSyncResult[]; error: string | null } = { synced: [], error: null };
+      if (cleanString(req.query.revenue) !== '0') {
+        try {
+          const { lastDayOfYearMonth, shiftYearMonth } = await import('./monthly-revenue');
+          const due = monthlyRevenueMonthsDue(sqlite, teamId, yearMonth, Date.now(), lastDayOfYearMonth, (ym) => shiftYearMonth(ym, -1));
+          for (const month of due) revenueSummary.synced.push(await syncMonthlyRevenueMonth(teamId, config, month, organisationId));
+        } catch (error: any) {
+          revenueSummary.error = error?.message || 'Failed to sync monthly revenue summary';
+        }
+      }
+      return { status: 200, data: { ok: true, yearMonth, startDate, endDate, rowsWritten, unmatched, locationCount: parsed.locations.length, startedAt, completedAt: new Date().toISOString(), revenueSummary } };
     } catch (error: any) {
       return apiError(502, 'YOT_ERROR', error?.message || 'Failed to sync monthly performance');
+    }
+  }
+
+  // ─── Monthly Revenue Summary (DailySalesSummaryTotals, by month) ───────
+  // GET /monthly-revenue?startMonth=YYYY-MM&endMonth=YYYY-MM
+  // One row per (location, month) from monthly_revenue_summary_facts, with
+  // total credit cards and sales per hour attached. Defaults to the thirteen
+  // months ending with the current one. Never calls YOT.
+  if (req.path === '/monthly-revenue' && req.method === 'GET') {
+    try {
+      const { isYearMonth, readMonthlyRevenue, shiftYearMonth, yearMonthsBetween } = await import('./monthly-revenue');
+      const currentMonth = dateOnlyNow().slice(0, 7);
+      const endRaw = cleanString(req.query.endMonth);
+      const startRaw = cleanString(req.query.startMonth);
+      if (endRaw && !isYearMonth(endRaw)) return apiError(400, 'BAD_REQUEST', 'endMonth must be YYYY-MM');
+      if (startRaw && !isYearMonth(startRaw)) return apiError(400, 'BAD_REQUEST', 'startMonth must be YYYY-MM');
+      const endMonth = endRaw || currentMonth;
+      let startMonth = startRaw || shiftYearMonth(endMonth, -12);
+      if (startMonth > endMonth) startMonth = endMonth;
+      // Five years of months is more than any page asks for.
+      if (yearMonthsBetween(startMonth, endMonth).length > 60) startMonth = shiftYearMonth(endMonth, -59);
+      const { sqlite } = initializeDatabase(teamId);
+      const rows = readMonthlyRevenue(sqlite, teamId, startMonth, endMonth, canonicalLocationName);
+      const span = sqlite.prepare(
+        'SELECT MIN(year_month) AS dataFrom, MAX(year_month) AS dataTo FROM monthly_revenue_summary_facts WHERE team_id = ?',
+      ).get(teamId) as { dataFrom: string | null; dataTo: string | null };
+      const lastUpdatedAt = rows.reduce<string | null>((acc, r) => mostRecentIso(acc, r.lastUpdatedAt), null);
+      return {
+        status: 200,
+        data: {
+          ok: true, startMonth, endMonth, months: yearMonthsBetween(startMonth, endMonth),
+          rowCount: rows.length, lastUpdatedAt, dataFrom: span?.dataFrom ?? null, dataTo: span?.dataTo ?? null, rows,
+        },
+      };
+    } catch (error: any) {
+      return apiError(500, 'INTERNAL', error?.message || 'Failed to read monthly revenue summary');
+    }
+  }
+
+  // POST /monthly-revenue/sync?yearMonth=YYYY-MM
+  //   or ?startMonth=YYYY-MM&endMonth=YYYY-MM for a backfill (one report run
+  //   per month, about a minute each, at most 12 months a call).
+  if (req.path === '/monthly-revenue/sync' && req.method === 'POST') {
+    const config = readYotConfig(teamId);
+    if (!config) return apiError(400, 'NOT_CONFIGURED', 'YOT apiKey not set for this team. POST /config first.');
+    const { isYearMonth, yearMonthsBetween } = await import('./monthly-revenue');
+    const currentMonth = dateOnlyNow().slice(0, 7);
+    const single = cleanString(req.query.yearMonth || req.query.month);
+    const startMonth = cleanString(req.query.startMonth) || single || currentMonth;
+    const endMonth = cleanString(req.query.endMonth) || single || startMonth;
+    if (!isYearMonth(startMonth) || !isYearMonth(endMonth)) return apiError(400, 'BAD_REQUEST', 'yearMonth, startMonth and endMonth must be YYYY-MM');
+    if (startMonth > endMonth) return apiError(400, 'BAD_REQUEST', 'startMonth must not be after endMonth');
+    if (endMonth > currentMonth) return apiError(400, 'BAD_REQUEST', `${endMonth} has not started yet`);
+    const months = yearMonthsBetween(startMonth, endMonth);
+    if (months.length > 12) return apiError(400, 'BAD_REQUEST', 'At most 12 months per call');
+    const organisationId = Number(cleanString(req.query.organisationId || req.query.org) || String(DEFAULT_REVENUE_ORGANISATION_ID));
+    if (!Number.isFinite(organisationId)) return apiError(400, 'BAD_REQUEST', 'organisationId must be a number');
+    const synced: MonthlyRevenueSyncResult[] = [];
+    try {
+      for (const month of months) synced.push(await syncMonthlyRevenueMonth(teamId, config, month, organisationId));
+      return { status: 200, data: { ok: true, months: synced } };
+    } catch (error: any) {
+      // Months already written stay written; say which one failed.
+      return apiError(502, 'YOT_ERROR', error?.message || 'Failed to sync monthly revenue summary', { synced, failedMonth: months[synced.length] ?? null });
     }
   }
 
@@ -4832,6 +5001,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         staff_popularity_facts: { table: 'staff_popularity_facts', dateExpr: 'date', grain: 'day' },
         staff_cashout_facts: { table: 'staff_cashout_facts', dateExpr: 'date', grain: 'day' },
         staff_retention_facts: { table: 'staff_retention_facts', dateExpr: 'period_start', grain: 'period' },
+        monthly_revenue_summary_facts: { table: 'monthly_revenue_summary_facts', dateExpr: "year_month || '-01'", grain: 'period' },
         location_coverage_facts: { table: 'location_coverage_facts', dateExpr: 'date', grain: 'day' },
         appointments: { table: 'appointments', dateExpr: 'substr(starts_at,1,10)', grain: 'day' },
         promotion_usage: { table: 'promotion_usage', dateExpr: 'substr(used_at,1,10)', grain: 'day' },
