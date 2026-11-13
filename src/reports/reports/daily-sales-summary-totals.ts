@@ -57,7 +57,16 @@ export type DailySalesSummaryTotalsParams = {
 
 export type DailySalesSummaryTotalsRow = {
   locationName: string | null;
-  rowKind: 'locationTotal' | 'grandTotal';
+  /**
+   * 'monthDetail' is one location's figures for one calendar month of the
+   * requested range (the report prints one such row per month, above the
+   * location's "Totals" row). `yearMonth` is set on those rows only.
+   */
+  rowKind: 'locationTotal' | 'grandTotal' | 'monthDetail';
+  /** The month label as printed, e.g. "Sep 2026". Month-detail rows only. */
+  monthLabel?: string | null;
+  /** 'YYYY-MM' parsed from the label. Month-detail rows only. */
+  yearMonth?: string | null;
   cashSales: number | null;
   creditCardSales: number | null;
   voucherSales: number | null;
@@ -110,6 +119,37 @@ function parseNumber(value: unknown): number | null {
 
 function valueAt(row: unknown[], idx: number): number | null {
   return parseNumber(row[idx]);
+}
+
+const MONTH_INDEX: Record<string, number> = {
+  jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12,
+};
+
+/** "Sep 2026" / "September 2026" → "2026-09"; anything else → null. */
+export function parseMonthLabel(label: unknown): string | null {
+  const match = /^([A-Za-z]{3})[A-Za-z]*\.?\s+(\d{4})$/.exec(String(label ?? '').trim());
+  if (!match) return null;
+  const month = MONTH_INDEX[match[1]!.toLowerCase()];
+  return month ? `${match[2]}-${String(month).padStart(2, '0')}` : null;
+}
+
+function numericColumns(row: unknown[]) {
+  return {
+    cashSales: valueAt(row, COL.cashSales),
+    creditCardSales: valueAt(row, COL.creditCardSales),
+    voucherSales: valueAt(row, COL.voucherSales),
+    otherSales: valueAt(row, COL.otherSales),
+    totalSales: valueAt(row, COL.totalSales),
+    creditCardTips: valueAt(row, COL.creditCardTips),
+    otherTips: valueAt(row, COL.otherTips),
+    numberOfSales: valueAt(row, COL.numberOfSales),
+    servicesPerSale: valueAt(row, COL.servicesPerSale),
+    avgSaleValue: valueAt(row, COL.avgSaleValue),
+    commissionTotal: valueAt(row, COL.commissionTotal),
+    commissionNet: valueAt(row, COL.commissionNet),
+    grossIncome: valueAt(row, COL.grossIncome),
+    pctCostOfSale: valueAt(row, COL.pctCostOfSale),
+  };
 }
 
 export function buildDailySalesSummaryTotalsParameterDiscovery(
@@ -172,22 +212,7 @@ export function parseDailySalesSummaryTotalsWorkbook(
     if (first === 'Start Date:' || first === 'End Date:') continue;
 
     if (first === 'Totals') {
-      const numeric = {
-        cashSales: valueAt(row, COL.cashSales),
-        creditCardSales: valueAt(row, COL.creditCardSales),
-        voucherSales: valueAt(row, COL.voucherSales),
-        otherSales: valueAt(row, COL.otherSales),
-        totalSales: valueAt(row, COL.totalSales),
-        creditCardTips: valueAt(row, COL.creditCardTips),
-        otherTips: valueAt(row, COL.otherTips),
-        numberOfSales: valueAt(row, COL.numberOfSales),
-        servicesPerSale: valueAt(row, COL.servicesPerSale),
-        avgSaleValue: valueAt(row, COL.avgSaleValue),
-        commissionTotal: valueAt(row, COL.commissionTotal),
-        commissionNet: valueAt(row, COL.commissionNet),
-        grossIncome: valueAt(row, COL.grossIncome),
-        pctCostOfSale: valueAt(row, COL.pctCostOfSale),
-      };
+      const numeric = numericColumns(row);
       if (currentLocation) {
         rows.push({ locationName: currentLocation, rowKind: 'locationTotal', ...numeric, raw: row });
         currentLocation = null;
@@ -198,14 +223,24 @@ export function parseDailySalesSummaryTotalsWorkbook(
     }
 
     // Month-label rows (e.g. "May 2026") have numeric data in the same columns
-    // but live between the location label and the per-location Totals row. We
-    // skip them — only Totals rows are persisted.
+    // and live between the location label and the per-location Totals row.
+    // They are emitted as 'monthDetail' for the monthly revenue summary; the
+    // daily revenue sync reads 'locationTotal' rows only and is unaffected.
     const hasNumericData = row.slice(1).some((v) => parseNumber(v) != null);
     if (!hasNumericData && /[A-Za-z]/.test(first)) {
+      // The column-header row also has no numbers; it starts "Location".
+      if (first === 'Location') continue;
       currentLocation = first;
       if (!locations.includes(first)) locations.push(first);
+      continue;
     }
-    // Otherwise: month detail row (numeric data, label like "May 2026") — skip.
+    const yearMonth = parseMonthLabel(first);
+    if (hasNumericData && currentLocation && yearMonth) {
+      rows.push({
+        locationName: currentLocation, rowKind: 'monthDetail', monthLabel: first, yearMonth,
+        ...numericColumns(row), raw: row,
+      });
+    }
   }
 
   return {
