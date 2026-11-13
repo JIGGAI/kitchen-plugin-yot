@@ -2650,7 +2650,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     const organisationId = Number(cleanString(req.query.organisationId || req.query.org) || String(DEFAULT_REVENUE_ORGANISATION_ID));
     if (!Number.isFinite(organisationId)) return apiError(400, 'BAD_REQUEST', 'organisationId must be a number');
     try {
-      const { groupDayOfWeekSummary } = await import('./day-of-week-summary');
+      const { groupDayOfWeekSummary, averageStaffByWeekday } = await import('./day-of-week-summary');
       const params = { startDateIso: `${startDate}T00:00:00`, endDateIso: `${endDate}T00:00:00`, organisationId, locationId: null, staffId: null };
       const client = createReportClient(config);
       const r = reportRegistry.dayOfWeekSummary;
@@ -2661,7 +2661,15 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       const file = await client.fetchDocument(inst, doc.documentId);
       const parsed = r.parseDocument(file.buffer, defs);
 
-      const { db } = initializeDatabase(teamId);
+      const { db, sqlite } = initializeDatabase(teamId);
+      // Head count per (shop, date): everyone with a Staff Performance row.
+      const staffCounts = sqlite.prepare(
+        `SELECT location_name AS locationName, date, COUNT(DISTINCT staff_name) AS staffCount
+         FROM staff_performance_facts
+         WHERE team_id = ? AND date >= ? AND date <= ?
+         GROUP BY location_name, date`,
+      ).all(teamId, startDate, endDate) as Array<{ locationName: string; date: string; staffCount: number }>;
+      const staffByShop = averageStaffByWeekday(staffCounts, canonicalLocationName);
       const rows = db.select().from(schema.locations).where(eq(schema.locations.teamId, teamId)).all() as schema.Location[];
       const byName = new Map<string, schema.Location[]>();
       for (const loc of rows) {
@@ -2674,7 +2682,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         const hit = matches.length === 1 ? matches[0] : matches.find((l) => cleanString(l.name) === cleanString(name));
         return hit?.id ?? null;
       };
-      const locations = groupDayOfWeekSummary(parsed.rows, canonicalLocationName, resolveId);
+      const locations = groupDayOfWeekSummary(parsed.rows, canonicalLocationName, resolveId, staffByShop);
       return { status: 200, data: { ok: true, startDate, endDate, locationCount: locations.length, fetchedAt: new Date().toISOString(), locations } };
     } catch (error: any) {
       return apiError(502, 'YOT_ERROR', error?.message || 'Failed to run the day of week summary');

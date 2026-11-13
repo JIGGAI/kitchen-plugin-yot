@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { parseDayOfWeekSummaryRows, buildDayOfWeekSummaryInstanceParams, WEEKDAYS } from '../reports/day-of-week-summary';
-import { groupDayOfWeekSummary } from '../../api/day-of-week-summary';
+import { groupDayOfWeekSummary, averageStaffByWeekday } from '../../api/day-of-week-summary';
 
 // The sheet the way Telerik lays it out: a title block, one header row with
 // some labels split over two lines, a "Week Starting" row over the label
@@ -92,5 +92,41 @@ describe('grouping for the dashboard', () => {
     const grouped = groupDayOfWeekSummary(rows, canonical, () => null);
     expect(grouped.map((g) => g.locationName)).toEqual(['Shop One', 'Shop Two']);
     expect(grouped[0]!.days[0]!.salesCount).toBe(100);
+  });
+});
+
+describe('average staff per weekday', () => {
+  const canonical = (name: string) => (name.toLowerCase() === 'shop 1' ? 'Shop One' : name);
+  // 2026-10-04 and 2026-10-11 are Sundays; 2026-10-05 is a Monday.
+  const counts = [
+    { locationName: 'Shop One', date: '2026-10-04', staffCount: 4 },
+    { locationName: 'Shop One', date: '2026-10-11', staffCount: 6 },
+    { locationName: 'Shop One', date: '2026-10-05', staffCount: 3 },
+    { locationName: 'Shop Two', date: '2026-10-05', staffCount: 2 },
+  ];
+
+  it('averages the head count over the dates of each weekday the shop was staffed', () => {
+    const byShop = averageStaffByWeekday(counts, canonical);
+    expect(byShop.get('shop one')).toEqual([5, 3, null, null, null, null, null]);
+    expect(byShop.get('shop two')).toEqual([null, 2, null, null, null, null, null]);
+  });
+
+  it('adds two spellings of one shop on the same date and ignores unusable rows', () => {
+    const byShop = averageStaffByWeekday([
+      ...counts,
+      { locationName: 'Shop 1', date: '2026-10-05', staffCount: 1 },
+      { locationName: 'Shop One', date: 'not-a-date', staffCount: 9 },
+      { locationName: 'Shop One', date: '2026-10-06', staffCount: 0 },
+    ], canonical);
+    expect(byShop.get('shop one')).toEqual([5, 4, null, null, null, null, null]);
+  });
+
+  it('is attached to each weekday, and left empty for a shop with no staff rows', () => {
+    const { rows } = parseDayOfWeekSummaryRows(SHEET);
+    const grouped = groupDayOfWeekSummary(rows, canonical, () => null, averageStaffByWeekday(counts.filter((c) => c.locationName === 'Shop One'), canonical));
+    expect(grouped[0]!.days.map((d) => d.averageStaffPerDay)).toEqual([5, 3, null, null, null, null, null]);
+    expect(grouped[1]!.days.every((d) => d.averageStaffPerDay === null)).toBe(true);
+    // Without the lookup the field is still present, as null.
+    expect(groupDayOfWeekSummary(rows, canonical, () => null)[0]!.days[0]!.averageStaffPerDay).toBeNull();
   });
 });
