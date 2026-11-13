@@ -2627,6 +2627,58 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     }
   }
 
+  // ─── Day of Week Summary (DayOfWeekSummary, on-demand) ─────────────────
+  // GET /day-of-week-summary?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
+  // The requested range folded onto the seven weekdays, per shop. Run fresh
+  // from YOT on every call (a month for every shop takes about ten seconds):
+  // the report's columns are averages over the range, so there is nothing to
+  // store and add up. Defaults to the current month to date; the end date is
+  // clamped to today. Callers that repeat a range should cache the answer.
+  if (req.path === '/day-of-week-summary' && req.method === 'GET') {
+    const config = readYotConfig(teamId);
+    if (!config) return apiError(400, 'NOT_CONFIGURED', 'YOT apiKey not set for this team. POST /config first.');
+    const today = dateOnlyNow();
+    const startRaw = cleanString(req.query.startDate || req.query.start);
+    const endRaw = cleanString(req.query.endDate || req.query.end);
+    const startInput = startRaw ? toDateOnlyInput(startRaw) : `${today.slice(0, 8)}01`;
+    const endInput = endRaw ? toDateOnlyInput(endRaw) : today;
+    if (!startInput || !endInput) return apiError(400, 'BAD_REQUEST', 'startDate and endDate must be YYYY-MM-DD');
+    const endDate = endInput > today ? today : endInput;
+    const startDate = startInput > endDate ? endDate : startInput;
+    const organisationId = Number(cleanString(req.query.organisationId || req.query.org) || String(DEFAULT_REVENUE_ORGANISATION_ID));
+    if (!Number.isFinite(organisationId)) return apiError(400, 'BAD_REQUEST', 'organisationId must be a number');
+    try {
+      const { groupDayOfWeekSummary } = await import('./day-of-week-summary');
+      const params = { startDateIso: `${startDate}T00:00:00`, endDateIso: `${endDate}T00:00:00`, organisationId, locationId: null, staffId: null };
+      const client = createReportClient(config);
+      const r = reportRegistry.dayOfWeekSummary;
+      const defs = await client.getParameters(r.reportType, r.buildParameterDiscovery(params, config.apiKey));
+      const inst = await client.createInstance(r.reportType, r.buildInstanceParams(params));
+      const doc = await client.createDocument(inst, r.preferredFormat);
+      await client.waitForDocument(inst, doc.documentId);
+      const file = await client.fetchDocument(inst, doc.documentId);
+      const parsed = r.parseDocument(file.buffer, defs);
+
+      const { db } = initializeDatabase(teamId);
+      const rows = db.select().from(schema.locations).where(eq(schema.locations.teamId, teamId)).all() as schema.Location[];
+      const byName = new Map<string, schema.Location[]>();
+      for (const loc of rows) {
+        const key = normalizeNameForLookup(canonicalLocationName(loc.name));
+        if (!key) continue;
+        byName.set(key, [...(byName.get(key) || []), loc]);
+      }
+      const resolveId = (name: string): string | null => {
+        const matches = byName.get(normalizeNameForLookup(name) || '') || [];
+        const hit = matches.length === 1 ? matches[0] : matches.find((l) => cleanString(l.name) === cleanString(name));
+        return hit?.id ?? null;
+      };
+      const locations = groupDayOfWeekSummary(parsed.rows, canonicalLocationName, resolveId);
+      return { status: 200, data: { ok: true, startDate, endDate, locationCount: locations.length, fetchedAt: new Date().toISOString(), locations } };
+    } catch (error: any) {
+      return apiError(502, 'YOT_ERROR', error?.message || 'Failed to run the day of week summary');
+    }
+  }
+
   // ─── Weekly Performance (MonthlyPerformanceSummary, on-demand) ─────────
   // GET /weekly-performance?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
   // Reuses the MonthlyPerformanceSummary YOT report — it accepts arbitrary

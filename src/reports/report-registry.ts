@@ -1,3 +1,11 @@
+import {
+  DAY_OF_WEEK_SUMMARY_REPORT,
+  type DayOfWeekSummaryParams,
+  type DayOfWeekSummaryResult,
+  buildDayOfWeekSummaryInstanceParams,
+  buildDayOfWeekSummaryParameterDiscovery,
+  parseDayOfWeekSummaryWorkbook,
+} from './reports/day-of-week-summary';
 import type { ReportDocumentFormat } from './client';
 import {
   DAILY_REVENUE_SUMMARY_REPORT,
@@ -162,6 +170,15 @@ export const reportRegistry = {
     buildInstanceParams: buildStaffPerformanceInstanceParams,
     parseDocument: parseStaffPerformanceWorkbook,
   } satisfies YotReportDefinition<StaffPerformanceParams, StaffPerformanceResult>,
+  dayOfWeekSummary: {
+    key: DAY_OF_WEEK_SUMMARY_REPORT.key,
+    reportName: DAY_OF_WEEK_SUMMARY_REPORT.reportName,
+    reportType: DAY_OF_WEEK_SUMMARY_REPORT.reportType,
+    preferredFormat: DAY_OF_WEEK_SUMMARY_REPORT.preferredFormat,
+    buildParameterDiscovery: buildDayOfWeekSummaryParameterDiscovery,
+    buildInstanceParams: buildDayOfWeekSummaryInstanceParams,
+    parseDocument: parseDayOfWeekSummaryWorkbook,
+  } satisfies YotReportDefinition<DayOfWeekSummaryParams, DayOfWeekSummaryResult>,
   staffPopularity: {
     key: STAFF_POPULARITY_REPORT.key,
     reportName: STAFF_POPULARITY_REPORT.reportName,
