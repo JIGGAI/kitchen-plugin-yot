@@ -2121,8 +2121,8 @@ function writeExportFiles(teamId: string, db: ReturnType<typeof initializeDataba
 // date; a month in the future is refused rather than stored as zeros.
 //
 // EndDate goes out at midnight of the last day. This report counts that whole
-// day (October 2026 for one shop summed to the same $37,229.95 as its 31
-// daily rows), unlike StaffPopularity, where a time of day spills over.
+// day (a 31-day month for one shop came to exactly the sum of its 31 daily
+// rows), unlike StaffPopularity, where a time of day spills over.
 const MONTHLY_REVENUE_REFRESH_MS = 6 * 60 * 60 * 1000;
 
 export type MonthlyRevenueSyncResult = {
