@@ -16,12 +16,20 @@
 // Columns are found by their header labels rather than by position — Telerik
 // pads the sheet with decorative empty columns and has moved them before.
 //
-// What the figures are (checked against one shop's month):
+// What the figures are (checked against several months of every shop):
 //   Sales #, Sales Value      totals for that weekday over the range.
-//   Average Sales Day         Sales Value ÷ the number of that weekday in the
-//                             range (dollars on a typical Monday).
-//   Average Sales Per Day     Sales # ÷ the number of that weekday (sales on
-//                             a typical Monday).
+//   Average Sales Per Day     Sales # ÷ the number of times that weekday
+//                             falls in the range (sales on a typical Monday).
+//   Average Sales Day         Sales Value ÷ a day count — but NOT that
+//                             weekday's. The report divides by the count of
+//                             the weekday BEFORE it (Sunday by the number of
+//                             Saturdays, Monday by the number of Sundays, …),
+//                             so the column is off whenever neighbouring
+//                             weekdays occur a different number of times in
+//                             the range. It is carried here exactly as
+//                             printed; a caller wanting dollars on a typical
+//                             Monday should derive it as
+//                             Sales Value × Average Sales Per Day ÷ Sales #.
 //   Average Sale Value        the report's own figure; it is not Sales Value ÷
 //                             Sales #, so it is carried as printed.
 //   Appoint. Count            appointments on that weekday over the range.
