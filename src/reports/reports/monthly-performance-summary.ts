@@ -60,6 +60,11 @@ export type MonthlyPerformanceSummaryRow = {
   onlineBookings: number | null;
   newClients: number | null;
   totalClients: number | null;
+  /**
+   * "# of Clients": clients seen in the month, as opposed to totalClients,
+   * the size of the client list. Null on a layout without the column.
+   */
+  clientCount: number | null;
   salesCount: number | null;
   salesPerDay: number | null;
   voucherCount: number | null;
@@ -97,7 +102,10 @@ const COL = {
   yoyPct: 32,
 } as const;
 
-type MonthlyPerformanceColumns = { [Key in keyof typeof COL]: number };
+type MonthlyPerformanceColumns = { [Key in keyof typeof COL]: number } & {
+  /** Header-only column (no legacy position); -1 when the sheet lacks it. */
+  clientCount: number;
+};
 
 function normalizeHeader(value: unknown): string {
   return String(value ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
@@ -136,6 +144,7 @@ export function resolveMonthlyPerformanceColumns(rows: unknown[][]): MonthlyPerf
     onlineBookings: header('Online Bookings', COL.onlineBookings),
     newClients: header('New Clients', COL.newClients),
     totalClients: header('Total Clients', COL.totalClients),
+    clientCount: findHeaderColumn(rows, '# of Clients') ?? -1,
     salesCount: header('# of Sales', COL.salesCount),
     salesPerDay: Math.max(0, salesPerDayLabel - 1),
     voucherCount: header('# of Vouchers', COL.voucherCount),
@@ -242,6 +251,7 @@ export function parseMonthlyPerformanceSummaryWorkbook(
       onlineBookings: valueAt(row, columns.onlineBookings),
       newClients: valueAt(row, columns.newClients),
       totalClients: valueAt(row, columns.totalClients),
+      clientCount: columns.clientCount >= 0 ? valueAt(row, columns.clientCount) : null,
       salesCount: valueAt(row, columns.salesCount),
       salesPerDay: valueAt(row, columns.salesPerDay),
       voucherCount: valueAt(row, columns.voucherCount),

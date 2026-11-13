@@ -72,6 +72,31 @@ describe('parseMonthlyPerformanceSummaryWorkbook', () => {
     });
   });
 
+  it('reads "# of Clients" beside "Total Clients" when the sheet has it', () => {
+    // Made-up figures. The two columns are different things: the size of the
+    // client list, and the clients seen in the month.
+    const result = parse([
+      row({ 9: 'Online Bookings', 11: 'New\r\nClients', 12: 'Total\r\nClients', 14: '# of\r\nClients', 15: '# of\r\nSales', 17: 'Sales per\r\nDay', 20: '# of\r\nVouchers', 22: 'Product\r\nSales Value', 26: 'Service\r\nSales Value', 28: 'Total\r\nSales', 30: 'Last Year\r\nComparison' }),
+      row({ 2: 'Month Starting', 7: 'Cancelled', 8: 'No Shows' }),
+      row({ 4: 'Appointments' }),
+      row({ 1: 'Shop One' }),
+      row({ 1: 'October 2026', 6: '500', 7: '40', 8: '10', 9: '300', 11: '60', 12: '9000', 14: '450', 15: '480', 16: '16', 20: '0', 22: '200', 24: '15000', 27: '15200', 29: '14000', 33: '(9%)' }),
+    ]);
+    expect(result.rows[0]).toMatchObject({ newClients: 60, totalClients: 9000, clientCount: 450, salesCount: 480, salesPerDay: 16 });
+  });
+
+  it('leaves the client count empty on a sheet without that column', () => {
+    const result = parse([
+      row({ 9: 'Online Bookings', 11: 'New Clients', 12: 'Total Clients', 15: '# of Sales', 17: 'Sales per Day', 20: '# of Vouchers', 22: 'Product Sales Value', 26: 'Service Sales Value', 28: 'Total Sales', 30: 'Last Year Comparison' }),
+      row({ 2: 'Month Starting', 7: 'Cancelled', 8: 'No Shows' }),
+      row({ 4: 'Appointments' }),
+      row({ 1: 'Shop One' }),
+      row({ 1: 'October 2026', 6: '500', 7: '40', 8: '10', 9: '300', 11: '60', 12: '9000', 15: '480', 16: '16', 20: '0', 22: '200', 24: '15000', 27: '15200', 29: '14000', 33: '(9%)' }),
+    ]);
+    expect(result.rows[0]!.clientCount).toBeNull();
+    expect(result.rows[0]!.totalClients).toBe(9000);
+  });
+
   it('continues to map the legacy 33-column layout', () => {
     const result = parse([
       row({ 10: 'Online Bookings', 11: 'New Clients', 13: 'Total Clients', 14: '# of Sales', 16: 'Sales per Day', 19: '# of Vouchers', 21: 'Product Sales Value', 25: 'Service Sales Value', 27: 'Total Sales', 29: 'Last Year Comparison' }, 33),
