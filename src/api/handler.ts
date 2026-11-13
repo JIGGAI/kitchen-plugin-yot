@@ -2427,6 +2427,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         onlineBookings: number | null;
         newClients: number | null;
         totalClients: number | null;
+        clientCount: number | null;
         salesCount: number | null;
         salesPerDay: number | null;
         voucherCount: number | null;
@@ -2440,7 +2441,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       const rows = sqlite.prepare(
         `SELECT location_id AS locationId, year_month AS yearMonth,
           appointments, cancelled, no_shows AS noShows, online_bookings AS onlineBookings,
-          new_clients AS newClients, total_clients AS totalClients,
+          new_clients AS newClients, total_clients AS totalClients, client_count AS clientCount,
           sales_count AS salesCount, sales_per_day AS salesPerDay, voucher_count AS voucherCount,
           product_sales AS productSales, service_sales AS serviceSales, total_sales AS totalSales,
           yoy_amount AS yoyAmount, yoy_pct AS yoyPct, last_updated_at AS lastUpdatedAt
@@ -2510,8 +2511,8 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
           appointments, cancelled, no_shows, online_bookings, new_clients, total_clients,
           sales_count, sales_per_day, voucher_count,
           product_sales, service_sales, total_sales,
-          yoy_amount, yoy_pct, last_updated_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+          yoy_amount, yoy_pct, last_updated_at, client_count
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT (team_id, location_id, year_month) DO UPDATE SET
           appointments = excluded.appointments,
           cancelled = excluded.cancelled,
@@ -2519,6 +2520,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
           online_bookings = excluded.online_bookings,
           new_clients = excluded.new_clients,
           total_clients = excluded.total_clients,
+          client_count = excluded.client_count,
           sales_count = excluded.sales_count,
           sales_per_day = excluded.sales_per_day,
           voucher_count = excluded.voucher_count,
@@ -2541,7 +2543,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
           row.appointments, row.cancelled, row.noShows, row.onlineBookings, row.newClients, row.totalClients,
           row.salesCount, row.salesPerDay, row.voucherCount,
           row.productSales, row.serviceSales, row.totalSales,
-          row.yoyAmount, row.yoyPct, startedAt,
+          row.yoyAmount, row.yoyPct, startedAt, row.clientCount,
         );
         rowsWritten += 1;
       }
