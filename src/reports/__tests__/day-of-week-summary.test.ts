@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { parseDayOfWeekSummaryRows, buildDayOfWeekSummaryInstanceParams, WEEKDAYS } from '../reports/day-of-week-summary';
-import { groupDayOfWeekSummary, averageStaffByWeekday } from '../../api/day-of-week-summary';
+import { groupDayOfWeekSummary, averageStaffByWeekday, averageStaffHoursByWeekday } from '../../api/day-of-week-summary';
 
 // The sheet the way Telerik lays it out: a title block, one header row with
 // some labels split over two lines, a "Week Starting" row over the label
@@ -123,10 +123,45 @@ describe('average staff per weekday', () => {
 
   it('is attached to each weekday, and left empty for a shop with no staff rows', () => {
     const { rows } = parseDayOfWeekSummaryRows(SHEET);
-    const grouped = groupDayOfWeekSummary(rows, canonical, () => null, averageStaffByWeekday(counts.filter((c) => c.locationName === 'Shop One'), canonical));
-    expect(grouped[0]!.days.map((d) => d.averageStaffPerDay)).toEqual([5, 3, null, null, null, null, null]);
-    expect(grouped[1]!.days.every((d) => d.averageStaffPerDay === null)).toBe(true);
+    const headcount = averageStaffByWeekday(counts.filter((c) => c.locationName === 'Shop One'), canonical);
+    const grouped = groupDayOfWeekSummary(rows, canonical, () => null, new Map([['shop one', [2.5, 1.5, null, null, null, null, null]]]), headcount);
+    // The hours-based figure is the one called averageStaffPerDay; the head
+    // count rides beside it.
+    expect(grouped[0]!.days.map((d) => d.averageStaffPerDay)).toEqual([2.5, 1.5, null, null, null, null, null]);
+    expect(grouped[0]!.days.map((d) => d.averageStaffHeadcount)).toEqual([5, 3, null, null, null, null, null]);
+    expect(grouped[1]!.days.every((d) => d.averageStaffPerDay === null && d.averageStaffHeadcount === null)).toBe(true);
     // Without the lookup the field is still present, as null.
     expect(groupDayOfWeekSummary(rows, canonical, () => null)[0]!.days[0]!.averageStaffPerDay).toBeNull();
+  });
+});
+
+describe('staff per weekday by hours', () => {
+  const canonical = (name: string) => (name.toLowerCase() === 'shop 1' ? 'Shop One' : name);
+  // Open 6 hours on Sunday, 10 on Monday, closed Tuesday.
+  const open = (weekday: number) => [360, 600, null, 600, 600, 660, 480][weekday] ?? null;
+  // 2026-10-04 and 2026-10-11 are Sundays; 2026-10-05 a Monday; 2026-10-06 a Tuesday.
+
+  it('counts four people working half the open day as two stylists', () => {
+    // Four stylists, 5 hours each, on a 10-hour Monday.
+    const byShop = averageStaffHoursByWeekday([{ locationName: 'Shop One', date: '2026-10-05', minutesWorked: 4 * 300 }], canonical, open);
+    expect(byShop.get('shop one')).toEqual([null, 2, null, null, null, null, null]);
+  });
+
+  it('averages the daily figures over the dates of the weekday that have hours', () => {
+    const byShop = averageStaffHoursByWeekday([
+      { locationName: 'Shop One', date: '2026-10-04', minutesWorked: 720 },  // 12h / 6h open = 2
+      { locationName: 'Shop One', date: '2026-10-11', minutesWorked: 1440 }, // 24h / 6h open = 4
+      { locationName: 'Shop 1', date: '2026-10-11', minutesWorked: 360 },    // same shop, same day: +1
+      { locationName: 'Shop One', date: '2026-10-18', minutesWorked: 0 },    // no hours: not a staffed day
+    ], canonical, open);
+    expect(byShop.get('shop one')![0]).toBe((2 + 5) / 2);
+  });
+
+  it('gives nothing for a weekday the shop is closed, or a bad date', () => {
+    const byShop = averageStaffHoursByWeekday([
+      { locationName: 'Shop One', date: '2026-10-06', minutesWorked: 600 },
+      { locationName: 'Shop One', date: 'nope', minutesWorked: 600 },
+    ], canonical, open);
+    expect(byShop.get('shop one')).toEqual([null, null, null, null, null, null, null]);
   });
 });
