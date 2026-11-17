@@ -155,6 +155,8 @@ type Diag = {
   // Report-fetch retry (export script >= 2026-11-05). Undefined before then.
   reportAttemptCount?: number;
   reportRetryFailures?: string[];
+  sheetsRetryFailures?: string[];
+  disbursementsEmailAttemptCount?: number;
 };
 
 async function main() {
@@ -277,6 +279,19 @@ Watchdog log: ${LOG_PATH}`,
     const first = (diag.reportRetryFailures || [])[0];
     sections.push(`YOT report fetch needed ${retries} ${retries === 1 ? 'retry' : 'retries'} tonight before it answered — payroll was sent in full, just later than usual.${first ? `\nFirst failure: ${first.slice(0, 300)}` : ''}`);
     summaryBits.push(`report fetched after ${retries} ${retries === 1 ? 'retry' : 'retries'}`);
+  }
+
+  // Same idea for the other two services the export leans on.
+  const sheetsRetries = diag.sheetsRetryFailures || [];
+  if (sheetsRetries.length) {
+    const n = sheetsRetries.length;
+    sections.push(`Google Sheets needed ${n} ${n === 1 ? 'retry' : 'retries'} tonight — payroll was sent in full, just later than usual.\nFirst failure: ${sheetsRetries[0]!.slice(0, 300)}`);
+    summaryBits.push(`${n} Sheets ${n === 1 ? 'retry' : 'retries'}`);
+  }
+  if ((diag.disbursementsEmailAttemptCount ?? 1) > 1) {
+    const retries = (diag.disbursementsEmailAttemptCount as number) - 1;
+    sections.push(`The disbursements email needed ${retries} ${retries === 1 ? 'retry' : 'retries'} tonight before Gmail accepted it — payroll was sent in full, just later than usual.`);
+    summaryBits.push(`email sent after ${retries} ${retries === 1 ? 'retry' : 'retries'}`);
   }
 
   const collisions = diag.crossGroupCollisions || [];

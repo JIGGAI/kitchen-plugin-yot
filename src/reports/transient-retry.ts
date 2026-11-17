@@ -17,9 +17,29 @@
  */
 import { isXlsxRenderingUnavailable } from './render-fallback';
 
-const REPORT_FAILURE_WITH_STATUS = /^Report (?:request|client creation) failed(?: \([^)]*\))?: (\d{3})\b/;
-const NETWORK_FAILURE = /\b(?:fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|EPIPE|ENETUNREACH|EHOSTUNREACH|socket hang up|UND_ERR_[A-Z_]+|network error)\b/i;
+const REPORT_FAILURE_WITH_STATUS = /^Report (?:request|client creation|document fetch) failed(?: \([^)]*\))?: (\d{3})\b/;
+// A connection that never opened, dropped mid-response ("terminated",
+// "other side closed") or was cut by a timeout ("The operation was aborted."
+// is what node-fetch says, and what ended the corp export on 2026-11-16).
+const NETWORK_FAILURE = /\b(?:fetch failed|ECONNRESET|ECONNREFUSED|ECONNABORTED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|EPIPE|ENETUNREACH|EHOSTUNREACH|socket hang up|UND_ERR_[A-Z_]+|network error|terminated|other side closed|operation was aborted|timed out|premature close)\b/i;
 const SQL_TIMEOUT = /Execution Timeout Expired|SqlException/;
+// The report server accepted the request but never finished rendering.
+const DOCUMENT_NOT_READY = /did not become ready after \d+ polls/;
+
+/**
+ * True for a failure of the connection itself rather than of the request:
+ * checks the message, the error name and `code`, and one level of `cause`
+ * (Node's fetch reports "fetch failed" and keeps the reason on `cause`).
+ */
+export function isNetworkFailure(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const code = (error as { code?: unknown }).code;
+  if (error.name === 'AbortError' || error.name === 'TimeoutError') return true;
+  if (typeof code === 'string' && (code === 'AbortError' || code === 'TimeoutError' || NETWORK_FAILURE.test(code))) return true;
+  if (NETWORK_FAILURE.test(error.message)) return true;
+  const cause = (error as { cause?: unknown }).cause;
+  return cause instanceof Error && cause !== error ? isNetworkFailure(cause) : false;
+}
 
 function transientStatus(status: number): boolean {
   return status >= 500 || status === 429;
@@ -33,7 +53,8 @@ export function isTransientReportError(error: unknown): boolean {
   const fromMessage = REPORT_FAILURE_WITH_STATUS.exec(error.message);
   if (fromMessage) return transientStatus(Number(fromMessage[1]));
   if (SQL_TIMEOUT.test(error.message)) return true;
-  return NETWORK_FAILURE.test(error.message);
+  if (DOCUMENT_NOT_READY.test(error.message)) return true;
+  return isNetworkFailure(error);
 }
 
 export type RetryEvent = {
@@ -56,6 +77,8 @@ export type RetryOptions = {
   sleep?: (ms: number) => Promise<void>;
   onRetry?: (event: RetryEvent) => void;
   isTransient?: (error: unknown) => boolean;
+  /** What is being retried, for the final error message. Default "Report fetch". */
+  label?: string;
 };
 
 export type RetryResult<T> = {
@@ -97,7 +120,7 @@ export async function retryTransient<T>(fn: (attempt: number) => Promise<T>, opt
       const nextAttemptAt = now() + intervalMs;
       if (nextAttemptAt > deadline) {
         const elapsedMin = Math.round((now() - start) / 60_000);
-        const finalError = new Error(`Report fetch still failing after ${attempt} attempts over ${elapsedMin} min: ${error.message}`);
+        const finalError = new Error(`${options.label ?? 'Report fetch'} still failing after ${attempt} attempts over ${elapsedMin} min: ${error.message}`);
         (finalError as { cause?: unknown }).cause = error;
         (finalError as { attempts?: number }).attempts = attempt;
         throw finalError;

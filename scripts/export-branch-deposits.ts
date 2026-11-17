@@ -42,6 +42,7 @@ import { otherGroupConfigs, resolveGroupConfig, type DisbursementGroupConfig } f
 import { findRosterCollisions, type RosterCollision, type RosterEntry } from '../src/disbursements/roster-collisions';
 import { findRosterDuplicates, isLocationDrift, isSameShop, type LocationDriftRow, type RosterDuplicate } from '../src/disbursements/location-drift';
 import { buildDayNotices, formatNoticesBlock } from '../src/disbursements/operator-notices';
+import { payoutAlreadySent } from '../src/disbursements/already-sent';
 
 type Args = {
   date: string;
@@ -80,6 +81,9 @@ type Args = {
    *  so a weekday run is settled before the 22:00 watchdog and the Sunday
    *  16:00 run before the 17:00 weekend combine. 0 = no retry. */
   reportRetryMinutes: number;
+  /** Catch-up firings pass this: exit without doing anything when this
+   *  group's payout for the date has already been emailed for real. */
+  skipIfSent: boolean;
 };
 
 type ReportMode = 'per-location' | 'org-wide';
@@ -209,6 +213,10 @@ type MatchDiagnostics = {
    *  fetch so a flaky report server is visible even when payroll went out. */
   reportAttemptCount: number;
   reportRetryFailures: string[];
+  /** Google Sheets calls that failed transiently and were retried. */
+  sheetsRetryFailures: string[];
+  /** SMTP sends it took to deliver the disbursements email (0 = not sent). */
+  disbursementsEmailAttemptCount: number;
   reportRowCount: number;
   masterRowCount: number;
   exportRowCount: number;
@@ -312,6 +320,7 @@ function parseArgs(argv: string[]): Args {
     skipEmail: (map.get('skip-email') ?? 'false') !== 'false',
     reportMode: parseReportMode(map.get('report-mode')),
     reportRetryMinutes: parseReportRetryMinutes(map.get('report-retry-minutes')),
+    skipIfSent: (map.get('skip-if-sent') ?? 'false') !== 'false',
   };
 }
 
@@ -564,14 +573,15 @@ function buildWatchdogEmailSection(args: {
   }));
 }
 
-async function emailDisbursementsCsv(filePath: string, account: string, recipients: string | string[], subject: string, body: string): Promise<void> {
-  await sendGmail({
+async function emailDisbursementsCsv(filePath: string, account: string, recipients: string | string[], subject: string, body: string): Promise<number> {
+  const { attempts } = await sendGmail({
     from: account,
     to: recipients,
     subject,
     text: body,
     attachments: [{ filename: path.basename(filePath), path: filePath }],
   });
+  return attempts;
 }
 
 // Fallback path: when the disbursements email to the configured recipient
@@ -783,8 +793,8 @@ async function loadExistingGarnishmentPayoutRows(sheetId: string, _account: stri
 
 async function rewriteGarnishmentPayoutSheet(sheetId: string, _account: string, rows: GarnishmentPayoutRow[]) {
   const values = toSheetValues(rows);
-  await sheetsApi.clearValues(sheetId, `'GARNISHMENTS PAYOUTS'!A:Z`);
-  await sheetsApi.updateValues(sheetId, `'GARNISHMENTS PAYOUTS'!A1:H${Math.max(rows.length + 1, 1)}`, values, 'USER_ENTERED');
+  // One request, not clear-then-update — see replaceValues.
+  await sheetsApi.replaceValues(sheetId, 'GARNISHMENTS PAYOUTS', values, 'USER_ENTERED');
 }
 
 // Parses currency strings the operator types into the LOANS tab — accepts
@@ -878,8 +888,7 @@ async function rewriteLoanPaymentsSheet(sheetId: string, _account: string, rows:
       r.transactionId,
     ]),
   ];
-  await sheetsApi.clearValues(sheetId, `'LOAN PAYMENTS'!A:Z`);
-  await sheetsApi.updateValues(sheetId, `'LOAN PAYMENTS'!A1:I${Math.max(values.length, 1)}`, values, 'USER_ENTERED');
+  await sheetsApi.replaceValues(sheetId, 'LOAN PAYMENTS', values, 'USER_ENTERED');
 }
 
 // Writes one loan's TOTAL PAID (col H) + REMAINING BAL. (col J) back to the
@@ -1090,6 +1099,18 @@ async function writeDispursementsDailyTab(args: {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   mkdirSync(args.outputDir, { recursive: true });
+
+  if (args.skipIfSent) {
+    const check = payoutAlreadySent(
+      path.join(args.outputDir, `${args.group.filePrefix}branch-deposits-${args.date}.diagnostics.json`),
+      { date: args.date, groupId: args.group.id, recipient: args.group.emailTo },
+    );
+    if (check.sent) {
+      console.log(JSON.stringify({ ok: true, date: args.date, groupId: args.group.id, skipped: 'already-sent', detail: check.reason }));
+      return;
+    }
+    console.error(`[catch-up] ${args.group.id} payout for ${args.date} has not been sent (${check.reason}) — running the export now`);
+  }
 
   const report = await fetchCashoutRowsWithRetry(args);
   console.error(`[report] mode=${report.reportMode} rows=${report.rows.length} locationCalls=${report.reportLocationCallCount} attempts=${report.reportAttemptCount}`);
@@ -1734,12 +1755,13 @@ Sourced from ${args.group.rosterTab} on the ${args.group.rosterSheetLabel} sheet
 
   let emailStatus: 'sent' | 'skipped' | 'failed' = 'skipped';
   let failureAlertStatus: 'sent' | 'skipped' | 'failed' | 'not-needed' = 'not-needed';
+  let emailAttemptCount = 0;
   if (args.dryRun || args.skipEmail) {
     const displayRecipients = Array.isArray(sendTo) ? sendTo.join(', ') : sendTo;
     console.error(`[${args.dryRun ? 'dry-run' : 'skip-email'}] would email ${disbursementsPath} to ${displayRecipients}: ${subject}`);
   } else {
     try {
-      await emailDisbursementsCsv(disbursementsPath, args.account, sendTo, subject, body);
+      emailAttemptCount = await emailDisbursementsCsv(disbursementsPath, args.account, sendTo, subject, body);
       emailStatus = 'sent';
     } catch (err: any) {
       emailStatus = 'failed';
@@ -1764,6 +1786,8 @@ Sourced from ${args.group.rosterTab} on the ${args.group.rosterSheetLabel} sheet
     reportLocationFailure: report.reportLocationFailure,
     reportAttemptCount: report.reportAttemptCount,
     reportRetryFailures: report.reportRetryFailures,
+    sheetsRetryFailures: sheetsApi.sheetsRetryFailures(),
+    disbursementsEmailAttemptCount: emailAttemptCount,
     reportRowCount: report.rows.length,
     masterRowCount: masterRows.length,
     exportRowCount: depositRows.length,
@@ -1805,6 +1829,8 @@ Sourced from ${args.group.rosterTab} on the ${args.group.rosterSheetLabel} sheet
     disbursementsEmailStatus: emailStatus,
     disbursementsFailureAlertStatus: failureAlertStatus,
     reportAttemptCount: report.reportAttemptCount,
+    sheetsRetryCount: sheetsApi.sheetsRetryFailures().length,
+    disbursementsEmailAttemptCount: emailAttemptCount,
     exportRowCount: depositRows.length,
     zeroNetOmittedCount: zeroNetRows.length,
     masterRowCount: masterRows.length,

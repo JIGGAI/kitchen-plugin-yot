@@ -37,6 +37,19 @@ describe('isTransientReportError', () => {
     expect(isTransientReportError(new Error('getaddrinfo EAI_AGAIN youreontime-reports.azurewebsites.net'))).toBe(true);
   });
 
+  it('treats dropped, aborted and timed-out connections as transient', () => {
+    expect(isTransientReportError(new Error('The operation was aborted.'))).toBe(true);
+    expect(isTransientReportError(Object.assign(new Error('This operation was aborted'), { name: 'AbortError' }))).toBe(true);
+    expect(isTransientReportError(new TypeError('terminated'))).toBe(true);
+    expect(isTransientReportError(Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('Headers Timeout Error'), { code: 'UND_ERR_HEADERS_TIMEOUT' }) }))).toBe(true);
+  });
+
+  it('treats a failed document download and a report that never renders as transient', () => {
+    expect(isTransientReportError(new Error('Report document fetch failed (c01530c87a8b): 502'))).toBe(true);
+    expect(isTransientReportError(new Error('Report document fetch failed (c01530c87a8b): 404'))).toBe(false);
+    expect(isTransientReportError(new Error('Document c01530c87a8b did not become ready after 60 polls'))).toBe(true);
+  });
+
   it('does not retry the XLSX renderer outage — that has its own CSV fallback', () => {
     expect(isTransientReportError(new Error(XLSX_OUTAGE))).toBe(false);
   });
