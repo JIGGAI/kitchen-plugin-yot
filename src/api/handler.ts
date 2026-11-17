@@ -2650,7 +2650,9 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     const organisationId = Number(cleanString(req.query.organisationId || req.query.org) || String(DEFAULT_REVENUE_ORGANISATION_ID));
     if (!Number.isFinite(organisationId)) return apiError(400, 'BAD_REQUEST', 'organisationId must be a number');
     try {
-      const { groupDayOfWeekSummary, averageStaffByWeekday } = await import('./day-of-week-summary');
+      const { groupDayOfWeekSummary, averageStaffByWeekday, averageStaffHoursByWeekday } = await import('./day-of-week-summary');
+      const { DEFAULT_BUSINESS_HOURS } = await import('../coverage/business-hours');
+      const { parseHoursWorkedToMinutes } = await import('../reports/reports/staff-performance');
       const params = { startDateIso: `${startDate}T00:00:00`, endDateIso: `${endDate}T00:00:00`, organisationId, locationId: null, staffId: null };
       const client = createReportClient(config);
       const r = reportRegistry.dayOfWeekSummary;
@@ -2669,7 +2671,22 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
          WHERE team_id = ? AND date >= ? AND date <= ?
          GROUP BY location_name, date`,
       ).all(teamId, startDate, endDate) as Array<{ locationName: string; date: string; staffCount: number }>;
-      const staffByShop = averageStaffByWeekday(staffCounts, canonicalLocationName);
+      const headcountByShop = averageStaffByWeekday(staffCounts, canonicalLocationName);
+      // Hours worked per (shop, date), and the open hours they are measured
+      // against: the same store hours Staff Coverage staffs to.
+      const staffHours = (sqlite.prepare(
+        `SELECT location_name AS locationName, date, hours_worked_raw AS hoursWorkedRaw
+         FROM staff_performance_facts
+         WHERE team_id = ? AND date >= ? AND date <= ? AND hours_worked_raw IS NOT NULL`,
+      ).all(teamId, startDate, endDate) as Array<{ locationName: string; date: string; hoursWorkedRaw: string | null }>)
+        .map((r) => ({ locationName: r.locationName, date: r.date, minutesWorked: parseHoursWorkedToMinutes(r.hoursWorkedRaw) }));
+      const openMinutes = (weekday: number): number | null => {
+        const hours = DEFAULT_BUSINESS_HOURS[weekday as 0 | 1 | 2 | 3 | 4 | 5 | 6];
+        if (!hours) return null;
+        const toMinutes = (hhmm: string) => Number(hhmm.slice(0, 2)) * 60 + Number(hhmm.slice(3, 5));
+        return toMinutes(hours.close) - toMinutes(hours.open);
+      };
+      const staffByShop = averageStaffHoursByWeekday(staffHours, canonicalLocationName, openMinutes);
       const rows = db.select().from(schema.locations).where(eq(schema.locations.teamId, teamId)).all() as schema.Location[];
       const byName = new Map<string, schema.Location[]>();
       for (const loc of rows) {
@@ -2682,7 +2699,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         const hit = matches.length === 1 ? matches[0] : matches.find((l) => cleanString(l.name) === cleanString(name));
         return hit?.id ?? null;
       };
-      const locations = groupDayOfWeekSummary(parsed.rows, canonicalLocationName, resolveId, staffByShop);
+      const locations = groupDayOfWeekSummary(parsed.rows, canonicalLocationName, resolveId, staffByShop, headcountByShop);
       return { status: 200, data: { ok: true, startDate, endDate, locationCount: locations.length, fetchedAt: new Date().toISOString(), locations } };
     } catch (error: any) {
       return apiError(502, 'YOT_ERROR', error?.message || 'Failed to run the day of week summary');
