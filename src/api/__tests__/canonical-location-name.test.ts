@@ -41,7 +41,7 @@ describe('canonicalLocationName', () => {
 
   it('passes through non-aliased names unchanged (incl. their original spacing)', () => {
     expect(canonicalLocationName('Brighton MI')).toBe('Brighton MI');
-    expect(canonicalLocationName('Clinton Twp.  MI')).toBe('Clinton Twp.  MI');
+    expect(canonicalLocationName('Shelby Twp.  MI')).toBe('Shelby Twp.  MI');
     expect(canonicalLocationName('World of Golf FL.')).toBe('World of Golf FL.');
   });
 
