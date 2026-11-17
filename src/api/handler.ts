@@ -67,6 +67,15 @@ const LOCATION_NAME_VARIANTS: Record<string, string> = {
   // history.
   'waterford': 'Waterford Mi',
   'westland': 'Westland Mi.',
+  // The Clinton Township shop (id 7726) was renamed twice in September 2026:
+  // "Clinton Twp. MI" until mid-month, "Macomb Eastpoint Clinton MI" for a few
+  // days, then "Macomb - Clinton MI". Same location id throughout.
+  'clinton twp. mi': 'Macomb - Clinton MI',
+  'macomb eastpoint clinton mi': 'Macomb - Clinton MI',
+  // The locations table spells this shop with two spaces before "FL."; some
+  // reports print one. Listing the canonical name here is what lets consumers
+  // that compare names exactly (the dashboard's scope filter) match it.
+  'yulee rt. 200 fl.': 'Yulee Rt. 200  FL.',
 };
 
 // Lookup table: every variant key AND every canonical name, both normalized.
@@ -2840,7 +2849,11 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       ).all(teamId, `${months[0]}-01`, `${shiftMonth(endMonth, 1)}-01`) as Array<{
         locationName: string; staffName: string; yearMonth: string; totalSalesValue: number; totalSalesCount: number;
       }>;
-      return { status: 200, data: { ok: true, months, rowCount: rows.length, rows } };
+      // The facts keep the shop name the report printed that day, so a renamed
+      // shop spans two spellings. Fold them, summing a stylist's month.
+      const { mergeMonthlyStaffPerformance } = await import('./canonical-rows');
+      const merged = mergeMonthlyStaffPerformance(rows, canonicalLocationName);
+      return { status: 200, data: { ok: true, months, rowCount: merged.length, rows: merged } };
     } catch (error: any) {
       return apiError(500, 'INTERNAL', error?.message || 'Failed to read monthly staff performance facts');
     }
@@ -3361,9 +3374,12 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       let lastSyncedAt: string | null = null;
 
       for (const f of facts) {
-        const key = `${f.locationName ?? ''}::${f.staffName}`;
+        // Stored under the name the report printed that day; fold renames so a
+        // stylist's late arrivals at one shop are counted together.
+        const locationName = f.locationName == null ? null : canonicalLocationName(f.locationName);
+        const key = `${locationName ?? ''}::${f.staffName}`;
         const agg = buckets.get(key) || {
-          locationName: f.locationName,
+          locationName,
           staffName: f.staffName,
           lateCount: 0,
           lastLateDate: null,
@@ -4031,7 +4047,15 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       const endDate = requestedEnd || anchorEnd;
       const startDate = requestedStart || endDate;
       const locationName = cleanString(req.query.location || req.query.locationName);
-      const rows = listStaffCashoutFacts(sqlite, teamId, { startDate, endDate, locationName });
+      // Rows are stored under the name the report printed that day. Return the
+      // shop's current name, and match the optional location filter the same
+      // way so asking for a shop by either spelling finds all of its rows.
+      const { canonicalizeRowLocations } = await import('./canonical-rows');
+      const rows = canonicalizeRowLocations(
+        listStaffCashoutFacts(sqlite, teamId, { startDate, endDate }),
+        canonicalLocationName,
+        locationName,
+      );
       const lastSyncedAt = (sqlite
         .prepare("SELECT last_synced_at AS lastSyncedAt FROM sync_state WHERE team_id = ? AND resource = 'staff_cashout_facts'")
         .get(teamId) as { lastSyncedAt?: string } | undefined)?.lastSyncedAt || null;
