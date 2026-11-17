@@ -3727,26 +3727,19 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       }
       const hasData = rows.length > 0;
 
-      // Group rows by location
-      const locMap = new Map<string, { locationName: string; staff: RetentionRow[] }>();
+      // Group rows by shop under its canonical name; a shop stored under two
+      // spellings in one window keeps only its newest snapshot.
+      const { groupRetentionByLocation } = await import('./staff-retention');
+      const locations = groupRetentionByLocation(rows, canonicalLocationName);
+      const keptRows = locations.flatMap((loc) => loc.staff);
       let lastSyncedAt: string | null = null;
       const trailingMonthLabels = { m1: null as string | null, m2: null as string | null, m3: null as string | null };
-      for (const r of rows) {
-        const bucket = locMap.get(r.locationName) || { locationName: r.locationName, staff: [] };
-        bucket.staff.push(r);
-        locMap.set(r.locationName, bucket);
+      for (const r of keptRows) {
         if (!lastSyncedAt || r.syncedAt > lastSyncedAt) lastSyncedAt = r.syncedAt;
         if (!trailingMonthLabels.m1 && r.retentionM1Label) trailingMonthLabels.m1 = r.retentionM1Label;
         if (!trailingMonthLabels.m2 && r.retentionM2Label) trailingMonthLabels.m2 = r.retentionM2Label;
         if (!trailingMonthLabels.m3 && r.retentionM3Label) trailingMonthLabels.m3 = r.retentionM3Label;
       }
-
-      const locations = Array.from(locMap.values())
-        .sort((a, b) => a.locationName.localeCompare(b.locationName))
-        .map((loc) => ({
-          locationName: loc.locationName,
-          staff: loc.staff.sort((a, b) => (b.totalSales - a.totalSales) || a.staffName.localeCompare(b.staffName)),
-        }));
 
       return {
         status: 200,
@@ -3759,7 +3752,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
           trailingMonthLabels,
           lastSyncedAt,
           locations,
-          rowCount: rows.length,
+          rowCount: keptRows.length,
         },
       };
     } catch (error: any) {
