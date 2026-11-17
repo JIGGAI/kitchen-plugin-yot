@@ -67,6 +67,28 @@ describe('parseStaffWorkSummaryWorkbook', () => {
     expect(result.rows[1].avgLengthMinutes).toBe(28);
   });
 
+  it('drops everyone listed under the corporate office or another non-shop', () => {
+    const result = parse([
+      row({ 1: 'Name' }),
+      row({ 1: 'Auburn Hills MI' }),
+      row({ 1: 'Carolyn Hojnowski', 6: '5h, 0m', 9: '5h, 0m', 10: '1', 25: '0.58', 29: '35m' }),
+      row({ 1: 'Hair Mechanix Corporate Office' }),
+      row({ 1: 'Office Person', 8: '00m' }),
+      row({ 1: '** OFFICE **' }),
+      row({ 1: 'Another Admin', 6: '8h, 0m', 9: '8h, 0m', 10: '1' }),
+      row({ 1: 'TEST LOCATION' }),
+      row({ 1: 'Test Person', 10: '1' }),
+      row({ 1: 'Brighton MI' }),
+      row({ 1: 'Dana Humble', 6: '5h, 0m', 9: '5h, 0m', 10: '1', 25: '0.96', 29: '28m' }),
+    ]);
+
+    expect(result.locations).toEqual(['Auburn Hills MI', 'Brighton MI']);
+    expect(result.rows.map((r) => `${r.locationName} / ${r.staffName}`)).toEqual([
+      'Auburn Hills MI / Carolyn Hojnowski',
+      'Brighton MI / Dana Humble',
+    ]);
+  });
+
   it('does not mistake a stylist with no mapped data for a location header', () => {
     // Regression: the header test used to be "none of the five mapped columns
     // has a value", so a stylist who worked no hours in the window became a

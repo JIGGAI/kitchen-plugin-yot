@@ -145,6 +145,17 @@ export function buildStaffWorkSummaryInstanceParams(
   };
 }
 
+/**
+ * Locations that are not shops: the corporate office, YOT's "** OFFICE **"
+ * pseudo-location, and the test location. The people listed under them are
+ * office staff, not stylists, and must not land in stylist data. Same set the
+ * dashboard hides from its location lists.
+ */
+export function isNonShopLocation(name: string): boolean {
+  const text = name.trim().replace(/\s+/g, ' ');
+  return /corporate office|test location/i.test(text) || /^\**\s*office\s*\**$/i.test(text);
+}
+
 // Header labels that appear in column [1] and must never be mistaken for a
 // location or a stylist.
 const NON_DATA_LABELS = new Set(['Name', 'Totals', 'Grand Total']);
@@ -191,12 +202,14 @@ export function parseStaffWorkSummaryWorkbook(
     const hasAnyDataCell = row.some((cell, i) => i !== COL.label && cleanString(cell) != null);
     if (!hasAnyDataCell) {
       currentLocation = label;
-      if (!locations.includes(label)) locations.push(label);
+      if (!isNonShopLocation(label) && !locations.includes(label)) locations.push(label);
       continue;
     }
 
     // A staff row before any location header would have nowhere to belong.
     if (!currentLocation) continue;
+    // Office staff are not stylists; drop everyone listed under a non-shop.
+    if (isNonShopLocation(currentLocation)) continue;
 
     rows.push({
       locationName: currentLocation,
