@@ -189,7 +189,7 @@ export function createReportClient(config: YotConfig, options: ReportClientOptio
     if (response.status === 410) {
       clientId = null;
     }
-    if (!response.ok) throw new Error(`Report document fetch failed (${documentId}): ${response.status}`);
+    if (!response.ok) throw Object.assign(new Error(`Report document fetch failed (${documentId}): ${response.status}`), { status: response.status });
     return { buffer, contentType: response.headers.get('content-type') };
   }
 

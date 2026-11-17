@@ -21,6 +21,7 @@ import { ImapFlow } from 'imapflow';
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
+import { retryTransient } from '../reports/transient-retry';
 
 const DEFAULT_ACCOUNT = 'govna.assistant@gmail.com';
 
@@ -74,8 +75,31 @@ function transport(): Transporter {
   return cachedTransport;
 }
 
-/** Send an email via Gmail SMTP. Throws on failure. */
-export async function sendGmail(args: SendMailArgs): Promise<{ messageId: string }> {
+// SMTP failures a second attempt can plausibly get past: the server said
+// "try again later" (4xx), or the connection never produced an answer at all
+// (DNS, connect, TLS, socket, timeout). A 5xx reply — bad credentials (535),
+// rejected recipient, message too large — fails on the first answer, as does
+// anything nodemailer flags as an auth or message-building problem.
+const SMTP_NETWORK_CODES = new Set(['ECONNECTION', 'ETIMEDOUT', 'ESOCKET', 'EDNS', 'ETLS', 'ECONNRESET', 'ECONNREFUSED', 'EAI_AGAIN', 'ENOTFOUND', 'EPIPE', 'ENETUNREACH', 'EHOSTUNREACH']);
+
+export function isTransientSmtpError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const e = error as { responseCode?: unknown; code?: unknown };
+  if (typeof e.responseCode === 'number') return e.responseCode >= 400 && e.responseCode < 500;
+  return typeof e.code === 'string' && SMTP_NETWORK_CODES.has(e.code);
+}
+
+export type SendRetryOptions = {
+  /** How long after the first attempt a new one may still start. 0 = one attempt. */
+  windowMs?: number;
+  intervalMs?: number;
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
+  /** Test seam: the function that performs one send. */
+  send?: (args: SendMailArgs) => Promise<{ messageId: string }>;
+};
+
+async function sendOnce(args: SendMailArgs): Promise<{ messageId: string }> {
   const info = await transport().sendMail({
     from: args.from || gmailAccount(),
     to: args.to,
@@ -88,6 +112,31 @@ export async function sendGmail(args: SendMailArgs): Promise<{ messageId: string
     attachments: args.attachments,
   });
   return { messageId: String(info.messageId || '') };
+}
+
+/**
+ * Send an email via Gmail SMTP. Throws on failure.
+ *
+ * Transient failures (see isTransientSmtpError) are retried every 30 s for up
+ * to 5 minutes; `attempts` says how many sends it took. Known trade-off: if
+ * the connection dies after Gmail accepted the message but before its reply
+ * reached us, the retry delivers a second identical copy. That is rare, and
+ * for the nightly payout file a duplicate beats no email.
+ */
+export async function sendGmail(args: SendMailArgs, retry: SendRetryOptions = {}): Promise<{ messageId: string; attempts: number }> {
+  const intervalMs = retry.intervalMs ?? 30_000;
+  const { value, attempts } = await retryTransient(() => (retry.send ?? sendOnce)(args), {
+    windowMs: retry.windowMs ?? 5 * 60_000,
+    intervalMs,
+    sleep: retry.sleep,
+    now: retry.now,
+    label: 'Email send',
+    isTransient: isTransientSmtpError,
+    onRetry: ({ attempt, error }) => {
+      console.error(`[retry] email "${args.subject.slice(0, 80)}" attempt ${attempt} failed (${error.message.slice(0, 200)}) — retrying in ${Math.round(intervalMs / 1000)}s`);
+    },
+  });
+  return { ...value, attempts };
 }
 
 /** Verify SMTP auth without sending (handshake + login). */

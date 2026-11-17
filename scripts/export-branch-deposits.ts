@@ -209,6 +209,10 @@ type MatchDiagnostics = {
    *  fetch so a flaky report server is visible even when payroll went out. */
   reportAttemptCount: number;
   reportRetryFailures: string[];
+  /** Google Sheets calls that failed transiently and were retried. */
+  sheetsRetryFailures: string[];
+  /** SMTP sends it took to deliver the disbursements email (0 = not sent). */
+  disbursementsEmailAttemptCount: number;
   reportRowCount: number;
   masterRowCount: number;
   exportRowCount: number;
@@ -564,14 +568,15 @@ function buildWatchdogEmailSection(args: {
   }));
 }
 
-async function emailDisbursementsCsv(filePath: string, account: string, recipients: string | string[], subject: string, body: string): Promise<void> {
-  await sendGmail({
+async function emailDisbursementsCsv(filePath: string, account: string, recipients: string | string[], subject: string, body: string): Promise<number> {
+  const { attempts } = await sendGmail({
     from: account,
     to: recipients,
     subject,
     text: body,
     attachments: [{ filename: path.basename(filePath), path: filePath }],
   });
+  return attempts;
 }
 
 // Fallback path: when the disbursements email to the configured recipient
@@ -1734,12 +1739,13 @@ Sourced from ${args.group.rosterTab} on the ${args.group.rosterSheetLabel} sheet
 
   let emailStatus: 'sent' | 'skipped' | 'failed' = 'skipped';
   let failureAlertStatus: 'sent' | 'skipped' | 'failed' | 'not-needed' = 'not-needed';
+  let emailAttemptCount = 0;
   if (args.dryRun || args.skipEmail) {
     const displayRecipients = Array.isArray(sendTo) ? sendTo.join(', ') : sendTo;
     console.error(`[${args.dryRun ? 'dry-run' : 'skip-email'}] would email ${disbursementsPath} to ${displayRecipients}: ${subject}`);
   } else {
     try {
-      await emailDisbursementsCsv(disbursementsPath, args.account, sendTo, subject, body);
+      emailAttemptCount = await emailDisbursementsCsv(disbursementsPath, args.account, sendTo, subject, body);
       emailStatus = 'sent';
     } catch (err: any) {
       emailStatus = 'failed';
@@ -1764,6 +1770,8 @@ Sourced from ${args.group.rosterTab} on the ${args.group.rosterSheetLabel} sheet
     reportLocationFailure: report.reportLocationFailure,
     reportAttemptCount: report.reportAttemptCount,
     reportRetryFailures: report.reportRetryFailures,
+    sheetsRetryFailures: sheetsApi.sheetsRetryFailures(),
+    disbursementsEmailAttemptCount: emailAttemptCount,
     reportRowCount: report.rows.length,
     masterRowCount: masterRows.length,
     exportRowCount: depositRows.length,
@@ -1805,6 +1813,8 @@ Sourced from ${args.group.rosterTab} on the ${args.group.rosterSheetLabel} sheet
     disbursementsEmailStatus: emailStatus,
     disbursementsFailureAlertStatus: failureAlertStatus,
     reportAttemptCount: report.reportAttemptCount,
+    sheetsRetryCount: sheetsApi.sheetsRetryFailures().length,
+    disbursementsEmailAttemptCount: emailAttemptCount,
     exportRowCount: depositRows.length,
     zeroNetOmittedCount: zeroNetRows.length,
     masterRowCount: masterRows.length,
