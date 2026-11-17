@@ -112,6 +112,42 @@ export async function clearValues(spreadsheetId: string, range: string): Promise
   await call(`clear ${range}`, () => client().spreadsheets.values.clear({ spreadsheetId, range }, REQUEST_OPTIONS));
 }
 
+/**
+ * Replace a tab's whole contents with `values` in ONE request.
+ *
+ * The ledger tabs used to be rewritten as clear-then-update. A failure
+ * between the two left the tab empty, and the rows that had been read from
+ * it existed only in a process that was about to exit. Here the new rows are
+ * padded with blank cells out to the tab's current size (capped at column Z,
+ * what the old `A:Z` clear covered), so a single update both writes the new
+ * rows and blanks whatever used to sit below or beside them. It either lands
+ * or the tab is untouched. An empty string clears a cell.
+ */
+export async function replaceValues(spreadsheetId: string, tabTitle: string, values: (string | number)[][], input: ValueInput = 'USER_ENTERED'): Promise<void> {
+  const meta = await call(`size of '${tabTitle}'`, () => client().spreadsheets.get({ spreadsheetId, fields: 'sheets.properties(title,gridProperties(rowCount,columnCount))' }, REQUEST_OPTIONS));
+  const tab = (meta.data.sheets || []).find((sh) => sh.properties?.title === tabTitle);
+  if (!tab) throw new Error(`Tab '${tabTitle}' not found on spreadsheet ${spreadsheetId}`);
+  const gridRows = Number(tab.properties?.gridProperties?.rowCount) || 0;
+  const gridCols = Number(tab.properties?.gridProperties?.columnCount) || 0;
+  const dataCols = values.reduce((max, row) => Math.max(max, row.length), 1);
+  const width = Math.max(dataCols, Math.min(gridCols, 26));
+  const height = Math.max(values.length, gridRows, 1);
+  const grid: (string | number)[][] = [];
+  for (let r = 0; r < height; r++) {
+    const source = values[r] || [];
+    const row: (string | number)[] = [];
+    for (let c = 0; c < width; c++) row.push(source[c] ?? '');
+    grid.push(row);
+  }
+  await updateValues(spreadsheetId, `'${tabTitle}'!A1:${columnLetter(width)}${height}`, grid, input);
+}
+
+function columnLetter(n: number): string {
+  let out = '';
+  for (let v = n; v > 0; v = Math.floor((v - 1) / 26)) out = String.fromCharCode(65 + ((v - 1) % 26)) + out;
+  return out;
+}
+
 export type TabMeta = { title: string; sheetId: number; index: number };
 
 export async function listTabs(spreadsheetId: string): Promise<TabMeta[]> {

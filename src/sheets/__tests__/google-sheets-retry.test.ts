@@ -6,6 +6,7 @@ import {
   deleteTab,
   getValues,
   isTransientSheetsError,
+  replaceValues,
   sheetsRetryFailures,
   updateValues,
 } from '../google-sheets';
@@ -153,5 +154,55 @@ describe('non-repeatable calls check before repeating', () => {
     vi.spyOn(console, 'error').mockImplementation(() => {});
     await expect(deleteTab('sheet', 77)).resolves.toBeUndefined();
     expect(batchUpdate).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('replaceValues rewrites a tab in one request', () => {
+  const sized = (title: string, rowCount: number, columnCount: number) => ({
+    data: { sheets: [{ properties: { title: 'OTHER', gridProperties: { rowCount: 5, columnCount: 5 } } }, { properties: { title, gridProperties: { rowCount, columnCount } } }] },
+  });
+
+  it('pads with blanks to the tab size so old rows below and beside are cleared by the same write', async () => {
+    const valuesUpdate = vi.fn().mockResolvedValue({ data: {} });
+    const get = vi.fn().mockResolvedValue(sized('LOAN PAYMENTS', 4, 30));
+    install(fakeClient({ valuesUpdate, get }));
+
+    await replaceValues('sheet', 'LOAN PAYMENTS', [['STAFF ID', 'DATE'], ["'0977", '2026-11-16']]);
+
+    expect(valuesUpdate).toHaveBeenCalledTimes(1);
+    const params = valuesUpdate.mock.calls[0]![0];
+    expect(params.range).toBe("'LOAN PAYMENTS'!A1:Z4");
+    expect(params.valueInputOption).toBe('USER_ENTERED');
+    const grid = params.requestBody.values as string[][];
+    expect(grid).toHaveLength(4);
+    expect(grid.every((row) => row.length === 26)).toBe(true);
+    expect(grid[1]!.slice(0, 3)).toEqual(["'0977", '2026-11-16', '']);
+    expect(grid[2]!.every((cell) => cell === '')).toBe(true);
+    expect(grid[3]!.every((cell) => cell === '')).toBe(true);
+  });
+
+  it('never clears first: a failed write leaves the tab as it was', async () => {
+    const valuesUpdate = vi.fn().mockRejectedValue(http(400, 'nope'));
+    const clear = vi.fn();
+    const get = vi.fn().mockResolvedValue(sized('LOAN PAYMENTS', 4, 9));
+    const client = fakeClient({ valuesUpdate, get });
+    (client.spreadsheets.values as unknown as { clear: unknown }).clear = clear;
+    install(client);
+    await expect(replaceValues('sheet', 'LOAN PAYMENTS', [['a']])).rejects.toThrow('nope');
+    expect(clear).not.toHaveBeenCalled();
+  });
+
+  it('writes past the current size when there are more rows than the tab has', async () => {
+    const valuesUpdate = vi.fn().mockResolvedValue({ data: {} });
+    const get = vi.fn().mockResolvedValue(sized('GARNISHMENTS PAYOUTS', 2, 8));
+    install(fakeClient({ valuesUpdate, get }));
+    await replaceValues('sheet', 'GARNISHMENTS PAYOUTS', [['h'], ['1'], ['2']]);
+    expect(valuesUpdate.mock.calls[0]![0].range).toBe("'GARNISHMENTS PAYOUTS'!A1:H3");
+  });
+
+  it('fails clearly when the tab is missing', async () => {
+    const get = vi.fn().mockResolvedValue(sized('LOAN PAYMENTS', 4, 9));
+    install(fakeClient({ get, valuesUpdate: vi.fn() }));
+    await expect(replaceValues('sheet', 'NOPE', [['a']])).rejects.toThrow("Tab 'NOPE' not found");
   });
 });
