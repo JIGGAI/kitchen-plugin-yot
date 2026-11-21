@@ -8,6 +8,14 @@ import { randomUUID } from 'crypto';
 import { execFileSync } from 'child_process';
 import { and, eq, sql } from 'drizzle-orm';
 import { initializeDatabase } from '../db';
+import {
+  appointmentMoneyTotals,
+  clientIdsWithAppointmentsAtLocation,
+  clientIdsWithAppointmentsForStylist,
+  locationIdsWithAppointmentsFor,
+  readRelationshipAppointments,
+  stylistIdsWithAppointmentsForClient,
+} from './appointment-reads';
 import * as schema from '../db/schema';
 import { listAppointmentsForRequest, AGGREGATE_COLUMNS } from './list-appointments';
 import { stylistsByLocationForRange } from './stylists-by-location';
@@ -1559,7 +1567,7 @@ function buildPromotionMatrix(rows: PromotionUsageRow[], summaries: ReturnType<t
   };
 }
 
-function computeRevenueSummary(db: ReturnType<typeof initializeDatabase>['db'], teamId: string, locationId: string | null) {
+function computeRevenueSummary(db: ReturnType<typeof initializeDatabase>['db'], sqlite: ReturnType<typeof initializeDatabase>['sqlite'], teamId: string, locationId: string | null) {
   if (!locationId) {
     return {
       available: false,
@@ -1591,21 +1599,15 @@ function computeRevenueSummary(db: ReturnType<typeof initializeDatabase>['db'], 
     return { available: true, source: 'revenue_facts' as const, grossAmount, discountAmount, netAmount, appointmentCount, lastUpdatedAt, note: null };
   }
 
-  const appointments = db.select().from(schema.appointments)
-    .where(and(eq(schema.appointments.teamId, teamId), eq(schema.appointments.locationId, locationId))).all() as schema.Appointment[];
-  const withAmounts = appointments.filter((row) => row.netAmount != null || row.grossAmount != null || row.total != null);
-  if (withAmounts.length) {
-    let grossAmount = 0;
-    let discountAmount = 0;
-    let netAmount = 0;
-    let lastUpdatedAt: string | null = null;
-    for (const row of withAmounts) {
-      grossAmount += row.grossAmount ?? row.total ?? 0;
-      discountAmount += row.discountAmount ?? 0;
-      netAmount += row.netAmount ?? row.total ?? row.grossAmount ?? 0;
-      lastUpdatedAt = mostRecentIso(lastUpdatedAt, row.updatedAtRemote || row.syncedAt || null);
-    }
-    return { available: true, source: 'appointments' as const, grossAmount, discountAmount, netAmount, appointmentCount: withAmounts.length, lastUpdatedAt, note: null };
+  // No revenue_facts for this shop: fall back to money fields on its
+  // appointments, summed in SQL rather than by loading the shop's history.
+  const money = appointmentMoneyTotals(sqlite, teamId, locationId);
+  if (money.withAmounts) {
+    return {
+      available: true, source: 'appointments' as const,
+      grossAmount: money.grossAmount, discountAmount: money.discountAmount, netAmount: money.netAmount,
+      appointmentCount: money.withAmounts, lastUpdatedAt: money.lastUpdatedWithAmounts, note: null,
+    };
   }
 
   return {
@@ -1614,18 +1616,16 @@ function computeRevenueSummary(db: ReturnType<typeof initializeDatabase>['db'], 
     grossAmount: null,
     discountAmount: null,
     netAmount: null,
-    appointmentCount: appointments.length,
-    lastUpdatedAt: appointments.reduce((latest, row) => mostRecentIso(latest, row.updatedAtRemote || row.syncedAt || null), null as string | null),
-    note: appointments.length ? 'Appointments are linked, but this cache does not yet include money fields for them.' : 'No local revenue rows found for this location yet.',
+    appointmentCount: money.total,
+    lastUpdatedAt: money.lastUpdatedAll,
+    note: money.total ? 'Appointments are linked, but this cache does not yet include money fields for them.' : 'No local revenue rows found for this location yet.',
   };
 }
 
-function buildRelationshipSummary(db: ReturnType<typeof initializeDatabase>['db'], teamId: string, focus: { clientId?: string | null; stylistId?: string | null; locationId?: string | null }): RelationshipComputation {
+function buildRelationshipSummary(db: ReturnType<typeof initializeDatabase>['db'], sqlite: ReturnType<typeof initializeDatabase>['sqlite'], teamId: string, focus: { clientId?: string | null; stylistId?: string | null; locationId?: string | null }): RelationshipComputation {
   const lookups = buildAppointmentLookups(db, teamId);
-  let appointments = db.select().from(schema.appointments).where(eq(schema.appointments.teamId, teamId)).all() as schema.Appointment[];
-  if (focus.clientId) appointments = appointments.filter((row) => row.clientId === focus.clientId);
-  if (focus.locationId) appointments = appointments.filter((row) => row.locationId === focus.locationId);
-  if (focus.stylistId) appointments = appointments.filter((row) => cleanString(row.stylistId ?? row.staffId) === focus.stylistId);
+  // Only the focused rows, and only the columns the summary reads.
+  const appointments = readRelationshipAppointments(sqlite, teamId, focus);
 
   const clients = new Map<string, RelationshipLinkAccumulator>();
   const stylists = new Map<string, RelationshipLinkAccumulator>();
@@ -1675,7 +1675,7 @@ function buildRelationshipSummary(db: ReturnType<typeof initializeDatabase>['db'
     clients: toRelationshipLinks(clients),
     stylists: toRelationshipLinks(stylists),
     locations: toRelationshipLinks(locations),
-    revenue: focus.locationId ? computeRevenueSummary(db, teamId, focus.locationId) : null,
+    revenue: focus.locationId ? computeRevenueSummary(db, sqlite, teamId, focus.locationId) : null,
   };
 }
 
@@ -1862,7 +1862,7 @@ function buildAppointmentLookups(db: ReturnType<typeof initializeDatabase>['db']
   };
 }
 
-function findAppointmentStylist(row: schema.Appointment, lookups: AppointmentLookupMaps): schema.Stylist | null {
+function findAppointmentStylist(row: Pick<schema.Appointment, 'stylistId' | 'staffId' | 'locationId'>, lookups: AppointmentLookupMaps): schema.Stylist | null {
   const privateId = cleanString(row.stylistId ?? row.staffId);
   if (!privateId) return null;
   if (row.locationId) {
@@ -4240,7 +4240,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
 
   if (req.path === '/locations' && req.method === 'GET') {
     try {
-      const { db } = initializeDatabase(teamId);
+      const { db, sqlite } = initializeDatabase(teamId);
       const { limit, offset } = parsePagination(req.query);
       const activeFilter = parseBooleanFilter(req.query.active);
       const locationFilter = cleanString(req.query.locationId || req.query.location);
@@ -4266,11 +4266,8 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
             if (client.id === clientFilter && client.sourceLocationId) allowedLocationIds.add(client.sourceLocationId);
           }
         }
-        const appointments = db.select().from(schema.appointments).where(eq(schema.appointments.teamId, teamId)).all() as schema.Appointment[];
-        for (const appointment of appointments) {
-          const stylistMatch = stylistFilter && (appointment.stylistId === stylistFilter || appointment.staffId === stylistFilter);
-          const clientMatch = clientFilter && appointment.clientId === clientFilter;
-          if ((stylistMatch || clientMatch) && appointment.locationId) allowedLocationIds.add(appointment.locationId);
+        for (const id of locationIdsWithAppointmentsFor(sqlite, teamId, { stylistId: stylistFilter, clientId: clientFilter })) {
+          allowedLocationIds.add(id);
         }
         rows = rows.filter((row: schema.Location) => allowedLocationIds.has(row.id));
       }
@@ -4292,10 +4289,10 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
   const locationMatch = req.path.match(/^\/locations\/([^/]+)$/);
   if (locationMatch && req.method === 'GET') {
     try {
-      const { db } = initializeDatabase(teamId);
+      const { db, sqlite } = initializeDatabase(teamId);
       const rows = db.select().from(schema.locations).where(and(eq(schema.locations.teamId, teamId), eq(schema.locations.id, locationMatch[1]!))).all();
       if (!rows.length) return apiError(404, 'NOT_FOUND', 'Location not found');
-      return { status: 200, data: mapLocationDetailRecord(rows[0], buildRelationshipSummary(db, teamId, { locationId: rows[0].id })) };
+      return { status: 200, data: mapLocationDetailRecord(rows[0], buildRelationshipSummary(db, sqlite, teamId, { locationId: rows[0].id })) };
     } catch (error: any) {
       return apiError(500, 'DATABASE_ERROR', error?.message || 'Failed to read location');
     }
@@ -4357,7 +4354,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
 
   if (req.path === '/clients' && req.method === 'GET') {
     try {
-      const { db } = initializeDatabase(teamId);
+      const { db, sqlite } = initializeDatabase(teamId);
       const { limit, offset } = parsePagination(req.query);
       const activeFilter = parseBooleanFilter(req.query.active);
       const locationFilter = cleanString(req.query.locationId || req.query.location);
@@ -4372,14 +4369,12 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         // Match clients with at least one appointment at this location, mirroring
         // the popup's `relationships.uniqueClientCount`. The previous `sourceLocationId`
         // filter under-counted because YOT's home-location field is sparsely populated.
-        const appointments = db.select().from(schema.appointments).where(eq(schema.appointments.teamId, teamId)).all() as schema.Appointment[];
-        const allowedClientIds = new Set(appointments.filter((row) => row.clientId && row.locationId === locationFilter).map((row) => row.clientId as string));
+        const allowedClientIds = clientIdsWithAppointmentsAtLocation(sqlite, teamId, locationFilter);
         rows = rows.filter((row) => allowedClientIds.has(row.id));
       }
       if (clientFilter) rows = rows.filter((row) => row.id === clientFilter || row.privateId === clientFilter);
       if (stylistFilter) {
-        const appointments = db.select().from(schema.appointments).where(eq(schema.appointments.teamId, teamId)).all() as schema.Appointment[];
-        const allowedClientIds = new Set(appointments.filter((row) => row.clientId && (row.stylistId === stylistFilter || row.staffId === stylistFilter)).map((row) => row.clientId as string));
+        const allowedClientIds = clientIdsWithAppointmentsForStylist(sqlite, teamId, stylistFilter);
         rows = rows.filter((row) => allowedClientIds.has(row.id));
       }
 
@@ -4521,10 +4516,10 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
   const clientMatch = req.path.match(/^\/clients\/([^/]+)$/);
   if (clientMatch && req.method === 'GET') {
     try {
-      const { db } = initializeDatabase(teamId);
+      const { db, sqlite } = initializeDatabase(teamId);
       const rows = db.select().from(schema.clients).where(and(eq(schema.clients.teamId, teamId), eq(schema.clients.id, clientMatch[1]!))).all();
       if (!rows.length) return apiError(404, 'NOT_FOUND', 'Client not found');
-      return { status: 200, data: mapClientDetailRecord(rows[0], buildRelationshipSummary(db, teamId, { clientId: rows[0].id })) };
+      return { status: 200, data: mapClientDetailRecord(rows[0], buildRelationshipSummary(db, sqlite, teamId, { clientId: rows[0].id })) };
     } catch (error: any) {
       return apiError(500, 'DATABASE_ERROR', error?.message || 'Failed to read client');
     }
@@ -4533,10 +4528,10 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
   const stylistMatch = req.path.match(/^\/stylists\/([^/]+)$/);
   if (stylistMatch && req.method === 'GET') {
     try {
-      const { db } = initializeDatabase(teamId);
+      const { db, sqlite } = initializeDatabase(teamId);
       const rows = db.select().from(schema.stylists).where(and(eq(schema.stylists.teamId, teamId), eq(schema.stylists.id, stylistMatch[1]!))).all();
       if (!rows.length) return apiError(404, 'NOT_FOUND', 'Stylist not found');
-      return { status: 200, data: mapStylistDetailRecord(rows[0], buildRelationshipSummary(db, teamId, { stylistId: rows[0].privateId })) };
+      return { status: 200, data: mapStylistDetailRecord(rows[0], buildRelationshipSummary(db, sqlite, teamId, { stylistId: rows[0].privateId })) };
     } catch (error: any) {
       return apiError(500, 'DATABASE_ERROR', error?.message || 'Failed to read stylist');
     }
@@ -4544,7 +4539,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
 
   if (req.path === '/stylists' && req.method === 'GET') {
     try {
-      const { db } = initializeDatabase(teamId);
+      const { db, sqlite } = initializeDatabase(teamId);
       const { limit, offset } = parsePagination(req.query);
       const activeFilter = parseBooleanFilter(req.query.active);
       const locationFilter = cleanString(req.query.locationId || req.query.location);
@@ -4557,13 +4552,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       if (locationFilter) rows = rows.filter((row) => row.locationId === locationFilter || row.sourceLocationId === locationFilter);
       if (stylistFilter) rows = rows.filter((row) => row.id === stylistFilter || row.privateId === stylistFilter);
       if (clientFilter) {
-        const appointments = db.select().from(schema.appointments).where(eq(schema.appointments.teamId, teamId)).all() as schema.Appointment[];
-        const allowedStylistIds = new Set<string>();
-        for (const appointment of appointments) {
-          if (appointment.clientId !== clientFilter) continue;
-          if (appointment.stylistId) allowedStylistIds.add(appointment.stylistId);
-          if (appointment.staffId) allowedStylistIds.add(appointment.staffId);
-        }
+        const allowedStylistIds = stylistIdsWithAppointmentsForClient(sqlite, teamId, clientFilter);
         rows = rows.filter((row) => allowedStylistIds.has(row.privateId || '') || allowedStylistIds.has(row.id));
       }
       if (search) {
