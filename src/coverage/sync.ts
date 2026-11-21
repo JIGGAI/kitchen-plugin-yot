@@ -88,23 +88,34 @@ function weekStartOf(dateIso: string): string {
 }
 
 function readAppointmentsForDay(
-  db: ReturnType<typeof initializeDatabase>['db'],
+  sqlite: SqliteDb,
   teamId: string,
   locationId: string,
   date: string,
 ): Array<{ startsAt: string; endsAt: string; stylistId: string | null }> {
-  const rows = db.select().from(schema.appointments)
-    .where(and(eq(schema.appointments.teamId, teamId), eq(schema.appointments.locationId, locationId)))
-    .all() as schema.Appointment[];
+  // One day of one shop, read through (team_id, location_id, start_at)
+  // rather than loading the shop's whole appointment history. The second
+  // branch covers legacy rows that only carry starts_at.
+  const next = `${date}~`; // sorts after every "YYYY-MM-DDT…" on that date
+  const rows = sqlite.prepare(
+    `SELECT start_at AS startsAt, COALESCE(end_at, ends_at) AS endsAt,
+            COALESCE(stylist_id, staff_id) AS stylistId
+       FROM appointments
+      WHERE team_id = ? AND location_id = ? AND start_at >= ? AND start_at < ?
+     UNION ALL
+     SELECT starts_at AS startsAt, COALESCE(end_at, ends_at) AS endsAt,
+            COALESCE(stylist_id, staff_id) AS stylistId
+       FROM appointments
+      WHERE team_id = ? AND location_id = ? AND start_at IS NULL
+        AND +starts_at >= ? AND +starts_at < ?`,
+  ).all(teamId, locationId, date, next, teamId, locationId, date, next) as Array<{
+    startsAt: string | null; endsAt: string | null; stylistId: string | null;
+  }>;
   return rows
-    .map((r) => {
-      const startsAt = r.startAt ?? r.startsAt;
-      const endsAt = r.endAt ?? r.endsAt;
-      return startsAt && endsAt && startsAt.slice(0, 10) === date
-        ? { startsAt, endsAt, stylistId: (r.stylistId ?? r.staffId) ?? null }
-        : null;
-    })
-    .filter((x): x is { startsAt: string; endsAt: string; stylistId: string | null } => x !== null);
+    .filter((r): r is { startsAt: string; endsAt: string; stylistId: string | null } => (
+      !!r.startsAt && !!r.endsAt && r.startsAt.slice(0, 10) === date
+    ))
+    .map((r) => ({ startsAt: r.startsAt, endsAt: r.endsAt, stylistId: r.stylistId ?? null }));
 }
 
 /**
@@ -176,9 +187,21 @@ export function averageDailyAppointmentsByDow(
     }
   }
 
-  const apptRows = db.select().from(schema.appointments)
-    .where(and(eq(schema.appointments.teamId, teamId), eq(schema.appointments.locationId, locationId)))
-    .all() as schema.Appointment[];
+  // Only the start time is needed, and only for the averaging window. This
+  // used to load every column of every appointment the shop has ever had
+  // (raw payload included) and discard all but the window in JS; with years
+  // of history cached that made each call read the whole table. Both
+  // branches seek on (team_id, location_id, start_at); the second covers
+  // legacy rows that only carry starts_at (the unary + keeps the planner
+  // off the team-wide starts_at index).
+  const apptRows = sqlite.prepare(
+    `SELECT start_at AS startsAt FROM appointments
+      WHERE team_id = ? AND location_id = ? AND start_at >= ? AND start_at < ?
+     UNION ALL
+     SELECT starts_at AS startsAt FROM appointments
+      WHERE team_id = ? AND location_id = ? AND start_at IS NULL
+        AND +starts_at >= ? AND +starts_at < ?`,
+  ).all(teamId, locationId, startIso, endIso, teamId, locationId, startIso, endIso) as Array<{ startsAt: string | null }>;
 
   // Map<dateIso, Map<hour, count>>: how many appointments START in each
   // hour-of-day on each historical date.
@@ -187,7 +210,7 @@ export function averageDailyAppointmentsByDow(
   // covered yet.
   const apptFallbackCountByDate = new Map<string, number>();
   for (const r of apptRows) {
-    const startsAt = r.startAt ?? r.startsAt;
+    const startsAt = r.startsAt;
     if (!startsAt) continue;
     const day = startsAt.slice(0, 10);
     if (day < startIso || day >= endIso) continue;
@@ -464,7 +487,7 @@ export async function syncCoverageForLocationDay(opts: SyncCoverageOptions): Pro
 
     const averageHourlyForDay = averageHourlyByDow[dateDow];
     const dayRosteredRaw = allEntries.filter((e) => e.date === date);
-    const appointments = readAppointmentsForDay(db, opts.teamId, opts.locationId, date);
+    const appointments = readAppointmentsForDay(sqlite, opts.teamId, opts.locationId, date);
     const dayFact = buildCoverageDayFact({
       date,
       businessHours,
