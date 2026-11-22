@@ -2,7 +2,7 @@
 // Kitchen invokes handleRequest({ path, method, query, headers, body }, ctx)
 // and expects { status, data } back.
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync, readdirSync, readFileSync } from 'fs';
 import path from 'path';
 import { randomUUID } from 'crypto';
 import { execFileSync } from 'child_process';
@@ -29,6 +29,7 @@ import { syncRevenueFactsRangeFromDailyRevenueSummary } from '../reports/sync-re
 import { reportRegistry } from '../reports/report-registry';
 import { GROUP_CONFIGS, type DisbursementGroupConfig, type DisbursementGroupId } from '../disbursements/group-config';
 import { createReportClient } from '../reports/client';
+import { rawForStorage, rawRetentionCutoff, trimAppointmentRaw } from './appointment-raw-retention';
 import type { KitchenPluginContext } from './types-kitchen';
 import type {
   ApiError,
@@ -36,7 +37,6 @@ import type {
   AppointmentRecord,
   ClientDetailRecord,
   ClientRecord,
-  ExportManifestRecord,
   LocationDetailRecord,
   LocationRecord,
   PromotionUsageQueryResponse,
@@ -2094,33 +2094,6 @@ function upsertSyncState(db: ReturnType<typeof initializeDatabase>['db'], teamId
                last_success_at = COALESCE(${values.lastSuccessAt ?? null}, last_success_at),
                last_error = ${values.lastError ?? null},
                row_count = COALESCE(${values.rowCount ?? null}, row_count)`);
-}
-
-function writeExportFiles(teamId: string, db: ReturnType<typeof initializeDatabase>['db']): ExportManifestRecord {
-  const exportedAt = new Date().toISOString();
-  const stamp = exportedAt.replace(/[:.]/g, '-');
-  const dir = path.join(process.env.HOME || '', '.openclaw', 'kitchen', 'plugins', 'yot', 'exports', teamId, stamp);
-  mkdirSync(dir, { recursive: true });
-
-  const files: Array<{ name: string; rows: number }> = [];
-  const datasets: Array<{ name: string; rows: unknown[] }> = [
-    { name: 'clients.json', rows: db.select().from(schema.clients).where(eq(schema.clients.teamId, teamId)).all() },
-    { name: 'locations.json', rows: db.select().from(schema.locations).where(eq(schema.locations.teamId, teamId)).all() },
-    { name: 'stylists.json', rows: db.select().from(schema.stylists).where(eq(schema.stylists.teamId, teamId)).all() },
-    { name: 'appointments.json', rows: db.select().from(schema.appointments).where(eq(schema.appointments.teamId, teamId)).all() },
-    { name: 'services.json', rows: db.select().from(schema.services).where(eq(schema.services.teamId, teamId)).all() },
-    { name: 'sync-state.json', rows: db.select().from(schema.syncState).where(eq(schema.syncState.teamId, teamId)).all() },
-    { name: 'sync-runs.json', rows: db.select().from(schema.syncRuns).where(eq(schema.syncRuns.teamId, teamId)).all() },
-  ];
-
-  for (const dataset of datasets) {
-    writeFileSync(path.join(dir, dataset.name), `${JSON.stringify(dataset.rows, null, 2)}\n`, 'utf8');
-    files.push({ name: dataset.name, rows: dataset.rows.length });
-  }
-
-  const manifest: ExportManifestRecord = { teamId, exportedAt, directory: dir, files };
-  writeFileSync(path.join(dir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
-  return manifest;
 }
 
 // ─── Monthly Revenue Summary sync ──────────────────────────────────────
@@ -4791,6 +4764,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
       const locations = await fetchLocations(config);
       const activeLocations = locations.filter((item) => item?.id != null && item?.active !== false);
       const now = new Date().toISOString();
+      const rawCutoff = rawRetentionCutoff();
       let appointmentsPruned = 0;
       let rowsSeen = 0;
       let rowsWritten = 0;
@@ -4824,6 +4798,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
           const categoryId = cleanString(item.category);
           const statusMeta = statusId ? statusById.get(statusId) : null;
           const categoryMeta = categoryId ? categoryById.get(categoryId) : null;
+          const startAt = localIsoFromParts(item, 'startHour', 'startMinute');
           const values: schema.NewAppointment = {
             id: `${locationId}:${appointmentId}`,
             teamId,
@@ -4839,9 +4814,9 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
             serviceNameRaw,
             serviceNameNorm,
             locationId,
-            startsAt: localIsoFromParts(item, 'startHour', 'startMinute'),
+            startsAt: startAt,
             endsAt: localIsoFromParts(item, 'endHour', 'endMinute'),
-            startAt: localIsoFromParts(item, 'startHour', 'startMinute'),
+            startAt,
             endAt: localIsoFromParts(item, 'endHour', 'endMinute'),
             status: cleanString(statusMeta?.description ?? item.status),
             statusCode: cleanString(statusMeta?.code ?? item.status),
@@ -4868,7 +4843,7 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
             createdBy: cleanString(item.createdBy),
             updatedAtRemote: cleanString(item.updatedAt),
             updatedBy: cleanString(item.updatedBy),
-            raw: JSON.stringify(item),
+            raw: rawForStorage(item, startAt, rawCutoff),
             syncedAt: now,
           };
           const existing = db.select().from(schema.appointments).where(eq(schema.appointments.id, values.id)).all();
@@ -4920,9 +4895,13 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         }
       }
 
+      // Appointments that have aged past the retention window lose their
+      // stored YOT payload; see ./appointment-raw-retention.
+      const rawTrimmed = trimAppointmentRaw(sqlite, teamId, rawCutoff);
+
       upsertSyncState(db, teamId, 'appointments', { lastSyncedAt: now, lastSuccessAt: now, lastError: null, rowCount: rowsWritten });
-      db.update(schema.syncRuns).set({ status: 'success', completedAt: now, rowsSeen, rowsWritten, pageCount: locationsSynced, notes: `lookbackDays=${lookbackDays}; locations=${locationsSynced}; appointmentsPruned=${appointmentsPruned}; duplicatesPruned=${duplicatesPruned}` }).where(eq(schema.syncRuns.id, runId)).run();
-      return { status: 200, data: { ok: true, synced: rowsWritten, rowsSeen, locationCount: locationsSynced, lookbackDays, appointmentsPruned, duplicatesPruned, startedAt, completedAt: now } };
+      db.update(schema.syncRuns).set({ status: 'success', completedAt: now, rowsSeen, rowsWritten, pageCount: locationsSynced, notes: `lookbackDays=${lookbackDays}; locations=${locationsSynced}; appointmentsPruned=${appointmentsPruned}; duplicatesPruned=${duplicatesPruned}; rawTrimmed=${rawTrimmed}` }).where(eq(schema.syncRuns.id, runId)).run();
+      return { status: 200, data: { ok: true, synced: rowsWritten, rowsSeen, locationCount: locationsSynced, lookbackDays, appointmentsPruned, duplicatesPruned, rawTrimmed, startedAt, completedAt: now } };
     } catch (error: any) {
       const errMsg = error?.message || String(error);
       const now = new Date().toISOString();
@@ -5035,16 +5014,6 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
         upsertSyncState(db, teamId, 'services', { lastSyncedAt: now, lastError: errMsg });
       } catch {}
       return apiError(502, 'YOT_ERROR', errMsg);
-    }
-  }
-
-  if (req.path === '/export' && req.method === 'POST') {
-    try {
-      const { db } = initializeDatabase(teamId);
-      const manifest = writeExportFiles(teamId, db);
-      return { status: 200, data: { ok: true, manifest } };
-    } catch (error: any) {
-      return apiError(500, 'EXPORT_ERROR', error?.message || 'Failed to export local cache');
     }
   }
 
