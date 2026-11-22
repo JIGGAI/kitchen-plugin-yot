@@ -17,7 +17,7 @@ The Hair Mechanix dashboard is a lightweight front end. Every external integrati
 - **Local cache (SQLite):** `clients`, `locations`, `appointments`, `sync_state`, `sync_runs`
 - **Config:** per-team API key stored in that team's YOT plugin DB under `plugin_config` (key: `yot`, value: `{ apiKey, baseUrl? }`)
 - **Pull model:** dashboard hits `/api/plugins/yot/<resource>`, plugin serves from cache, periodic/manual sync refreshes from YOT
-- **Exports:** flat-file JSON export snapshots can be written under `~/.openclaw/kitchen/plugins/yot/exports/<teamId>/...`
+- **Raw payload retention:** each appointment keeps the YOT payload it was built from for 90 days (`YOT_APPOINTMENT_RAW_RETENTION_DAYS`, `0` keeps it forever); older appointments keep every typed column but drop the payload, which is what keeps the database from growing without bound
 
 ## HTTP surface
 
@@ -36,7 +36,6 @@ The Hair Mechanix dashboard is a lightweight front end. Every external integrati
 | GET | `/clients/paging-characterization` | Probe page sizes / empty-page behavior against the live YOT API |
 | GET | `/sync-state` | Read aggregate sync status by resource |
 | GET | `/sync-runs` | Read recent sync run history |
-| POST | `/export` | Write a flat-file JSON snapshot of the local cache |
 
 ## Current status
 

@@ -24,7 +24,6 @@ export type {
   ServiceDetailRecord,
   SyncStateRecord,
   SyncRunRecord,
-  ExportManifestRecord,
   ApiError,
   PaginatedResponse,
 } from './types';

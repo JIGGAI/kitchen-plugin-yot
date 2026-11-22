@@ -73,9 +73,7 @@ import { api, boolLabel, describeFreshness, fmtNumber, formatDateTime, t } from 
       setError(null);
       try {
         const data = await api('yot', teamId, path, { method: 'POST', headers: { 'content-type': 'application/json' } }) as any;
-        if (key === 'export') {
-          setMessage(`${label} complete • ${data?.manifest?.directory || 'snapshot written'}`);
-        } else if (key === 'clients') {
+        if (key === 'clients') {
           setMessage(`${label} complete • ${fmtNumber(data?.synced)} clients synced across ${fmtNumber(data?.pageCount)} pages`);
         } else if (key === 'stylists' || key === 'services' || key === 'appointments') {
           setMessage(`${label} complete • ${fmtNumber(data?.synced)} rows across ${fmtNumber(data?.locationCount)} locations`);
@@ -147,8 +145,7 @@ import { api, boolLabel, describeFreshness, fmtNumber, formatDateTime, t } from 
               if (!job) return;
               void runAction(job.key, `${job.label} sync`, job.buildPath());
             }
-          }, busy && busy !== 'export' ? `Syncing ${(SYNC_JOBS.find((j) => j.key === busy) || {} as any).label || busy}…` : 'Sync now'),
-          h('button', { type: 'button', style: t.btnGhost, disabled: !!busy, onClick: () => void runAction('export', 'Export snapshot', '/export') }, busy === 'export' ? 'Exporting…' : 'Export snapshot')
+          }, busy ? `Syncing ${(SYNC_JOBS.find((j) => j.key === busy) || {} as any).label || busy}…` : 'Sync now')
         )
       ),
       h('div', { style: t.card },
