@@ -56,6 +56,14 @@ function isCorporateFranchise(name: string): boolean {
   return CORPORATE_FRANCHISE_NAMES.has(name.trim().toLowerCase());
 }
 
+/** Order overlapping roster groups so the specific billing owner wins. */
+export function franchiseSyncOrder<T extends { name: string }>(entries: T[]): T[] {
+  return [
+    ...entries.filter((e) => isCorporateFranchise(e.name)),
+    ...entries.filter((e) => !isCorporateFranchise(e.name)),
+  ];
+}
+
 /**
  * Normalize a location name for fuzzy matching: lowercase, collapse whitespace,
  * strip trailing punctuation. The YOT franchise list and the YOT REST
@@ -116,15 +124,11 @@ export async function syncFranchises(opts: SyncFranchisesOptions): Promise<SyncF
   const records: FranchiseSyncRecord[] = [];
   let totalLocationsUpdated = 0;
 
-  // Process entries with the corporate franchise LAST so it wins any conflict
-  // (YOT can list a single store under multiple franchises, e.g. Morgantown
-  // WV appears under both "Hair MX" corporate AND "Terry Morgantown" — the
-  // intent in that case is corporate ownership). Within each group, preserve
-  // the source order from YOT.
-  const orderedEntries = [
-    ...entries.filter((e) => !isCorporateFranchise(e.name)),
-    ...entries.filter((e) => isCorporateFranchise(e.name)),
-  ];
+  // Process corporate first and named owner/franchise groups last. YOT can
+  // list a store under both (Morgantown appears under Hair MX and Terry
+  // Morgantown); the specific owner group is the billing authority and must
+  // win the overlap. Within each group, preserve YOT's source order.
+  const orderedEntries = franchiseSyncOrder(entries);
 
   for (const entry of orderedEntries) {
     const isCorp = isCorporateFranchise(entry.name);
@@ -143,9 +147,8 @@ export async function syncFranchises(opts: SyncFranchisesOptions): Promise<SyncF
       .run(teamId, entry.franchiseId, entry.name, isCorp ? 1 : 0, entry.locationCount, syncedAt);
 
     if (matchedIds.length) {
-      // Stamp the franchise pointer on every matched location. Since corporate
-      // is processed last, any location appearing in BOTH a franchisee group
-      // and the corporate group ends up correctly tagged as corporate.
+      // Stamp the franchise pointer on every matched location. Since specific
+      // owner groups are processed last, an overlap is billed to that owner.
       const stmt = sqlite.prepare(
         'UPDATE locations SET franchise_id = ?, franchise_name = ? WHERE team_id = ? AND id = ?',
       );
