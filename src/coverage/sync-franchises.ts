@@ -12,6 +12,7 @@ import { initializeDatabase } from '../db';
 import * as schema from '../db/schema';
 import type { YotConfig } from '../types';
 import { fetchFranchisesHtml, parseFranchisesHtml, withAutoLogin } from '../drivers/yot-mvc-client';
+import { applyFranchiseOwnershipOverrides } from './franchise-overrides';
 
 type SqliteDb = ReturnType<typeof initializeDatabase>['sqlite'];
 
@@ -34,6 +35,7 @@ export type SyncFranchisesResult = {
   syncedAt: string;
   franchises: FranchiseSyncRecord[];
   totalLocationsUpdated: number;
+  overridesApplied: number;
 };
 
 function readConfig(sqlite: SqliteDb, teamId: string): YotConfig {
@@ -129,7 +131,12 @@ export async function syncFranchises(opts: SyncFranchisesOptions): Promise<SyncF
   // are then re-stamped below; locations with no match will remain null
   // (rather than carrying a stale franchise from a previous sync).
   sqlite
-    .prepare('UPDATE locations SET franchise_id = NULL, franchise_name = NULL WHERE team_id = ?')
+    .prepare(`UPDATE locations
+                 SET franchise_id = NULL,
+                     franchise_name = NULL,
+                     yot_franchise_id = NULL,
+                     yot_franchise_name = NULL
+               WHERE team_id = ?`)
     .run(teamId);
 
   // Replace the franchise table for this team.
@@ -164,10 +171,13 @@ export async function syncFranchises(opts: SyncFranchisesOptions): Promise<SyncF
       // Stamp the franchise pointer on every matched location. Since specific
       // owner groups are processed last, an overlap is billed to that owner.
       const stmt = sqlite.prepare(
-        'UPDATE locations SET franchise_id = ?, franchise_name = ? WHERE team_id = ? AND id = ?',
+        `UPDATE locations
+            SET franchise_id = ?, franchise_name = ?,
+                yot_franchise_id = ?, yot_franchise_name = ?
+          WHERE team_id = ? AND id = ?`,
       );
       const tx = sqlite.transaction((ids: string[]) => {
-        for (const id of ids) stmt.run(entry.franchiseId, entry.name, teamId, id);
+        for (const id of ids) stmt.run(entry.franchiseId, entry.name, entry.franchiseId, entry.name, teamId, id);
       });
       tx(matchedIds);
       totalLocationsUpdated += matchedIds.length;
@@ -183,7 +193,8 @@ export async function syncFranchises(opts: SyncFranchisesOptions): Promise<SyncF
     });
   }
 
-  return { syncedAt, franchises: records, totalLocationsUpdated };
+  const overridesApplied = applyFranchiseOwnershipOverrides(sqlite, teamId);
+  return { syncedAt, franchises: records, totalLocationsUpdated, overridesApplied };
 }
 
 export type FranchiseRow = {
