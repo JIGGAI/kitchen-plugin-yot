@@ -65,6 +65,19 @@ export function franchiseSyncOrder<T extends { name: string }>(entries: T[]): T[
 }
 
 /**
+ * An expired or changed MVC page can contain unrelated `itemId` markup while
+ * yielding no franchise rows. Treat that as a failed fetch: clearing the live
+ * mappings on an empty parse is substantially worse than keeping the last
+ * known-good ownership data until the next successful sync.
+ */
+export function requireFranchiseRows<T>(entries: T[]): T[] {
+  if (entries.length === 0) {
+    throw new Error('FRANCHISE_SYNC_EMPTY: YOT returned no franchise rows; existing mappings were preserved');
+  }
+  return entries;
+}
+
+/**
  * Normalize a location name for fuzzy matching: lowercase, collapse whitespace,
  * strip trailing punctuation. The YOT franchise list and the YOT REST
  * /locations response usually agree on names, but there are minor cosmetic
@@ -92,7 +105,8 @@ export async function syncFranchises(opts: SyncFranchisesOptions): Promise<SyncF
     // withAutoLogin probe and re-login rather than persisting an empty sync.
     { looksEmpty: (h) => !/itemId=/i.test(h) },
   );
-  const entries = parseFranchisesHtml(html);
+  // This guard must remain before every database reset below.
+  const entries = requireFranchiseRows(parseFranchisesHtml(html));
   const syncedAt = new Date().toISOString();
 
   // Build a name → location-id index from the current locations table for
