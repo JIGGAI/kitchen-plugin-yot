@@ -1815,7 +1815,7 @@ function mapAppointmentRecord(row: schema.Appointment): AppointmentRecord {
 }
 
 type AppointmentLookupMaps = {
-  locationsById: Map<string, schema.Location>;
+  locationsById: Map<string, Pick<schema.Location, 'id' | 'name'>>;
   stylistsByScopedPrivateId: Map<string, schema.Stylist>;
   stylistsByPrivateId: Map<string, schema.Stylist>;
   clientsById: Map<string, schema.Client>;
@@ -1824,8 +1824,9 @@ type AppointmentLookupMaps = {
 };
 
 function buildAppointmentLookups(db: ReturnType<typeof initializeDatabase>['db'], teamId: string): AppointmentLookupMaps {
-  const locationsById = new Map<string, schema.Location>();
-  for (const row of db.select().from(schema.locations).where(eq(schema.locations.teamId, teamId)).all() as schema.Location[]) {
+  const locationsById = new Map<string, Pick<schema.Location, 'id' | 'name'>>();
+  for (const row of db.select({ id: schema.locations.id, name: schema.locations.name })
+    .from(schema.locations).where(eq(schema.locations.teamId, teamId)).all()) {
     locationsById.set(row.id, row);
   }
 
@@ -5972,6 +5973,53 @@ export async function handleRequest(req: PluginRequest, _ctx: KitchenPluginConte
     const { listFranchises } = await import('../coverage/sync-franchises');
     const data = listFranchises(teamId);
     return { status: 200, data: { data, total: data.length } };
+  }
+
+  if (req.path === '/franchise-overrides' && req.method === 'GET') {
+    const { sqlite } = initializeDatabase(teamId);
+    const { listFranchiseOwnership } = await import('../coverage/franchise-overrides');
+    const { listFranchises } = await import('../coverage/sync-franchises');
+    const locations = listFranchiseOwnership(sqlite, teamId);
+    return {
+      status: 200,
+      data: {
+        locations,
+        franchises: listFranchises(teamId),
+        overrideCount: locations.filter((row) => row.override).length,
+      },
+    };
+  }
+
+  const franchiseOverrideMatch = req.path.match(/^\/franchise-overrides\/([^/]+)$/);
+  if (franchiseOverrideMatch && (req.method === 'PUT' || req.method === 'DELETE')) {
+    let locationId = '';
+    try { locationId = decodeURIComponent(franchiseOverrideMatch[1]); } catch {}
+    if (!locationId) return apiError(400, 'BAD_REQUEST', 'locationId is required');
+    const { sqlite } = initializeDatabase(teamId);
+    const {
+      deleteFranchiseOwnershipOverride,
+      upsertFranchiseOwnershipOverride,
+    } = await import('../coverage/franchise-overrides');
+
+    if (req.method === 'DELETE') {
+      const removed = deleteFranchiseOwnershipOverride(sqlite, teamId, locationId);
+      if (!removed) return apiError(404, 'OVERRIDE_NOT_FOUND', 'No ownership override exists for this location');
+      return { status: 200, data: { removed: true, locationId } };
+    }
+
+    const body = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, unknown>;
+    const franchiseId = String(body.franchiseId || '').trim();
+    const note = body.note == null ? null : String(body.note).trim().slice(0, 500);
+    const updatedBy = body.updatedBy == null ? null : String(body.updatedBy).trim().slice(0, 200);
+    if (!franchiseId) return apiError(400, 'BAD_REQUEST', 'franchiseId is required');
+    try {
+      const location = upsertFranchiseOwnershipOverride(sqlite, teamId, locationId, franchiseId, note, updatedBy);
+      return { status: 200, data: { location } };
+    } catch (err: any) {
+      if (err?.message === 'LOCATION_NOT_FOUND') return apiError(404, 'LOCATION_NOT_FOUND', 'Location not found');
+      if (err?.message === 'FRANCHISE_NOT_FOUND') return apiError(404, 'FRANCHISE_NOT_FOUND', 'Franchise not found');
+      throw err;
+    }
   }
 
   if (req.path === '/public-holidays/sync' && req.method === 'POST') {

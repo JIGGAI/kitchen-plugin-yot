@@ -58,6 +58,8 @@ export const locations = sqliteTable('locations', {
   country: text('country'),
   franchiseId: text('franchise_id'),
   franchiseName: text('franchise_name'),
+  yotFranchiseId: text('yot_franchise_id'),
+  yotFranchiseName: text('yot_franchise_name'),
   raw: text('raw'),
   syncedAt: text('synced_at').notNull(),
 });
@@ -71,6 +73,20 @@ export const franchises = sqliteTable('franchises', {
   syncedAt: text('synced_at').notNull(),
 }, (t) => ({
   pk: primaryKey({ columns: [t.teamId, t.franchiseId] }),
+}));
+
+export const franchiseOwnershipOverrides = sqliteTable('franchise_ownership_overrides', {
+  teamId: text('team_id').notNull(),
+  locationId: text('location_id').notNull(),
+  franchiseId: text('franchise_id').notNull(),
+  franchiseName: text('franchise_name').notNull(),
+  note: text('note'),
+  createdBy: text('created_by'),
+  updatedBy: text('updated_by'),
+  createdAt: text('created_at').notNull(),
+  updatedAt: text('updated_at').notNull(),
+}, (t) => ({
+  pk: primaryKey({ columns: [t.teamId, t.locationId] }),
 }));
 
 export const publicHolidays = sqliteTable('public_holidays', {

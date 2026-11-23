@@ -5,7 +5,7 @@ import type { initializeDatabase } from '../db';
 type Db = ReturnType<typeof initializeDatabase>['db'];
 
 export type AppointmentLookupMaps = {
-  locationsById: Map<string, schema.Location>;
+  locationsById: Map<string, Pick<schema.Location, 'id' | 'name'>>;
   stylistsByScopedPrivateId: Map<string, schema.Stylist>;
   stylistsByPrivateId: Map<string, schema.Stylist>;
   clientsById: Map<string, schema.Client>;
@@ -44,7 +44,7 @@ export function buildAppointmentLookupsForRows(
   // join is an `IN (...)` over a 185K-row table sized by the page. Skipping it
   // is most of what makes a 20,000-row page cheaper than 40 pages of 500.
   const includeClients = options.includeClients !== false;
-  const locationsById = new Map<string, schema.Location>();
+  const locationsById = new Map<string, Pick<schema.Location, 'id' | 'name'>>();
   const stylistsByScopedPrivateId = new Map<string, schema.Stylist>();
   const stylistsByPrivateId = new Map<string, schema.Stylist>();
   const clientsById = new Map<string, schema.Client>();
@@ -71,9 +71,12 @@ export function buildAppointmentLookupsForRows(
   const servicePrivateIds = uniqueIds(rows.map((r) => r.serviceId));
 
   if (locationIds.length) {
-    const locations = db.select().from(schema.locations)
+    // Only appointment labels need the location id/name. Selecting the full
+    // evolving locations schema makes focused tests and older read-only DBs
+    // fail as soon as an unrelated location column is added.
+    const locations = db.select({ id: schema.locations.id, name: schema.locations.name }).from(schema.locations)
       .where(and(eq(schema.locations.teamId, teamId), inArray(schema.locations.id, locationIds)))
-      .all() as schema.Location[];
+      .all();
     for (const row of locations) locationsById.set(row.id, row);
   }
 
