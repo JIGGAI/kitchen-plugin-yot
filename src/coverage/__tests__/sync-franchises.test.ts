@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { franchiseSyncOrder } from '../sync-franchises';
+import { franchiseSyncOrder, requireFranchiseRows } from '../sync-franchises';
 
 describe('franchiseSyncOrder', () => {
   it('stamps corporate first so a specific owner wins an overlapping shop', () => {
@@ -10,5 +10,14 @@ describe('franchiseSyncOrder', () => {
     ]);
 
     expect(rows.map((row) => row.franchiseId)).toEqual(['1', '77', '22']);
+  });
+
+  it('fails closed when YOT parses to zero rows', () => {
+    expect(() => requireFranchiseRows([])).toThrow(/FRANCHISE_SYNC_EMPTY/);
+  });
+
+  it('passes a non-empty roster through unchanged', () => {
+    const rows = [{ name: 'Hair MX' }];
+    expect(requireFranchiseRows(rows)).toBe(rows);
   });
 });
