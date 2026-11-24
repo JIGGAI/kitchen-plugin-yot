@@ -58,11 +58,11 @@ function isCorporateFranchise(name: string): boolean {
   return CORPORATE_FRANCHISE_NAMES.has(name.trim().toLowerCase());
 }
 
-/** Order overlapping roster groups so the specific billing owner wins. */
+/** Order overlapping roster groups so the corporate owner wins. */
 export function franchiseSyncOrder<T extends { name: string }>(entries: T[]): T[] {
   return [
-    ...entries.filter((e) => isCorporateFranchise(e.name)),
     ...entries.filter((e) => !isCorporateFranchise(e.name)),
+    ...entries.filter((e) => isCorporateFranchise(e.name)),
   ];
 }
 
@@ -145,10 +145,11 @@ export async function syncFranchises(opts: SyncFranchisesOptions): Promise<SyncF
   const records: FranchiseSyncRecord[] = [];
   let totalLocationsUpdated = 0;
 
-  // Process corporate first and named owner/franchise groups last. YOT can
+  // Process named owner/franchise groups first and corporate last. YOT can
   // list a store under both (Morgantown appears under Hair MX and Terry
-  // Morgantown); the specific owner group is the billing authority and must
-  // win the overlap. Within each group, preserve YOT's source order.
+  // Morgantown); Corporate is the default billing authority and must win the
+  // overlap unless an explicit local ownership override says otherwise. Within
+  // each group, preserve YOT's source order.
   const orderedEntries = franchiseSyncOrder(entries);
 
   for (const entry of orderedEntries) {
@@ -168,8 +169,8 @@ export async function syncFranchises(opts: SyncFranchisesOptions): Promise<SyncF
       .run(teamId, entry.franchiseId, entry.name, isCorp ? 1 : 0, entry.locationCount, syncedAt);
 
     if (matchedIds.length) {
-      // Stamp the franchise pointer on every matched location. Since specific
-      // owner groups are processed last, an overlap is billed to that owner.
+      // Stamp the franchise pointer on every matched location. Since Corporate
+      // is processed last, an overlap defaults to Corporate.
       const stmt = sqlite.prepare(
         `UPDATE locations
             SET franchise_id = ?, franchise_name = ?,
